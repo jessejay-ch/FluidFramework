@@ -6,6 +6,7 @@
 import { ScribeLambdaFactory } from "@fluidframework/server-lambdas";
 import { createDocumentRouter } from "@fluidframework/server-routerlicious-base";
 import { createProducer, getDbFactory, TenantManager } from "@fluidframework/server-services";
+import * as core from "@fluidframework/server-services-core";
 import {
     DefaultServiceConfiguration,
     IDb,
@@ -13,6 +14,7 @@ import {
     IPartitionLambdaFactory,
     ISequencedOperationMessage,
     IServiceConfiguration,
+    ICheckpointHeuristicsServerConfiguration,
     MongoManager,
 } from "@fluidframework/server-services-core";
 import { Provider } from "nconf";
@@ -42,6 +44,12 @@ export async function scribeCreate(config: Provider): Promise<IPartitionLambdaFa
     const tenantManager = new TenantManager(authEndpoint, internalHistorianUrl);
 
     const factory = await getDbFactory(config);
+
+    const checkpointHeuristics = config.get("scribe:checkpointHeuristics") as
+        ICheckpointHeuristicsServerConfiguration;
+    if (checkpointHeuristics?.enable) {
+        core.DefaultServiceConfiguration.scribe.checkpointHeuristics = checkpointHeuristics;
+    }
 
     let globalDb;
     if (globalDbEnabled) {
