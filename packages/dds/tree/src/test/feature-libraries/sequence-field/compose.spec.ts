@@ -6,31 +6,33 @@
 import { strict as assert } from "assert";
 import { RevisionTag } from "../../../core";
 import { SequenceField as SF } from "../../../feature-libraries";
+import { makeAnonChange, TaggedChange } from "../../../rebase";
 import { TreeSchemaIdentifier } from "../../../schema-stored";
 import { brand } from "../../../util";
 import { TestChange } from "../../testChange";
 import { deepFreeze } from "../../utils";
-import { cases, TestChangeset } from "./utils";
+import { cases, ChangeMaker as Change, TestChangeset } from "./testEdits";
 
 const type: TreeSchemaIdentifier = brand("Node");
 const tag1: RevisionTag = brand(1);
 const tag2: RevisionTag = brand(2);
 
-function compose(changes: TestChangeset[]): TestChangeset {
+function compose(changes: TaggedChange<TestChangeset>[]): TestChangeset {
     changes.forEach(deepFreeze);
     return SF.compose(changes, TestChange.compose);
 }
 
-function composeNoVerify(changes: TestChangeset[]): TestChangeset {
+function composeNoVerify(changes: TaggedChange<TestChangeset>[]): TestChangeset {
     changes.forEach(deepFreeze);
-    return SF.compose(changes, (cs: TestChange[]) => TestChange.compose(cs, false));
+    return SF.compose(changes, (cs: TaggedChange<TestChange>[]) => TestChange.compose(cs, false));
 }
 
-function shallowCompose(changes: SF.Changeset[]): SF.Changeset {
+function shallowCompose(changes: TaggedChange<SF.Changeset>[]): SF.Changeset {
     changes.forEach(deepFreeze);
-    return SF.sequenceFieldChangeRebaser.compose(changes, () =>
-        assert.fail("Unexpected call to child rebaser"),
-    );
+    return SF.sequenceFieldChangeRebaser.compose(changes, (children) => {
+        assert(children.length === 1, "Should only have one child to compose");
+        return children[0].change;
+    });
 }
 
 describe("SequenceField - Compose", () => {
@@ -40,10 +42,10 @@ describe("SequenceField - Compose", () => {
             for (const b of entries) {
                 for (const c of entries) {
                     it(`((${a[0]}, ${b[0]}), ${c[0]}) === (${a[0]}, (${b[0]}, ${c[0]}))`, () => {
-                        const ab = composeNoVerify([a[1], b[1]]);
-                        const left = composeNoVerify([ab, c[1]]);
-                        const bc = composeNoVerify([b[1], c[1]]);
-                        const right = composeNoVerify([a[1], bc]);
+                        const ab = composeNoVerify([makeAnonChange(a[1]), makeAnonChange(b[1])]);
+                        const left = composeNoVerify([makeAnonChange(ab), makeAnonChange(c[1])]);
+                        const bc = composeNoVerify([makeAnonChange(b[1]), makeAnonChange(c[1])]);
+                        const right = composeNoVerify([makeAnonChange(a[1]), makeAnonChange(bc)]);
                         assert.deepEqual(left, right);
                     });
                 }
@@ -57,51 +59,100 @@ describe("SequenceField - Compose", () => {
     });
 
     it("Does not leave empty mark lists and fields", () => {
-        const insertion: SF.Changeset = [{ type: "Insert", id: 1, content: [{ type, value: 1 }] }];
-        const deletion: SF.Changeset = [{ type: "Delete", id: 2, count: 1 }];
-        const actual = shallowCompose([insertion, deletion]);
+        const insertion = Change.insert(0, 1);
+        const deletion = Change.delete(0, 1);
+        const actual = shallowCompose([makeAnonChange(insertion), makeAnonChange(deletion)]);
         assert.deepEqual(actual, cases.no_change);
     });
 
     it("insert ○ modify", () => {
-        const insert: SF.Changeset = [
-            {
-                type: "Insert",
-                id: 1,
-                content: [
-                    { type, value: 1 },
-                    { type, value: 2 },
-                ],
-            },
-        ];
-        const modify: SF.Changeset = [
-            {
-                type: "Modify",
-                changes: { valueChange: { value: 42 } },
-            },
-        ];
-        const expected: SF.Changeset = [
+        const insert = Change.insert(0, 2);
+        const modify = Change.modify(0, TestChange.mint([], 42));
+        const expected: TestChangeset = [
             {
                 type: "MInsert",
-                id: 1,
-                content: { type, value: 1 },
-                changes: { valueChange: { value: 42 } },
+                id: 0,
+                content: { type, value: 0 },
+                changes: TestChange.mint([], 42),
             },
-            { type: "Insert", id: 1, content: [{ type, value: 2 }] },
+            { type: "Insert", id: 0, content: [{ type, value: 1 }] },
         ];
-        const actual = shallowCompose([insert, modify]);
+        const actual = compose([makeAnonChange(insert), makeAnonChange(modify)]);
         assert.deepEqual(actual, expected);
     });
 
     it("modify insert ○ modify", () => {
         const childChangeA = TestChange.mint([0], 1);
         const childChangeB = TestChange.mint([0, 1], 2);
-        const childChangeAB = TestChange.compose([childChangeA, childChangeB]);
+        const childChangeAB = TestChange.compose([
+            makeAnonChange(childChangeA),
+            makeAnonChange(childChangeB),
+        ]);
         const insert: TestChangeset = [
             {
                 type: "MInsert",
                 id: 1,
                 content: { type, value: 1 },
+                changes: childChangeA,
+            },
+        ];
+        const modify = Change.modify(0, childChangeB);
+        const expected: TestChangeset = [
+            {
+                type: "MInsert",
+                id: 1,
+                content: { type, value: 1 },
+                changes: childChangeAB,
+            },
+        ];
+        const actual = compose([makeAnonChange(insert), makeAnonChange(modify)]);
+        assert.deepEqual(actual, expected);
+    });
+
+    it("delete ○ modify", () => {
+        const deletion = Change.delete(0, 3);
+        const modify = Change.modify(0, { valueChange: { value: 2 } });
+        const expected: SF.Changeset = [
+            { type: "Delete", id: 0, count: 3 },
+            {
+                type: "Modify",
+                changes: { valueChange: { value: 2 } },
+            },
+        ];
+        const actual = shallowCompose([makeAnonChange(deletion), makeAnonChange(modify)]);
+        assert.deepEqual(actual, expected);
+    });
+
+    it("revive ○ modify", () => {
+        const revive = Change.revive(0, 3, 0, tag1);
+        const modify = Change.modify(0, { valueChange: { value: 2 } });
+        const expected: SF.Changeset = [
+            {
+                type: "MRevive",
+                id: 0,
+                detachedBy: tag1,
+                detachIndex: 0,
+                changes: { valueChange: { value: 2 } },
+            },
+            { type: "Revive", id: 0, count: 2, detachedBy: tag1, detachIndex: 1 },
+        ];
+        const actual = shallowCompose([makeAnonChange(revive), makeAnonChange(modify)]);
+        assert.deepEqual(actual, expected);
+    });
+
+    it("revive and modify ○ modify", () => {
+        const childChangeA = TestChange.mint([0], 1);
+        const childChangeB = TestChange.mint([0, 1], 2);
+        const childChangeAB = TestChange.compose([
+            makeAnonChange(childChangeA),
+            makeAnonChange(childChangeB),
+        ]);
+        const revive: TestChangeset = [
+            {
+                type: "MRevive",
+                id: 1,
+                detachedBy: tag1,
+                detachIndex: 0,
                 changes: childChangeA,
             },
         ];
@@ -113,103 +164,44 @@ describe("SequenceField - Compose", () => {
         ];
         const expected: TestChangeset = [
             {
-                type: "MInsert",
-                id: 1,
-                content: { type, value: 1 },
-                changes: childChangeAB,
-            },
-        ];
-        const actual = compose([insert, modify]);
-        assert.deepEqual(actual, expected);
-    });
-
-    it("delete ○ modify", () => {
-        const deletion: SF.Changeset = [{ type: "Delete", id: 1, count: 3 }];
-        const modify: SF.Changeset = [
-            {
-                type: "Modify",
-                changes: { valueChange: { value: 2 } },
-            },
-        ];
-        const expected: SF.Changeset = [
-            { type: "Delete", id: 1, count: 3 },
-            {
-                type: "Modify",
-                changes: { valueChange: { value: 2 } },
-            },
-        ];
-        const actual = shallowCompose([deletion, modify]);
-        assert.deepEqual(actual, expected);
-    });
-
-    it("revive ○ modify", () => {
-        const revive: SF.Changeset = [
-            { type: "Revive", id: 1, count: 3, detachedBy: tag1, detachIndex: 0 },
-        ];
-        const modify: SF.Changeset = [
-            {
-                type: "Modify",
-                changes: { valueChange: { value: 2 } },
-            },
-        ];
-        const expected: SF.Changeset = [
-            {
                 type: "MRevive",
                 id: 1,
                 detachedBy: tag1,
                 detachIndex: 0,
-                changes: { valueChange: { value: 2 } },
+                changes: childChangeAB,
             },
-            { type: "Revive", id: 1, count: 2, detachedBy: tag1, detachIndex: 1 },
         ];
-        const actual = shallowCompose([revive, modify]);
+        const actual = compose([makeAnonChange(revive), makeAnonChange(modify)]);
         assert.deepEqual(actual, expected);
     });
 
     it("modify ○ modify", () => {
         const childChangeA = TestChange.mint([0], 1);
         const childChangeB = TestChange.mint([0, 1], 2);
-        const childChangeAB = TestChange.compose([childChangeA, childChangeB]);
-        const modifyA: TestChangeset = [
-            {
-                type: "Modify",
-                changes: childChangeA,
-            },
-        ];
-        const modifyB: TestChangeset = [
-            {
-                type: "Modify",
-                changes: childChangeB,
-            },
-        ];
+        const childChangeAB = TestChange.compose([
+            makeAnonChange(childChangeA),
+            makeAnonChange(childChangeB),
+        ]);
+        const modifyA = Change.modify(0, childChangeA);
+        const modifyB = Change.modify(0, childChangeB);
         const expected: TestChangeset = [
             {
                 type: "Modify",
                 changes: childChangeAB,
             },
         ];
-        const actual = compose([modifyA, modifyB]);
+        const actual = compose([makeAnonChange(modifyA), makeAnonChange(modifyB)]);
         assert.deepEqual(actual, expected);
     });
 
     it("insert ○ delete (within insert)", () => {
-        const insert: SF.Changeset = [
-            {
-                type: "Insert",
-                id: 1,
-                content: [
-                    { type, value: 1 },
-                    { type, value: 2 },
-                    { type, value: 3 },
-                ],
-            },
-        ];
-        const deletion: SF.Changeset = [1, { type: "Delete", id: 2, count: 1 }];
-        const actual = shallowCompose([insert, deletion]);
+        const insert = Change.insert(0, 3, 1);
+        const deletion = Change.delete(1, 1);
+        const actual = shallowCompose([makeAnonChange(insert), makeAnonChange(deletion)]);
         const expected: SF.Changeset = [
             {
                 type: "Insert",
-                id: 1,
+                id: 0,
                 content: [
                     { type, value: 1 },
                     { type, value: 3 },
@@ -246,8 +238,8 @@ describe("SequenceField - Compose", () => {
                 ],
             },
         ];
-        const deletion: SF.Changeset = [1, { type: "Delete", id: 2, count: 4 }];
-        const actual = shallowCompose([insert, deletion]);
+        const deletion = Change.delete(1, 4);
+        const actual = shallowCompose([makeAnonChange(insert), makeAnonChange(deletion)]);
         const expected: SF.Changeset = [
             { type: "Insert", id: 1, content: [{ type, value: 1 }] },
             { type: "Insert", id: 3, content: [{ type, value: 6 }] },
@@ -256,14 +248,9 @@ describe("SequenceField - Compose", () => {
     });
 
     it("modify ○ delete", () => {
-        const modify: SF.Changeset = [
-            {
-                type: "Modify",
-                changes: { valueChange: { value: 1 } },
-            },
-        ];
-        const deletion: SF.Changeset = [{ type: "Delete", id: 2, count: 1 }];
-        const actual = shallowCompose([modify, deletion]);
+        const modify = Change.modify(0, { valueChange: { value: 1 } });
+        const deletion = Change.delete(0, 1);
+        const actual = shallowCompose([makeAnonChange(modify), makeAnonChange(deletion)]);
         assert.deepEqual(actual, deletion);
     });
 
@@ -280,7 +267,7 @@ describe("SequenceField - Compose", () => {
             2,
             { type: "Delete", id: 4, count: 2 },
         ];
-        const actual = shallowCompose([deleteA, deleteB]);
+        const actual = shallowCompose([makeAnonChange(deleteA), makeAnonChange(deleteB)]);
         // Deletes ABCDEFG-IJKLMNOP
         const expected: SF.Changeset = [
             { type: "Delete", id: 1, count: 3 },
@@ -294,66 +281,73 @@ describe("SequenceField - Compose", () => {
     });
 
     it("revive ○ delete", () => {
-        const revive: SF.Changeset = [
-            { type: "Revive", id: 1, count: 5, detachedBy: tag1, detachIndex: 0 },
-        ];
+        const revive = Change.revive(0, 5, 0, tag1);
         const deletion: SF.Changeset = [
             1,
             { type: "Delete", id: 3, count: 1 },
             1,
             { type: "Delete", id: 4, count: 3 },
         ];
-        const actual = shallowCompose([revive, deletion]);
+        const actual = shallowCompose([makeAnonChange(revive), makeAnonChange(deletion)]);
         const expected: SF.Changeset = [
-            { type: "Revive", id: 1, count: 1, detachedBy: tag1, detachIndex: 0 },
-            { type: "Revive", id: 1, count: 1, detachedBy: tag1, detachIndex: 2 },
+            { type: "Revive", id: 0, count: 1, detachedBy: tag1, detachIndex: 0 },
+            { type: "Revive", id: 0, count: 1, detachedBy: tag1, detachIndex: 2 },
             { type: "Delete", id: 4, count: 1 },
         ];
         assert.deepEqual(actual, expected);
     });
 
+    it("revive and modify ○ delete", () => {
+        const revive: SF.Changeset = [
+            {
+                type: "MRevive",
+                id: 1,
+                detachedBy: tag1,
+                detachIndex: 0,
+                changes: { valueChange: { value: 1 } },
+            },
+        ];
+        const deletion: SF.Changeset = [{ type: "Delete", id: 3, count: 2 }];
+        const actual = shallowCompose([makeAnonChange(revive), makeAnonChange(deletion)]);
+        const expected: SF.Changeset = [{ type: "Delete", id: 3, count: 1 }];
+        assert.deepEqual(actual, expected);
+    });
+
     it("modify ○ insert", () => {
-        const modify: SF.Changeset = [
-            {
-                type: "Modify",
-                changes: { valueChange: { value: 1 } },
-            },
-        ];
-        const insert: SF.Changeset = [{ type: "Insert", id: 1, content: [{ type, value: 2 }] }];
+        const modify = Change.modify(0, { valueChange: { value: 1 } });
+        const insert = Change.insert(0, 1, 2);
         const expected: SF.Changeset = [
-            { type: "Insert", id: 1, content: [{ type, value: 2 }] },
+            { type: "Insert", id: 0, content: [{ type, value: 2 }] },
             {
                 type: "Modify",
                 changes: { valueChange: { value: 1 } },
             },
         ];
-        const actual = shallowCompose([modify, insert]);
+        const actual = shallowCompose([makeAnonChange(modify), makeAnonChange(insert)]);
         assert.deepEqual(actual, expected);
     });
 
     it("delete ○ insert", () => {
-        const deletion: SF.Changeset = [{ type: "Delete", id: 1, count: 3 }];
-        const insert: SF.Changeset = [{ type: "Insert", id: 1, content: [{ type, value: 2 }] }];
+        const deletion = Change.delete(0, 3);
+        const insert = Change.insert(0, 1, 2);
         // TODO: test with merge-right policy as well
         const expected: SF.Changeset = [
-            { type: "Insert", id: 1, content: [{ type, value: 2 }] },
-            { type: "Delete", id: 1, count: 3 },
+            { type: "Insert", id: 0, content: [{ type, value: 2 }] },
+            { type: "Delete", id: 0, count: 3 },
         ];
-        const actual = shallowCompose([deletion, insert]);
+        const actual = shallowCompose([makeAnonChange(deletion), makeAnonChange(insert)]);
         assert.deepEqual(actual, expected);
     });
 
     it("revive ○ insert", () => {
-        const deletion: SF.Changeset = [
-            { type: "Revive", id: 1, count: 5, detachedBy: tag1, detachIndex: 0 },
-        ];
-        const insert: SF.Changeset = [{ type: "Insert", id: 1, content: [{ type, value: 2 }] }];
+        const revive = Change.revive(0, 5, 0, tag1);
+        const insert = Change.insert(0, 1, 2);
         // TODO: test with merge-right policy as well
         const expected: SF.Changeset = [
-            { type: "Insert", id: 1, content: [{ type, value: 2 }] },
-            { type: "Revive", id: 1, count: 5, detachedBy: tag1, detachIndex: 0 },
+            { type: "Insert", id: 0, content: [{ type, value: 2 }] },
+            { type: "Revive", id: 0, count: 5, detachedBy: tag1, detachIndex: 0 },
         ];
-        const actual = shallowCompose([deletion, insert]);
+        const actual = shallowCompose([makeAnonChange(revive), makeAnonChange(insert)]);
         assert.deepEqual(actual, expected);
     });
 
@@ -375,7 +369,7 @@ describe("SequenceField - Compose", () => {
             4,
             { type: "Insert", id: 4, content: [{ type, value: 4 }] },
         ];
-        const actual = shallowCompose([insertA, insertB]);
+        const actual = shallowCompose([makeAnonChange(insertA), makeAnonChange(insertB)]);
         const expected: SF.Changeset = [
             { type: "Insert", id: 3, content: [{ type, value: 3 }] },
             { type: "Insert", id: 1, content: [{ type, value: 1 }] },
@@ -388,54 +382,40 @@ describe("SequenceField - Compose", () => {
     });
 
     it("modify ○ revive", () => {
-        const modify: SF.Changeset = [
-            {
-                type: "Modify",
-                changes: { valueChange: { value: 1 } },
-            },
-        ];
-        const revive: SF.Changeset = [
-            { type: "Revive", id: 1, count: 2, detachedBy: tag1, detachIndex: 0 },
-        ];
+        const modify = Change.modify(0, { valueChange: { value: 1 } });
+        const revive = Change.revive(0, 2, 0, tag1);
         const expected: SF.Changeset = [
-            { type: "Revive", id: 1, count: 2, detachedBy: tag1, detachIndex: 0 },
+            { type: "Revive", id: 0, count: 2, detachedBy: tag1, detachIndex: 0 },
             {
                 type: "Modify",
                 changes: { valueChange: { value: 1 } },
             },
         ];
-        const actual = shallowCompose([modify, revive]);
+        const actual = shallowCompose([makeAnonChange(modify), makeAnonChange(revive)]);
         assert.deepEqual(actual, expected);
     });
 
     it("delete ○ revive", () => {
-        const deletion: SF.Changeset = [{ type: "Delete", id: 1, count: 3 }];
-        const revive: SF.Changeset = [
-            { type: "Revive", id: 1, count: 2, detachedBy: tag1, detachIndex: 0 },
-        ];
+        const deletion = Change.delete(0, 3);
+        const revive = Change.revive(0, 2, 0, tag1);
         // TODO: test with merge-right policy as well
-        // TODO: test revive of deleted content
         const expected: SF.Changeset = [
-            { type: "Revive", id: 1, count: 2, detachedBy: tag1, detachIndex: 0 },
-            { type: "Delete", id: 1, count: 3 },
+            { type: "Revive", id: 0, count: 2, detachedBy: tag1, detachIndex: 0 },
+            { type: "Delete", id: 0, count: 3 },
         ];
-        const actual = shallowCompose([deletion, revive]);
+        const actual = shallowCompose([makeAnonChange(deletion), makeAnonChange(revive)]);
         assert.deepEqual(actual, expected);
     });
 
     it("revive ○ revive", () => {
-        const reviveA: SF.Changeset = [
-            { type: "Revive", id: 1, count: 2, detachedBy: tag1, detachIndex: 0 },
-        ];
-        const reviveB: SF.Changeset = [
-            { type: "Revive", id: 2, count: 3, detachedBy: tag2, detachIndex: 0 },
-        ];
+        const reviveA = Change.revive(0, 2, 0, tag1);
+        const reviveB = Change.revive(0, 3, 0, tag2);
         // TODO: test with merge-right policy as well
         const expected: SF.Changeset = [
-            { type: "Revive", id: 2, count: 3, detachedBy: tag2, detachIndex: 0 },
-            { type: "Revive", id: 1, count: 2, detachedBy: tag1, detachIndex: 0 },
+            { type: "Revive", id: 0, count: 3, detachedBy: tag2, detachIndex: 0 },
+            { type: "Revive", id: 0, count: 2, detachedBy: tag1, detachIndex: 0 },
         ];
-        const actual = shallowCompose([reviveA, reviveB]);
+        const actual = shallowCompose([makeAnonChange(reviveA), makeAnonChange(reviveB)]);
         assert.deepEqual(actual, expected);
     });
 
@@ -457,7 +437,7 @@ describe("SequenceField - Compose", () => {
             4,
             { type: "Revive", id: 4, count: 1, detachedBy: tag1, detachIndex: 0 },
         ];
-        const actual = shallowCompose([insert, revive]);
+        const actual = shallowCompose([makeAnonChange(insert), makeAnonChange(revive)]);
         const expected: SF.Changeset = [
             { type: "Revive", id: 3, count: 1, detachedBy: tag1, detachIndex: 0 },
             { type: "Insert", id: 1, content: [{ type, value: 1 }] },
