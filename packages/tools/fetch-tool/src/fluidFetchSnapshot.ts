@@ -6,13 +6,15 @@
 import fs from "fs";
 import util from "util";
 
-import { bufferToString, stringToBuffer } from "@fluidframework/common-utils";
-import { IDocumentService, IDocumentStorageService } from "@fluidframework/driver-definitions";
-import { BlobAggregationStorage } from "@fluidframework/driver-utils";
-import { ISnapshotTree, IVersion } from "@fluidframework/protocol-definitions";
-import { TelemetryNullLogger } from "@fluidframework/telemetry-utils";
+import { bufferToString, stringToBuffer } from "@fluid-internal/client-utils";
+import {
+	IDocumentService,
+	IDocumentStorageService,
+	ISnapshotTree,
+	IVersion,
+} from "@fluidframework/driver-definitions/internal";
 
-import { formatNumber } from "./fluidAnalyzeMessages";
+import { formatNumber } from "./fluidAnalyzeMessages.js";
 import {
 	dumpSnapshotStats,
 	dumpSnapshotTrees,
@@ -20,9 +22,8 @@ import {
 	paramActualFormatting,
 	paramNumSnapshotVersions,
 	paramSnapshotVersionIndex,
-	paramUnpackAggregatedBlobs,
-} from "./fluidFetchArgs";
-import { latestVersionsId } from "./fluidFetchInit";
+} from "./fluidFetchArgs.js";
+import { latestVersionsId } from "./fluidFetchInit.js";
 
 interface ISnapshotInfo {
 	blobCountNew: number;
@@ -67,9 +68,8 @@ function fetchBlobs(
 	blobIdMap: Map<string, number>,
 ) {
 	const result: IFetchedBlob[] = [];
-	for (const item of Object.keys(tree.blobs)) {
+	for (const [item, blobId] of Object.entries(tree.blobs)) {
 		const treePath = `${prefix}${item}`;
-		const blobId = tree.blobs[item];
 		if (blobId !== null) {
 			let reused = true;
 			let blob = blobCachePrevious.get(blobId);
@@ -133,8 +133,7 @@ async function fetchBlobsFromSnapshotTree(
 	const blobIdMap = parentBlobIdMap ?? new Map<string, number>();
 	let result: IFetchedData[] = fetchBlobs(prefix, tree, storage, blobIdMap);
 
-	for (const subtreeId of Object.keys(tree.trees)) {
-		const subtree = tree.trees[subtreeId];
+	for (const [subtreeId, subtree] of Object.entries(tree.trees)) {
 		const dataStoreBlobs = await fetchBlobsFromSnapshotTree(
 			storage,
 			subtree,
@@ -184,11 +183,16 @@ async function dumpSnapshotTreeVerbose(name: string, fetchedData: IFetchedData[]
 
 	console.log("-".repeat(nameLength + 26));
 	console.log(
-		`${"Total snapshot size".padEnd(nameLength)} |        | ${formatNumber(size).padStart(10)}`,
+		`${"Total snapshot size".padEnd(nameLength)} |        | ${formatNumber(size).padStart(
+			10,
+		)}`,
 	);
 }
 
-async function dumpSnapshotTree(name: string, fetchedData: IFetchedData[]): Promise<ISnapshotInfo> {
+async function dumpSnapshotTree(
+	name: string,
+	fetchedData: IFetchedData[],
+): Promise<ISnapshotInfo> {
 	let size = 0;
 	let sizeNew = 0;
 	let blobCountNew = 0;
@@ -257,7 +261,7 @@ async function fetchBlobsFromVersion(storage: IDocumentStorageService, version: 
 		storage.getSnapshotTree(version),
 	);
 	if (!tree) {
-		return Promise.reject(new Error("Failed to load snapshot tree"));
+		throw new Error("Failed to load snapshot tree");
 	}
 	return fetchBlobsFromSnapshotTree(storage, tree);
 }
@@ -271,7 +275,10 @@ async function reportErrors<T>(message: string, res: Promise<T>) {
 	}
 }
 
-export async function fluidFetchSnapshot(documentService?: IDocumentService, saveDir?: string) {
+export async function fluidFetchSnapshot(
+	documentService?: IDocumentService,
+	saveDir?: string,
+) {
 	if (
 		!dumpSnapshotStats &&
 		!dumpSnapshotTrees &&
@@ -290,14 +297,7 @@ export async function fluidFetchSnapshot(documentService?: IDocumentService, sav
 
 	console.log("\n");
 
-	let storage = await documentService.connectToStorage();
-	if (paramUnpackAggregatedBlobs) {
-		storage = BlobAggregationStorage.wrap(
-			storage,
-			new TelemetryNullLogger(),
-			false /* allowPacking */,
-		);
-	}
+	const storage = await documentService.connectToStorage();
 
 	let version: IVersion | undefined;
 	const versions = await reportErrors(

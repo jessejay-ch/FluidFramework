@@ -26,15 +26,37 @@ export {
 	HookArguments,
 	isInPerformanceTestingMode,
 	validateBenchmarkArguments,
+	qualifiedTitle,
 	Titled,
 	BenchmarkTimingOptions,
 	BenchmarkRunningOptions,
 	BenchmarkSyncFunction,
 	BenchmarkAsyncFunction,
 	OnBatch,
+	BenchmarkDescription,
+	CustomBenchmark,
+	BenchmarkTimer,
+	CustomBenchmarkArguments,
+	TestType,
 } from "./Configuration";
-export { benchmark } from "./Runner";
-export { benchmarkMemory, IMemoryTestObject, MemoryTestObjectProps } from "./MemoryTestRunner";
-export { prettyNumber, geometricMean, Stats } from "./ReporterUtilities";
+export {
+	benchmark,
+	benchmarkMemory,
+	benchmarkCustom,
+	IMemoryTestObject,
+	MemoryTestObjectProps,
+	CustomBenchmarkOptions,
+	IMeasurementReporter,
+} from "./mocha";
+export { prettyNumber, geometricMean } from "./RunnerUtilities";
 export { BenchmarkReporter } from "./Reporter";
-export { BenchmarkData, BenchmarkError, BenchmarkResult, isResultError } from "./runBenchmark";
+export { Phase, runBenchmark } from "./runBenchmark";
+export {
+	BenchmarkData,
+	BenchmarkError,
+	BenchmarkResult,
+	Stats,
+	CustomData,
+	isResultError,
+} from "./ResultTypes";
+export { Timer } from "./timer";

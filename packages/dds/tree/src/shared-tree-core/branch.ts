@@ -3,86 +3,171 @@
  * Licensed under the MIT License.
  */
 
-import { assert } from "@fluidframework/common-utils";
+import { assert } from "@fluidframework/core-utils/internal";
+import { type TelemetryEventBatcher, measure } from "@fluidframework/telemetry-utils/internal";
+
 import {
-	AnchorSet,
-	ChangeFamily,
-	ChangeFamilyEditor,
+	type BranchRebaseResult,
+	type ChangeFamily,
+	type ChangeFamilyEditor,
+	CommitKind,
+	type GraphCommit,
+	type RevisionTag,
+	type TaggedChange,
 	findAncestor,
-	GraphCommit,
+	makeAnonChange,
 	mintCommit,
-	mintRevisionTag,
-	Rebaser,
-	RepairDataStore,
-} from "../core";
-import { EventEmitter } from "../events";
-import { TransactionResult } from "../util";
-import { TransactionStack } from "./transactionStack";
+	rebaseBranch,
+	tagRollbackInverse,
+	type RebaseStatsWithDuration,
+} from "../core/index.js";
+import type { Listenable } from "@fluidframework/core-interfaces";
+import { createEmitter } from "@fluid-internal/client-utils";
+
+import { hasSome, defineLazyCachedProperty } from "../util/index.js";
+
+/**
+ * Describes a change to a `SharedTreeBranch`. Each of the following event types provides a `change` which contains the net change to the branch (or is undefined if there was no net change):
+ * * Append - when one or more commits are appended to the head of the branch, for example via
+ * a change applied by the branch's editor, or as a result of merging another branch into this one
+ * * Remove - when one or more commits are removed from the head of the branch.
+ * * Rebase - when a rebase operation adds commits from another branch and replaces existing commits with their rebased versions.
+ */
+export type SharedTreeBranchChange<TChange> =
+	| {
+			type: "append";
+			kind: CommitKind;
+			change: TaggedChange<TChange>;
+			/** The commits appended to the head of the branch by this operation */
+			newCommits: readonly [GraphCommit<TChange>, ...GraphCommit<TChange>[]];
+	  }
+	| {
+			type: "remove";
+			change: TaggedChange<TChange>;
+			/** The commits removed from the head of the branch by this operation */
+			removedCommits: readonly [GraphCommit<TChange>, ...GraphCommit<TChange>[]];
+	  }
+	| {
+			type: "rebase";
+			change: TaggedChange<TChange> | undefined;
+	  };
 
 /**
  * The events emitted by a `SharedTreeBranch`
  */
-export interface SharedTreeBranchEvents<TChange> {
+export interface SharedTreeBranchEvents<TEditor extends ChangeFamilyEditor, TChange>
+	extends BranchTrimmingEvents {
 	/**
-	 * Fired any time the branch has a new change applied to it
+	 * Fired just before the head of this branch changes.
+	 * @param change - the change to this branch's state and commits
 	 */
-	onChange(change: TChange): void;
+	beforeChange(change: SharedTreeBranchChange<TChange>): void;
+
+	/**
+	 * Fired just after the head of this branch changes.
+	 * @param change - the change to this branch's state and commits
+	 */
+	afterChange(change: SharedTreeBranchChange<TChange>): void;
+
+	/**
+	 * Fired when this branch forks
+	 * @param fork - the new branch that forked off of this branch
+	 */
+	fork(fork: SharedTreeBranch<TEditor, TChange>): void;
+
+	/**
+	 * Fired after this branch is disposed
+	 */
+	dispose(): void;
+}
+
+/**
+ * Events related to branch trimming.
+ *
+ * @remarks
+ * Trimming is a very specific kind of mutation which is the only allowed mutations to branches.
+ * References to commits from other commits are removed so that the commit objects can be GC'd by the JS engine.
+ * This happens by changing a commit's parent property to undefined, which drops all commits that are in its "ancestry".
+ * It is done as a performance optimization when it is determined that commits are no longer needed for future computation.
+ */
+export interface BranchTrimmingEvents {
+	/**
+	 * Fired when some contiguous range of commits beginning with the "global tail" of this branch are trimmed from the branch.
+	 * This happens by deleting the parent pointer to the last commit in that range. This event can be fired at any time.
+	 */
+	ancestryTrimmed(trimmedRevisions: RevisionTag[]): void;
 }
 
 /**
  * A branch of changes that can be applied to a SharedTree.
  */
-export class SharedTreeBranch<TEditor extends ChangeFamilyEditor, TChange> extends EventEmitter<
-	SharedTreeBranchEvents<TChange>
-> {
-	private head: GraphCommit<TChange>;
+export class SharedTreeBranch<TEditor extends ChangeFamilyEditor, TChange> {
+	readonly #events = createEmitter<SharedTreeBranchEvents<TEditor, TChange>>();
+	public readonly events: Listenable<SharedTreeBranchEvents<TEditor, TChange>> = this.#events;
 	public readonly editor: TEditor;
-	private readonly transactions = new TransactionStack();
-	private readonly forks = new Set<SharedTreeBranch<TEditor, TChange>>();
 	private disposed = false;
-
+	private readonly unsubscribeBranchTrimmer?: () => void;
 	/**
-	 * @param getBaseBranch - a function which retrieves the head of the base branch
-	 * @param mergeIntoBase - a function which describes how to merge this branch into the base branch which created it.
-	 * It is responsible for rebasing the changes properly across branches and updating the head of the base branch.
-	 * It returns the net change to the child branch.
-	 * @param sessionId - the session ID used to author commits made by to this branch
-	 * @param rebaser - a rebaser to rebase this branch's changes when it pulls or merges
+	 * Construct a new branch.
+	 * @param head - the head of the branch
+	 * @param changeFamily - determines the set of changes that this branch can commit
+	 * @param branchTrimmer - an optional event emitter that informs the branch it has been trimmed. If this is not supplied, then the branch must
+	 * never be trimmed. See {@link BranchTrimmingEvents} for details on trimming.
 	 */
 	public constructor(
-		private readonly getBaseBranch: () => GraphCommit<TChange>,
-		private readonly mergeIntoBase: (forked: SharedTreeBranch<TEditor, TChange>) => TChange,
-		private readonly sessionId: string,
-		private readonly rebaser: Rebaser<TChange>,
-		private readonly changeFamily: ChangeFamily<TEditor, TChange>,
-		private readonly anchors: AnchorSet,
+		private head: GraphCommit<TChange>,
+		public readonly changeFamily: ChangeFamily<TEditor, TChange>,
+		private readonly mintRevisionTag: () => RevisionTag,
+		private readonly branchTrimmer?: Listenable<BranchTrimmingEvents>,
+		private readonly telemetryEventBatcher?: TelemetryEventBatcher<
+			keyof RebaseStatsWithDuration
+		>,
 	) {
-		super();
-		this.head = getBaseBranch();
-		this.editor = this.changeFamily.buildEditor(
-			(change) => this.applyChange(change, false),
-			anchors,
+		this.editor = this.changeFamily.buildEditor(mintRevisionTag, (change) =>
+			this.apply(change),
 		);
+		this.unsubscribeBranchTrimmer = branchTrimmer?.on("ancestryTrimmed", (commit) => {
+			this.#events.emit("ancestryTrimmed", commit);
+		});
 	}
 
-	public applyChange(change: TChange, rebaseAnchors = true): void {
+	/**
+	 * Sets the head of this branch.
+	 * @remarks This is a "manual override" of sorts, for when the branch needs to be set to a certain state without going through the usual flow of edits.
+	 * This might be necessary as a performance optimization, or to prevent parts of the system updating incorrectly (this method emits no change events!).
+	 */
+	public setHead(head: GraphCommit<TChange>): void {
 		this.assertNotDisposed();
-		const revision = mintRevisionTag();
-		this.head = mintCommit(this.head, {
-			revision,
-			sessionId: this.sessionId,
-			change,
+		this.head = head;
+	}
+
+	/**
+	 * Apply a change to this branch.
+	 * @param change - the change to apply
+	 * @param kind - the kind of change to apply
+	 * @returns the change that was applied and the new head commit of the branch
+	 */
+	public apply(change: TaggedChange<TChange>, kind: CommitKind = CommitKind.Default): void {
+		this.assertNotDisposed();
+
+		const revisionTag = change.revision;
+		assert(revisionTag !== undefined, 0xa49 /* Revision tag must be provided */);
+
+		const newHead = mintCommit(this.head, {
+			revision: revisionTag,
+			change: change.change,
 		});
 
-		this.transactions.repairStore?.capture(
-			this.changeFamily.intoDelta(change),
-			this.head.revision,
-		);
+		const changeEvent = {
+			type: "append",
+			kind,
+			change,
+			newCommits: [newHead],
+		} as const;
 
-		if (rebaseAnchors) {
-			this.changeFamily.rebaser.rebaseAnchors(this.anchors, change);
-		}
-		this.emit("onChange", change);
+		this.#events.emit("beforeChange", changeEvent);
+		this.head = newHead;
+		this.#events.emit("afterChange", changeEvent);
 	}
 
 	/**
@@ -92,163 +177,220 @@ export class SharedTreeBranch<TEditor extends ChangeFamilyEditor, TChange> exten
 		return this.head;
 	}
 
-	public startTransaction(repairStore?: RepairDataStore): void {
-		this.transactions.push(this.head.revision, repairStore);
-		this.editor.enterTransaction();
-	}
-
-	public commitTransaction(): TransactionResult.Commit {
-		const [startCommit, commits] = this.popTransaction();
-		this.editor.exitTransaction();
-
-		// Anonymize the commits from this transaction by stripping their revision tags.
-		// Otherwise, the change rebaser will record their tags and those tags no longer exist.
-		const anonymousCommits = commits.map(({ change }) => ({ change, revision: undefined }));
-
-		{
-			// Squash the changes and make the squash commit the new head of this branch
-			const change = this.changeFamily.rebaser.compose(anonymousCommits);
-			this.head = mintCommit(startCommit, {
-				revision: mintRevisionTag(),
-				sessionId: this.sessionId,
-				change,
-			});
-
-			// If there is still an ongoing transaction (because this transaction was nested inside of an outer transaction)
-			// then update the repair data store for that transaction
-			this.transactions.repairStore?.capture(
-				this.changeFamily.intoDelta(change),
-				this.head.revision,
-			);
-		}
-		return TransactionResult.Commit;
-	}
-
-	public abortTransaction(): TransactionResult.Abort {
-		const [startCommit, commits, repairStore] = this.popTransaction();
-		this.editor.exitTransaction();
-		this.head = startCommit;
-		for (let i = commits.length - 1; i >= 0; i--) {
-			const inverse = this.changeFamily.rebaser.invert(commits[i], false, repairStore);
-			this.changeFamily.rebaser.rebaseAnchors(this.anchors, inverse);
-			this.emit("onChange", inverse);
-		}
-		return TransactionResult.Abort;
-	}
-
-	public isTransacting(): boolean {
-		return this.transactions.size !== 0;
-	}
-
-	private popTransaction(): [
-		GraphCommit<TChange>,
-		GraphCommit<TChange>[],
-		RepairDataStore | undefined,
-	] {
-		const { startRevision, repairStore } = this.transactions.pop();
-		const commits: GraphCommit<TChange>[] = [];
-		const startCommit = findAncestor([this.head, commits], (c) => c.revision === startRevision);
-		assert(
-			startCommit !== undefined,
-			0x593 /* Expected branch to be ahead of transaction start revision */,
-		);
-		return [startCommit, commits, repairStore];
-	}
-
-	/**
-	 * Rebase the changes that have been applied to this branch over all the changes in the base branch that have
-	 * occurred since this branch last pulled (or was forked).
-	 * @returns the net change to this branch
-	 */
-	public pull(): TChange {
-		this.assertNotDisposed();
-		const baseBranch = this.getBaseBranch();
-		if (this.head === baseBranch) {
-			// Not necessary for correctness, but skips needless rebase and event firing below
-			return this.rebaser.changeRebaser.compose([]);
-		}
-
-		const [newBranch, change] = this.rebaser.rebaseBranch(this.head, baseBranch);
-		this.head = newBranch;
-		this.changeFamily.rebaser.rebaseAnchors(this.anchors, change);
-		this.emit("onChange", change);
-		return change;
-	}
-
 	/**
 	 * Spawn a new branch that is based off of the current state of this branch.
-	 * Changes made to the new branch will not be applied to this branch until the new branch is merged back in.
+	 * @param commit - The commit to base the new branch off of. Defaults to the head of this branch.
+	 * @remarks Changes made to the new branch will not be applied to this branch until the new branch is {@link SharedTreeBranch.merge | merged} back in.
+	 * Forks created during a transaction will be disposed when the transaction ends.
 	 */
-	public fork(anchors: AnchorSet): SharedTreeBranch<TEditor, TChange> {
+	public fork(commit: GraphCommit<TChange> = this.head): SharedTreeBranch<TEditor, TChange> {
 		this.assertNotDisposed();
 		const fork = new SharedTreeBranch(
-			() => this.head,
-			(forked) => {
-				// In this function, `this` is the base and `forked` is the fork being merged in
-				const changeToForked = forked.pull();
-				assert(
-					forked.getBaseBranch() === this.head,
-					0x594 /* Expected merging checkout branches to be related */,
-				);
-				const commits: GraphCommit<TChange>[] = [];
-				const ancestor = findAncestor([forked.head, commits], (c) => c === this.head);
-				assert(
-					ancestor === this.head,
-					0x595 /* Expected merging checkout branches to be related */,
-				);
-				this.head = forked.head;
-				assert(this.forks.delete(forked), 0x596 /* Invalid checkout merge */);
-				const change = this.rebaser.changeRebaser.compose(commits);
-				this.changeFamily.rebaser.rebaseAnchors(this.anchors, change);
-				this.emit("onChange", change);
-				return changeToForked;
-			},
-			this.sessionId,
-			this.rebaser,
+			commit,
 			this.changeFamily,
-			anchors,
+			this.mintRevisionTag,
+			this.branchTrimmer,
 		);
-		this.forks.add(fork);
+		this.#events.emit("fork", fork);
 		return fork;
 	}
 
 	/**
-	 * Apply all the changes on this branch to the base branch from which it was forked. If the base branch has new
-	 * changes since this branch last pulled (or was forked), then this branch's changes will be rebased over those first.
-	 * After the merge completes, this branch may no longer be forked or mutated.
-	 * @returns the net change to this branch
+	 * Rebase the changes that have been applied to this branch over divergent changes in the given branch.
+	 * After this operation completes, this branch will be based off of `branch`.
+	 *
+	 * @param branch - the branch to rebase onto
+	 * @param upTo - the furthest commit on `branch` over which to rebase (inclusive). Defaults to the head commit of `branch`.
+	 * @returns the result of the rebase or undefined if nothing changed
 	 */
-	public merge(): TChange {
+	public rebaseOnto(
+		branch: SharedTreeBranch<TEditor, TChange>,
+		upTo = branch.getHead(),
+	): void {
 		this.assertNotDisposed();
-		assert(
-			this.transactions.size === 0,
-			0x597 /* Branch may not be merged while transaction is in progress */,
-		);
-		const change = this.mergeIntoBase(this);
-		this.dispose();
-		return change;
-	}
 
-	/**
-	 * Whether or not this branch has been merged into its base via `merge()`.
-	 * If it has, then it may no longer be forked or mutated.
-	 */
-	public isMerged(): boolean {
-		return this.disposed;
-	}
-
-	/**
-	 * Dispose this branch and all branches that descend from it (i.e. have been transitively forked).
-	 */
-	private dispose(): void {
-		this.assertNotDisposed();
-		this.disposed = true;
-		for (const fork of this.forks) {
-			fork.dispose();
+		// Rebase this branch onto the given branch
+		const rebaseResult = this.rebaseBranch(this, branch, upTo);
+		if (rebaseResult === undefined) {
+			return;
 		}
+
+		// The net change to this branch is provided by the `rebaseBranch` API
+		const { newSourceHead, commits } = rebaseResult;
+		const { deletedSourceCommits, targetCommits, sourceCommits } = commits;
+		assert(hasSome(targetCommits), 0xa83 /* Expected commit(s) for a non no-op rebase */);
+
+		const newCommits = targetCommits.concat(sourceCommits);
+		const changeEvent = {
+			type: "rebase",
+			get change() {
+				const change = rebaseResult.sourceChange;
+				return change === undefined ? undefined : makeAnonChange(change);
+			},
+			removedCommits: deletedSourceCommits,
+			newCommits,
+		} as const;
+
+		this.#events.emit("beforeChange", changeEvent);
+		this.head = newSourceHead;
+		this.#events.emit("afterChange", changeEvent);
 	}
 
-	private assertNotDisposed(message?: string | number): void {
-		assert(!this.isMerged(), message ?? "Branch is already merged");
+	/**
+	 * Remove a range of commits from this branch.
+	 * @param commit - All commits after (but not including) this commit will be removed.
+	 * @returns The net change to this branch and the commits that were removed from this branch.
+	 */
+	public removeAfter(commit: GraphCommit<TChange>): void {
+		if (commit === this.head) {
+			return;
+		}
+
+		const removedCommits: GraphCommit<TChange>[] = [];
+		const inverses: TaggedChange<TChange>[] = [];
+		findAncestor([this.head, removedCommits], (c) => {
+			// TODO: Pull this side effect out if/when more diverse ancestry walking helpers are available
+			if (c !== commit) {
+				const revision = this.mintRevisionTag();
+				const inverse = this.changeFamily.rebaser.changeRevision(
+					this.changeFamily.rebaser.invert(c, true, revision),
+					revision,
+					c.revision,
+				);
+
+				inverses.push(tagRollbackInverse(inverse, revision, c.revision));
+				return false;
+			}
+
+			return true;
+		});
+		assert(hasSome(removedCommits), 0xa84 /* Commit must be in the branch's ancestry */);
+
+		const change = makeAnonChange(this.changeFamily.rebaser.compose(inverses));
+		const changeEvent = {
+			type: "remove",
+			change,
+			removedCommits,
+		} as const;
+
+		this.#events.emit("beforeChange", changeEvent);
+		this.head = commit;
+		this.#events.emit("afterChange", changeEvent);
 	}
+
+	/**
+	 * Apply all the divergent changes on the given branch to this branch.
+	 *
+	 * @param branch - the branch to merge into this branch
+	 * @returns the net change to this branch and the commits that were added to this branch by the merge,
+	 * or undefined if nothing changed
+	 */
+	public merge(branch: SharedTreeBranch<TEditor, TChange>): void {
+		this.assertNotDisposed();
+		branch.assertNotDisposed();
+
+		if (branch === this) {
+			return undefined;
+		}
+
+		// Rebase the given branch onto this branch
+		const rebaseResult = this.rebaseBranch(branch, this);
+		if (rebaseResult === undefined) {
+			return undefined;
+		}
+
+		// Compute the net change to this branch
+		const sourceCommits = rebaseResult.commits.sourceCommits;
+		assert(hasSome(sourceCommits), 0xa86 /* Expected source commits in non no-op merge */);
+		const { rebaser } = this.changeFamily;
+		const changeEvent = defineLazyCachedProperty(
+			{
+				type: "append",
+				kind: CommitKind.Default,
+				newCommits: sourceCommits,
+			} as const,
+			"change",
+			() => makeAnonChange(rebaser.compose(sourceCommits)),
+		);
+
+		this.#events.emit("beforeChange", changeEvent);
+		this.head = rebaseResult.newSourceHead;
+		this.#events.emit("afterChange", changeEvent);
+	}
+
+	/** Rebase `branchHead` onto `onto`, but return undefined if nothing changed */
+	private rebaseBranch(
+		branch: SharedTreeBranch<TEditor, TChange>,
+		onto: SharedTreeBranch<TEditor, TChange>,
+		upTo = onto.getHead(),
+	): BranchRebaseResult<TChange> | undefined {
+		const { head } = branch;
+		if (head === upTo) {
+			return undefined;
+		}
+
+		const { duration, output } = measure(() =>
+			rebaseBranch(
+				this.mintRevisionTag,
+				this.changeFamily.rebaser,
+				head,
+				upTo,
+				onto.getHead(),
+			),
+		);
+
+		this.telemetryEventBatcher?.accumulateAndLog({ duration, ...output.telemetryProperties });
+
+		if (this.head === output.newSourceHead) {
+			return undefined;
+		}
+
+		return output;
+	}
+
+	/**
+	 * Dispose this branch, freezing its state.
+	 *
+	 * @remarks
+	 * Attempts to further mutate the branch will error.
+	 * Any transactions in progress will be aborted.
+	 * Calling dispose more than once has no effect.
+	 */
+	public dispose(): void {
+		if (this.disposed) {
+			return;
+		}
+
+		this.unsubscribeBranchTrimmer?.();
+
+		this.disposed = true;
+		this.#events.emit("dispose");
+	}
+
+	private assertNotDisposed(): void {
+		assert(!this.disposed, 0x66e /* Branch is disposed */);
+	}
+}
+
+/**
+ * Registers an event listener that fires when the given branch forks.
+ * The listener will also fire when any of those forks fork, and when those forks of forks fork, and so on.
+ * @param branch - the branch that will be listened to for forks
+ * @param onFork - the fork event listener
+ * @returns a function which when called will deregister all registrations (including transitive) created by this function.
+ * The deregister function has undefined behavior if called more than once.
+ */
+// Branches are invariant over TChange
+export function onForkTransitive<T extends { events: Listenable<{ fork(t: T): void }> }>(
+	branch: T,
+	onFork: (fork: T) => void,
+): () => void {
+	const offs: (() => void)[] = [];
+	offs.push(
+		branch.events.on("fork", (fork: T) => {
+			offs.push(onForkTransitive(fork, onFork));
+			onFork(fork);
+		}),
+	);
+	return () => offs.forEach((off) => off());
 }

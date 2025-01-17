@@ -5,28 +5,31 @@
 
 // eslint-disable-next-line import/no-nodejs-modules
 import assert from "assert";
-import { EventEmitter } from "events";
+
+import { EventEmitter } from "@fluid-example/example-utils";
+import { MergeTreeMaintenanceType, segmentIsRemoved } from "@fluidframework/merge-tree/legacy";
 import {
 	ISegment,
-	ReferencePosition,
-	MergeTreeMaintenanceType,
 	LocalReferencePosition,
-} from "@fluidframework/merge-tree";
-import { SequenceEvent } from "@fluidframework/sequence";
-import { FlowDocument } from "../document";
+	ReferencePosition,
+	SequenceEvent,
+} from "@fluidframework/sequence/legacy";
+
+import { FlowDocument } from "../document/index.js";
 import {
-	clamp,
 	Dom,
+	TagName,
+	clamp,
 	done,
 	emptyObject,
 	getSegmentRange,
 	hasTagName,
 	isTextNode,
-	TagName,
-} from "../util";
-import { extractRef, updateRef } from "../util/localref";
-import { debug } from "./debug";
-import { BootstrapFormatter, Formatter, IFormatterState, RootFormatter } from "./formatter";
+} from "../util/index.js";
+import { extractRef, updateRef } from "../util/localref.js";
+
+import { debug } from "./debug.js";
+import { BootstrapFormatter, Formatter, IFormatterState, RootFormatter } from "./formatter.js";
 
 interface ILayoutCursor {
 	parent: Node;
@@ -298,6 +301,7 @@ export class Layout extends EventEmitter {
 			"  pushFormat(%o,pos=%d,%s,start=%d,end=%d,depth=%d)",
 			formatter,
 			this.position,
+			// eslint-disable-next-line @typescript-eslint/no-base-to-string
 			segment.toString(),
 			this.startOffset,
 			this.endOffset,
@@ -305,7 +309,7 @@ export class Layout extends EventEmitter {
 		);
 
 		// Must not request a formatter for a removed segment.
-		assert.strictEqual(segment.removedSeq, undefined);
+		assert.strictEqual(segmentIsRemoved(segment), false);
 
 		// If we've checkpointed this segment previously, we can potentially reuse our previous state to
 		// minimize damage to the DOM.
@@ -417,7 +421,7 @@ export class Layout extends EventEmitter {
 
 	public nodeToSegment(node: Node): ISegment {
 		const seg = this.nodeToSegmentMap.get(node);
-		return seg && (seg.removedSeq === undefined ? seg : undefined);
+		return seg && (!segmentIsRemoved(seg) ? seg : undefined);
 	}
 
 	public segmentAndOffsetToNodeAndOffset(segment: ISegment, offset: number) {
@@ -605,7 +609,7 @@ export class Layout extends EventEmitter {
 
 		// If the segment was removed, promptly remove any DOM nodes it emitted.
 		for (const { segment } of e.ranges) {
-			if (segment.removedSeq) {
+			if (segmentIsRemoved(segment)) {
 				this.removeSegment(segment);
 			}
 		}

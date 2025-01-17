@@ -7,7 +7,9 @@ import assert from "assert";
 import express from "express";
 import request from "supertest";
 import nconf from "nconf";
+import { TypedEventEmitter } from "@fluidframework/common-utils";
 import { Lumberjack, TestEngine1 } from "@fluidframework/server-services-telemetry";
+import { ICollaborationSessionEvents } from "@fluidframework/server-lambdas";
 import {
 	TestTenantManager,
 	TestThrottler,
@@ -15,6 +17,8 @@ import {
 	TestDbFactory,
 	TestProducer,
 	TestKafka,
+	TestNotImplementedDocumentRepository,
+	TestClusterDrainingStatusChecker,
 } from "@fluidframework/server-test-utils";
 import {
 	IDocument,
@@ -25,14 +29,16 @@ import * as alfredApp from "../../alfred/app";
 import { IAlfredTenant } from "@fluidframework/server-services-client";
 import { ScopeType } from "@fluidframework/protocol-definitions";
 import { generateToken } from "@fluidframework/server-services-utils";
-import { TestCache } from "@fluidframework/server-test-utils";
-import { DeltaService } from "../../alfred/services";
+import { TestCache, TestFluidAccessTokenGenerator } from "@fluidframework/server-test-utils";
+import { DeltaService, DocumentDeleteService } from "../../alfred/services";
 import * as SessionHelper from "../../utils/sessionHelper";
 import Sinon from "sinon";
 import { Constants } from "../../utils";
+import { StartupCheck } from "@fluidframework/server-services-shared";
 
 const nodeCollectionName = "testNodes";
 const documentsCollectionName = "testDocuments";
+const checkpointsCollectionName = "testCheckpoints";
 const deltasCollectionName = "testDeltas";
 const rawDeltasCollectionName = "testRawDeltas";
 const defaultProvider = new nconf.Provider({}).defaults({
@@ -66,9 +72,20 @@ if (!Lumberjack.isSetupCompleted()) {
 describe("Routerlicious", () => {
 	describe("Alfred", () => {
 		describe("API", async () => {
+			const appTenant1: IAlfredTenant = {
+				id: "default-tenant-1",
+				key: "tenant-key-1",
+			};
+			const appTenant2: IAlfredTenant = {
+				id: "default-tenant-2",
+				key: "tenant-key-2",
+			};
+			const defaultAppTenants: IAlfredTenant[] = [appTenant1, appTenant2];
 			const defaultTenantManager = new TestTenantManager();
 			const document1 = {
 				_id: "doc-1",
+				tenantId: appTenant1.id,
+				documentId: "doc-1",
 				content: "Hello, World!",
 			};
 			const defaultDbFactory = new TestDbFactory({
@@ -84,19 +101,11 @@ describe("Routerlicious", () => {
 				defaultMongoManager,
 				nodeCollectionName,
 				documentsCollectionName,
+				checkpointsCollectionName,
 				deltasCollectionName,
 				rawDeltasCollectionName,
 			);
 			const defaultStorage = new TestDocumentStorage(defaultDbManager, defaultTenantManager);
-			const appTenant1: IAlfredTenant = {
-				id: "default-tenant-1",
-				key: "tenant-key-1",
-			};
-			const appTenant2: IAlfredTenant = {
-				id: "default-tenant-2",
-				key: "tenant-key-2",
-			};
-			const defaultAppTenants: IAlfredTenant[] = [appTenant1, appTenant2];
 			const defaultSingleUseTokenCache = new TestCache();
 			const scopes = [ScopeType.DocRead, ScopeType.DocWrite, ScopeType.SummaryWrite];
 			const tenantToken1 = `Basic ${generateToken(
@@ -111,21 +120,63 @@ describe("Routerlicious", () => {
 				appTenant2.key,
 				scopes,
 			)}`;
+			const tenantToken3 = `Basic ${generateToken(
+				appTenant1.id,
+				document1._id,
+				appTenant1.key,
+				scopes,
+			)}`;
+			const tenantToken4 = `Basic ${generateToken(
+				appTenant1.id,
+				document1._id,
+				appTenant1.key,
+				scopes,
+			)}`;
 			const defaultProducer = new TestProducer(new TestKafka());
-			const defaultDb = await defaultMongoManager.getDatabase();
-			const defaultDeltaService = new DeltaService(defaultMongoManager, defaultTenantManager);
-			const defaultDocumentsCollection =
-				defaultDb.collection<IDocument>(documentsCollectionName);
+			const deltasCollection = await defaultDbManager.getDeltaCollection(
+				undefined,
+				undefined,
+			);
+			const defaultDeltaService = new DeltaService(deltasCollection, defaultTenantManager);
+			const defaultDocumentRepository = new TestNotImplementedDocumentRepository();
+			const defaultDocumentDeleteService = new DocumentDeleteService();
+			const defaultCollaborationSessionEventEmitter =
+				new TypedEventEmitter<ICollaborationSessionEvents>();
 			let app: express.Application;
 			let supertest: request.SuperTest<request.Test>;
+			let testFluidAccessTokenGenerator: TestFluidAccessTokenGenerator;
+			let testClusterDrainingStatusChecker: TestClusterDrainingStatusChecker;
 			describe("throttling", () => {
 				const limitTenant = 10;
 				const limitCreateDoc = 5;
 				const limitGetDeltas = 5;
+				const limitGetSession = 5;
 				beforeEach(() => {
-					const tenantThrottler = new TestThrottler(limitTenant);
+					const restTenantThrottler = new TestThrottler(limitTenant);
+					const restTenantGetDeltasThrottler = new TestThrottler(limitTenant);
+					const restTenantCreateDocThrottler = new TestThrottler(limitTenant);
+					const restTenantGetSessionThrottler = new TestThrottler(limitTenant);
+					const restTenantThrottlers = new Map<string, TestThrottler>();
+					restTenantThrottlers.set(
+						Constants.generalRestCallThrottleIdPrefix,
+						restTenantThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.getDeltasThrottleIdPrefix,
+						restTenantGetDeltasThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.createDocThrottleIdPrefix,
+						restTenantCreateDocThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.getSessionThrottleIdPrefix,
+						restTenantGetSessionThrottler,
+					);
+
 					const restCreateDocThrottler = new TestThrottler(limitCreateDoc);
 					const restGetDeltasThrottler = new TestThrottler(limitGetDeltas);
+					const restGetSessionThrottler = new TestThrottler(limitGetSession);
 					const restClusterThrottlers = new Map<string, TestThrottler>();
 					restClusterThrottlers.set(
 						Constants.createDocThrottleIdPrefix,
@@ -135,29 +186,45 @@ describe("Routerlicious", () => {
 						Constants.getDeltasThrottleIdPrefix,
 						restGetDeltasThrottler,
 					);
+					restClusterThrottlers.set(
+						Constants.getSessionThrottleIdPrefix,
+						restGetSessionThrottler,
+					);
+					const startupCheck = new StartupCheck();
+					testFluidAccessTokenGenerator = new TestFluidAccessTokenGenerator();
 					app = alfredApp.create(
 						defaultProvider,
 						defaultTenantManager,
-						tenantThrottler,
+						restTenantThrottlers,
 						restClusterThrottlers,
 						defaultSingleUseTokenCache,
 						defaultStorage,
 						defaultAppTenants,
 						defaultDeltaService,
 						defaultProducer,
-						defaultDocumentsCollection,
+						defaultDocumentRepository,
+						defaultDocumentDeleteService,
+						startupCheck,
+						undefined,
+						undefined,
+						defaultCollaborationSessionEventEmitter,
+						undefined,
+						undefined,
+						undefined,
+						testFluidAccessTokenGenerator,
 					);
 					supertest = request(app);
 				});
 
 				const assertThrottle = async (
 					url: string,
-					token: string | (() => string),
-					body: any,
+					token: string | (() => string) | undefined,
+					body: any | undefined,
 					method: "get" | "post" | "patch" = "get",
 					limit: number = limitTenant,
 				): Promise<void> => {
-					const tokenProvider = typeof token === "function" ? token : () => token;
+					const tokenProvider =
+						typeof token === "function" ? token : () => token ?? "no-token";
 					for (let i = 0; i < limit; i++) {
 						// we're not interested in making the requests succeed with 200s, so just assert that not 429
 						await supertest[method](url)
@@ -175,21 +242,29 @@ describe("Routerlicious", () => {
 
 				describe("/api/v1", () => {
 					it("/ping", async () => {
-						await assertThrottle("/api/v1/ping", null, null);
+						await assertThrottle("/api/v1/ping", undefined, undefined);
+					});
+					it("/tenants/:tenantid/accesstoken", async () => {
+						await assertThrottle(
+							`/api/v1/tenants/${appTenant1.id}/accesstoken`,
+							"Bearer 12345", // Dummy bearer token
+							undefined,
+							"post",
+						);
 					});
 					it("/:tenantId/:id/root", async () => {
 						await assertThrottle(
 							`/api/v1/${appTenant1.id}/${document1._id}/root`,
-							null,
-							null,
+							undefined,
+							undefined,
 							"patch",
 						);
 					});
 					it("/:tenantId/:id/blobs", async () => {
 						await assertThrottle(
 							`/api/v1/${appTenant1.id}/${document1._id}/blobs`,
-							null,
-							null,
+							undefined,
+							undefined,
 							"post",
 						);
 					});
@@ -200,12 +275,12 @@ describe("Routerlicious", () => {
 						await assertThrottle(
 							`/documents/${appTenant2.id}/${document1._id}`,
 							tenantToken2,
-							null,
+							undefined,
 						);
 						await assertThrottle(
 							`/documents/${appTenant1.id}/${document1._id}`,
 							tenantToken1,
-							null,
+							undefined,
 						);
 						await supertest
 							.get(`/documents/${appTenant1.id}/${document1._id}`)
@@ -230,12 +305,12 @@ describe("Routerlicious", () => {
 						await assertThrottle(
 							`/deltas/raw/${appTenant2.id}/${document1._id}`,
 							tenantToken2,
-							null,
+							undefined,
 						);
 						await assertThrottle(
 							`/deltas/raw/${appTenant1.id}/${document1._id}`,
 							tenantToken1,
-							null,
+							undefined,
 						);
 						await supertest
 							.get(`/deltas/raw/${appTenant1.id}/${document1._id}`)
@@ -246,7 +321,7 @@ describe("Routerlicious", () => {
 						await assertThrottle(
 							`/deltas/${appTenant1.id}/${document1._id}`,
 							tenantToken1,
-							null,
+							undefined,
 							"get",
 							limitGetDeltas,
 						);
@@ -259,12 +334,12 @@ describe("Routerlicious", () => {
 						await assertThrottle(
 							`/deltas/v1/${appTenant2.id}/${document1._id}`,
 							tenantToken2,
-							null,
+							undefined,
 						);
 						await assertThrottle(
 							`/deltas/v1/${appTenant1.id}/${document1._id}`,
 							tenantToken1,
-							null,
+							undefined,
 						);
 						await supertest
 							.get(`/deltas/v1/${appTenant1.id}/${document1._id}`)
@@ -275,12 +350,12 @@ describe("Routerlicious", () => {
 						await assertThrottle(
 							`/deltas/${appTenant2.id}/${document1._id}/v1`,
 							tenantToken2,
-							null,
+							undefined,
 						);
 						await assertThrottle(
 							`/deltas/${appTenant1.id}/${document1._id}/v1`,
 							tenantToken1,
-							null,
+							undefined,
 						);
 						await supertest
 							.get(`/deltas/${appTenant1.id}/${document1._id}/v1`)
@@ -293,31 +368,140 @@ describe("Routerlicious", () => {
 			describe("authorization", () => {
 				const maxThrottlerLimit = 10;
 				beforeEach(() => {
-					const tenantThrottler = new TestThrottler(maxThrottlerLimit);
-					const restCreateDocThrottler = new TestThrottler(maxThrottlerLimit);
-					const restGetDeltasThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantGetDeltasThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantCreateDocThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantGetSessionThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantThrottlers = new Map<string, TestThrottler>();
+					restTenantThrottlers.set(
+						Constants.generalRestCallThrottleIdPrefix,
+						restTenantThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.getDeltasThrottleIdPrefix,
+						restTenantGetDeltasThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.createDocThrottleIdPrefix,
+						restTenantCreateDocThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.getSessionThrottleIdPrefix,
+						restTenantGetSessionThrottler,
+					);
+
+					const restClusterCreateDocThrottler = new TestThrottler(maxThrottlerLimit);
+					const restClusterGetDeltasThrottler = new TestThrottler(maxThrottlerLimit);
+					const restClusterGetSessionThrottler = new TestThrottler(maxThrottlerLimit);
 					const restClusterThrottlers = new Map<string, TestThrottler>();
 					restClusterThrottlers.set(
 						Constants.createDocThrottleIdPrefix,
-						restCreateDocThrottler,
+						restClusterCreateDocThrottler,
 					);
 					restClusterThrottlers.set(
 						Constants.getDeltasThrottleIdPrefix,
-						restGetDeltasThrottler,
+						restClusterGetDeltasThrottler,
 					);
+					restClusterThrottlers.set(
+						Constants.getSessionThrottleIdPrefix,
+						restClusterGetSessionThrottler,
+					);
+
+					const startupCheck = new StartupCheck();
+					testFluidAccessTokenGenerator = new TestFluidAccessTokenGenerator();
 					app = alfredApp.create(
 						defaultProvider,
 						defaultTenantManager,
-						tenantThrottler,
+						restTenantThrottlers,
 						restClusterThrottlers,
 						defaultSingleUseTokenCache,
 						defaultStorage,
 						defaultAppTenants,
 						defaultDeltaService,
 						defaultProducer,
-						defaultDocumentsCollection,
+						defaultDocumentRepository,
+						defaultDocumentDeleteService,
+						startupCheck,
+						undefined,
+						undefined,
+						defaultCollaborationSessionEventEmitter,
+						undefined,
+						undefined,
+						undefined,
+						testFluidAccessTokenGenerator,
 					);
 					supertest = request(app);
+				});
+
+				describe("/api/v1", () => {
+					it("/api/v1/tenants/:tenantid/accesstoken", async () => {
+						const body = {
+							documentId: "doc-1",
+						};
+
+						await supertest
+							.post(`/api/v1/tenants/${appTenant1.id}/accesstoken`)
+							.set("Authorization", "Bearer 12345")
+							.set("Content-Type", "application/json")
+							.send(body)
+							.expect(201);
+					});
+					it("/api/v1/tenants/:tenantid/accesstoken missing-bearer-token", async () => {
+						const body = {
+							documentId: "doc-1",
+						};
+
+						await supertest
+							.post(`/api/v1/tenants/${appTenant1.id}/accesstoken`)
+							.set("Content-Type", "application/json")
+							.send(body)
+							.expect(400);
+					});
+					it("/api/v1/tenants/:tenantid/accesstoken invalid-token", async () => {
+						const body = {
+							documentId: "doc-1",
+						};
+
+						await supertest
+							.post(`/api/v1/tenants/${appTenant1.id}/accesstoken`)
+							.set("Authorization", "Basic 12345")
+							.set("Content-Type", "application/json")
+							.send(body)
+							.expect(400);
+					});
+					it("/api/v1/:tenantId/:id/broadcast-signal", async () => {
+						const body = {
+							signalContent: {
+								contents: {
+									type: "ExternalDataChanged_V1.0.0",
+									content: { taskListId: "task-list-1" },
+								},
+							},
+						};
+
+						await supertest
+							.post(`/api/v1/${appTenant1.id}/${document1._id}/broadcast-signal`)
+							.send(body)
+							.set("Authorization", tenantToken1)
+							.set("Content-Type", "application/json")
+							.expect(200);
+					});
+					it("/api/v1/:tenantId/:id/broadcast-signal invalid-token", async () => {
+						const body = {
+							signalContent: {
+								contents: {
+									type: "ExternalDataChanged_V1.0.0",
+									content: { taskListId: "task-list-1" },
+								},
+							},
+						};
+
+						await supertest
+							.post(`/api/v1/${appTenant1.id}/${document1._id}/broadcast-signal`)
+							.send(body)
+							.set("Content-Type", "application/json")
+							.expect(403);
+					});
 				});
 
 				describe("/documents", () => {
@@ -326,6 +510,19 @@ describe("Routerlicious", () => {
 							.get(`/documents/${appTenant1.id}/${document1._id}`)
 							.set("Authorization", tenantToken1)
 							.expect(200);
+					});
+					it("/:tenantId/:id-NotFound", async () => {
+						const nonExistingDocumentId = "nonExistingDocumentId";
+						const tenantToken1OnNonExistingDocument = `Basic ${generateToken(
+							appTenant1.id,
+							nonExistingDocumentId,
+							appTenant1.key,
+							scopes,
+						)}`;
+						await supertest
+							.get(`/documents/${appTenant1.id}/${nonExistingDocumentId}`)
+							.set("Authorization", tenantToken1OnNonExistingDocument)
+							.expect(404);
 					});
 					it("/:tenantId/:id-invalidToken", async () => {
 						await supertest
@@ -380,29 +577,67 @@ describe("Routerlicious", () => {
 
 				const maxThrottlerLimit = 1000000;
 				beforeEach(() => {
-					const tenantThrottler = new TestThrottler(maxThrottlerLimit);
-					const restCreateDocThrottler = new TestThrottler(maxThrottlerLimit);
-					const restGetDeltasThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantGetDeltasThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantCreateDocThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantGetSessionThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantThrottlers = new Map<string, TestThrottler>();
+					restTenantThrottlers.set(
+						Constants.generalRestCallThrottleIdPrefix,
+						restTenantThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.getDeltasThrottleIdPrefix,
+						restTenantGetDeltasThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.createDocThrottleIdPrefix,
+						restTenantCreateDocThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.getSessionThrottleIdPrefix,
+						restTenantGetSessionThrottler,
+					);
+
+					const restClusterCreateDocThrottler = new TestThrottler(maxThrottlerLimit);
+					const restClusterGetDeltasThrottler = new TestThrottler(maxThrottlerLimit);
+					const restClusterGetSessionThrottler = new TestThrottler(maxThrottlerLimit);
 					const restClusterThrottlers = new Map<string, TestThrottler>();
 					restClusterThrottlers.set(
 						Constants.createDocThrottleIdPrefix,
-						restCreateDocThrottler,
+						restClusterCreateDocThrottler,
 					);
 					restClusterThrottlers.set(
 						Constants.getDeltasThrottleIdPrefix,
-						restGetDeltasThrottler,
+						restClusterGetDeltasThrottler,
 					);
+					restClusterThrottlers.set(
+						Constants.getSessionThrottleIdPrefix,
+						restClusterGetSessionThrottler,
+					);
+
+					const startupCheck = new StartupCheck();
+					testFluidAccessTokenGenerator = new TestFluidAccessTokenGenerator();
 					app = alfredApp.create(
 						defaultProvider,
 						defaultTenantManager,
-						tenantThrottler,
+						restTenantThrottlers,
 						restClusterThrottlers,
 						defaultSingleUseTokenCache,
 						defaultStorage,
 						defaultAppTenants,
 						defaultDeltaService,
 						defaultProducer,
-						defaultDocumentsCollection,
+						defaultDocumentRepository,
+						defaultDocumentDeleteService,
+						startupCheck,
+						undefined,
+						undefined,
+						defaultCollaborationSessionEventEmitter,
+						undefined,
+						undefined,
+						undefined,
+						testFluidAccessTokenGenerator,
 					);
 					supertest = request(app);
 				});
@@ -425,6 +660,12 @@ describe("Routerlicious", () => {
 					it("/ping", async () => {
 						await assertCorrelationId("/api/v1/ping");
 					});
+					it("/tenants/:tenantid/accesstoken", async () => {
+						await assertCorrelationId(
+							`/api/v1/tenants/${appTenant1.id}/accesstoken`,
+							"post",
+						);
+					});
 					it("/:tenantId/:id/root", async () => {
 						await assertCorrelationId(
 							`/api/v1/${appTenant1.id}/${document1._id}/root`,
@@ -434,6 +675,12 @@ describe("Routerlicious", () => {
 					it("/:tenantId/:id/blobs", async () => {
 						await assertCorrelationId(
 							`/api/v1/${appTenant1.id}/${document1._id}/blobs`,
+							"post",
+						);
+					});
+					it("/api/v1/:tenantId/:id/broadcast-signal", async () => {
+						await assertCorrelationId(
+							`/api/v1/${appTenant1.id}/${document1._id}/broadcast-signal`,
 							"post",
 						);
 					});
@@ -467,29 +714,66 @@ describe("Routerlicious", () => {
 			describe("single-use JWTs", () => {
 				const limit = 1000000;
 				beforeEach(() => {
-					const tenantThrottler = new TestThrottler(limit);
-					const restCreateDocThrottler = new TestThrottler(limit);
-					const restGetDeltasThrottler = new TestThrottler(limit);
+					const restTenantThrottler = new TestThrottler(limit);
+					const restTenantGetDeltasThrottler = new TestThrottler(limit);
+					const restTenantCreateDocThrottler = new TestThrottler(limit);
+					const restTenantGetSessionThrottler = new TestThrottler(limit);
+					const restTenantThrottlers = new Map<string, TestThrottler>();
+					restTenantThrottlers.set(
+						Constants.generalRestCallThrottleIdPrefix,
+						restTenantThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.getDeltasThrottleIdPrefix,
+						restTenantGetDeltasThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.createDocThrottleIdPrefix,
+						restTenantCreateDocThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.getSessionThrottleIdPrefix,
+						restTenantGetSessionThrottler,
+					);
+
+					const restClusterCreateDocThrottler = new TestThrottler(limit);
+					const restClusterGetDeltasThrottler = new TestThrottler(limit);
+					const restClusterGetSessionThrottler = new TestThrottler(limit);
 					const restClusterThrottlers = new Map<string, TestThrottler>();
 					restClusterThrottlers.set(
 						Constants.createDocThrottleIdPrefix,
-						restCreateDocThrottler,
+						restClusterCreateDocThrottler,
 					);
 					restClusterThrottlers.set(
 						Constants.getDeltasThrottleIdPrefix,
-						restGetDeltasThrottler,
+						restClusterGetDeltasThrottler,
 					);
+					restClusterThrottlers.set(
+						Constants.getSessionThrottleIdPrefix,
+						restClusterGetSessionThrottler,
+					);
+					const startupCheck = new StartupCheck();
+					testFluidAccessTokenGenerator = new TestFluidAccessTokenGenerator();
 					app = alfredApp.create(
 						defaultProvider,
 						defaultTenantManager,
-						tenantThrottler,
+						restTenantThrottlers,
 						restClusterThrottlers,
 						new TestCache(),
 						defaultStorage,
 						defaultAppTenants,
 						defaultDeltaService,
 						defaultProducer,
-						defaultDocumentsCollection,
+						defaultDocumentRepository,
+						defaultDocumentDeleteService,
+						startupCheck,
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						testFluidAccessTokenGenerator,
 					);
 					supertest = request(app);
 				});
@@ -519,32 +803,70 @@ describe("Routerlicious", () => {
 
 				beforeEach(() => {
 					const maxThrottlerLimit = 1000000;
-					const tenantThrottler = new TestThrottler(maxThrottlerLimit);
-					const restCreateDocThrottler = new TestThrottler(maxThrottlerLimit);
-					const restGetDeltasThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantGetDeltasThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantCreateDocThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantGetSessionThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantThrottlers = new Map<string, TestThrottler>();
+					restTenantThrottlers.set(
+						Constants.generalRestCallThrottleIdPrefix,
+						restTenantThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.getDeltasThrottleIdPrefix,
+						restTenantGetDeltasThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.createDocThrottleIdPrefix,
+						restTenantCreateDocThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.getSessionThrottleIdPrefix,
+						restTenantGetSessionThrottler,
+					);
+
+					const restClusterCreateDocThrottler = new TestThrottler(maxThrottlerLimit);
+					const restClusterGetDeltasThrottler = new TestThrottler(maxThrottlerLimit);
+					const restClusterGetSessionThrottler = new TestThrottler(maxThrottlerLimit);
 					const restClusterThrottlers = new Map<string, TestThrottler>();
 					restClusterThrottlers.set(
 						Constants.createDocThrottleIdPrefix,
-						restCreateDocThrottler,
+						restClusterCreateDocThrottler,
 					);
 					restClusterThrottlers.set(
 						Constants.getDeltasThrottleIdPrefix,
-						restGetDeltasThrottler,
+						restClusterGetDeltasThrottler,
+					);
+					restClusterThrottlers.set(
+						Constants.getSessionThrottleIdPrefix,
+						restClusterGetSessionThrottler,
 					);
 
 					spyGetSession = Sinon.spy(SessionHelper, "getSession");
 
+					const startupCheck = new StartupCheck();
+					testFluidAccessTokenGenerator = new TestFluidAccessTokenGenerator();
+					testClusterDrainingStatusChecker = new TestClusterDrainingStatusChecker();
 					app = alfredApp.create(
 						defaultProvider,
 						defaultTenantManager,
-						tenantThrottler,
+						restTenantThrottlers,
 						restClusterThrottlers,
 						defaultSingleUseTokenCache,
 						defaultStorage,
 						defaultAppTenants,
 						defaultDeltaService,
 						defaultProducer,
-						defaultDocumentsCollection,
+						defaultDocumentRepository,
+						defaultDocumentDeleteService,
+						startupCheck,
+						undefined,
+						undefined,
+						undefined,
+						testClusterDrainingStatusChecker,
+						undefined,
+						undefined,
+						testFluidAccessTokenGenerator,
 					);
 					supertest = request(app);
 				});
@@ -556,8 +878,10 @@ describe("Routerlicious", () => {
 				describe("documents", () => {
 					it("/:tenantId/session/:id", async () => {
 						// Create a new session
-						Sinon.stub(defaultDocumentsCollection, "upsert").returns(Promise.resolve());
-						Sinon.stub(defaultDocumentsCollection, "findOne")
+						Sinon.stub(defaultDocumentRepository, "updateOne").returns(
+							Promise.resolve(),
+						);
+						Sinon.stub(defaultDocumentRepository, "readOne")
 							.onFirstCall()
 							.returns(Promise.resolve({} as IDocument))
 							.onSecondCall()
@@ -601,6 +925,182 @@ describe("Routerlicious", () => {
 									isSessionAlive: false,
 									isSessionActive: true,
 								});
+							});
+
+						// Error our when the cluster is draining
+						testClusterDrainingStatusChecker.setClusterDrainingStatus(true);
+						await supertest
+							.get(`/documents/${appTenant1.id}/session/${document1._id}`)
+							.set("Authorization", tenantToken1)
+							.expect((res) => {
+								assert.strictEqual(res.status, 503);
+							});
+					});
+				});
+			});
+
+			describe("functionality", () => {
+				const maxThrottlerLimit = 10;
+				beforeEach(() => {
+					const restTenantThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantGetDeltasThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantCreateDocThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantGetSessionThrottler = new TestThrottler(maxThrottlerLimit);
+					const restTenantThrottlers = new Map<string, TestThrottler>();
+					restTenantThrottlers.set(
+						Constants.generalRestCallThrottleIdPrefix,
+						restTenantThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.getDeltasThrottleIdPrefix,
+						restTenantGetDeltasThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.createDocThrottleIdPrefix,
+						restTenantCreateDocThrottler,
+					);
+					restTenantThrottlers.set(
+						Constants.getSessionThrottleIdPrefix,
+						restTenantGetSessionThrottler,
+					);
+
+					const restClusterCreateDocThrottler = new TestThrottler(maxThrottlerLimit);
+					const restClusterGetDeltasThrottler = new TestThrottler(maxThrottlerLimit);
+					const restClusterGetSessionThrottler = new TestThrottler(maxThrottlerLimit);
+					const restClusterThrottlers = new Map<string, TestThrottler>();
+					restClusterThrottlers.set(
+						Constants.createDocThrottleIdPrefix,
+						restClusterCreateDocThrottler,
+					);
+					restClusterThrottlers.set(
+						Constants.getDeltasThrottleIdPrefix,
+						restClusterGetDeltasThrottler,
+					);
+					restClusterThrottlers.set(
+						Constants.getSessionThrottleIdPrefix,
+						restClusterGetSessionThrottler,
+					);
+
+					const startupCheck = new StartupCheck();
+					testClusterDrainingStatusChecker = new TestClusterDrainingStatusChecker();
+					testFluidAccessTokenGenerator = new TestFluidAccessTokenGenerator();
+					app = alfredApp.create(
+						defaultProvider,
+						defaultTenantManager,
+						restTenantThrottlers,
+						restClusterThrottlers,
+						defaultSingleUseTokenCache,
+						defaultStorage,
+						defaultAppTenants,
+						defaultDeltaService,
+						defaultProducer,
+						defaultDocumentRepository,
+						defaultDocumentDeleteService,
+						startupCheck,
+						undefined,
+						undefined,
+						defaultCollaborationSessionEventEmitter,
+						testClusterDrainingStatusChecker,
+						undefined,
+						undefined,
+						testFluidAccessTokenGenerator,
+					);
+					supertest = request(app);
+				});
+
+				describe("/api/v1", () => {
+					it("/tenants/:tenantid/accesstoken validate access token exists in response", async () => {
+						const body = {
+							documentId: "doc-1",
+							customClaims: {
+								claim1: "value1",
+								claim2: "value2",
+							},
+						};
+
+						await supertest
+							.post(`/api/v1/tenants/${appTenant1.id}/accesstoken`)
+							.set("Authorization", "Bearer 12345")
+							.set("Content-Type", "application/json")
+							.send(body)
+							.expect((res) => {
+								assert.strictEqual(res.status, 201);
+								assert.notStrictEqual(res.body.fluidAccessToken, undefined);
+							});
+					});
+					it("/tenants/:tenantid/accesstoken bearer token validation failure", async () => {
+						testFluidAccessTokenGenerator.setFailSignatureValidation();
+						await supertest
+							.post(`/api/v1/tenants/${appTenant1.id}/accesstoken`)
+							.set("Authorization", "Bearer 12345")
+							.set("Content-Type", "application/json")
+							.expect(401);
+					});
+					it("/tenants/:tenantid/accesstoken authorization failure", async () => {
+						testFluidAccessTokenGenerator.setFailAuthorizationValidation();
+						await supertest
+							.post(`/api/v1/tenants/${appTenant1.id}/accesstoken`)
+							.set("Authorization", "Bearer 12345")
+							.set("Content-Type", "application/json")
+							.expect(403);
+					});
+				});
+
+				describe("/api/v1/:tenantId/:id/broadcast-signal", () => {
+					it("Successful request", async () => {
+						const body = {
+							signalContent: {
+								contents: {
+									type: "ExternalDataChanged_V1.0.0",
+									content: { taskListId: "task-list-1" },
+								},
+							},
+						};
+
+						await supertest
+							.post(`/api/v1/${appTenant1.id}/${document1._id}/broadcast-signal`)
+							.send(body)
+							.set("Authorization", tenantToken1)
+							.set("Content-Type", "application/json")
+							.expect(200);
+					});
+
+					it("Invalid request content", async () => {
+						const body = {
+							signalContent: {},
+						};
+
+						await supertest
+							.post(`/api/v1/${appTenant1.id}/${document1._id}/broadcast-signal`)
+							.send(body)
+							.set("Authorization", tenantToken1)
+							.set("Content-Type", "application/json")
+							.expect(400);
+					});
+				});
+
+				describe("/documents", () => {
+					it("/:tenantId cluster in draining status", async () => {
+						testClusterDrainingStatusChecker.setClusterDrainingStatus(true);
+
+						await supertest
+							.post(`/documents/${appTenant1.id}`)
+							.set("Authorization", tenantToken3)
+							.send({ id: document1._id })
+							.expect((res) => {
+								assert.strictEqual(res.status, 503);
+								return true;
+							});
+					});
+
+					it("/:tenantId cluster not in draining status", async () => {
+						await supertest
+							.post(`/documents/${appTenant1.id}`)
+							.set("Authorization", tenantToken4)
+							.send({ id: document1._id })
+							.expect((res) => {
+								assert.notStrictEqual(res.status, 503);
+								return true;
 							});
 					});
 				});

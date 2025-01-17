@@ -5,17 +5,19 @@
 
 import {
 	IChannelAttributes,
+	IChannelFactory,
 	IFluidDataStoreRuntime,
 	IChannelServices,
-	IChannelFactory,
-} from "@fluidframework/datastore-definitions";
-import { ISharedObject } from "@fluidframework/shared-object-base";
-import { Ink } from "./ink";
-import { pkgVersion } from "./packageVersion";
+} from "@fluidframework/datastore-definitions/internal";
+import { ISharedObject } from "@fluidframework/shared-object-base/internal";
+
+import { Ink } from "./ink.js";
+import { pkgVersion } from "./packageVersion.js";
 
 /**
  * Factory for Ink.
  * @sealed
+ * @internal
  */
 export class InkFactory implements IChannelFactory {
 	/**
@@ -35,14 +37,14 @@ export class InkFactory implements IChannelFactory {
 	/**
 	 * {@inheritDoc @fluidframework/datastore-definitions#IChannelFactory."type"}
 	 */
-	public get type() {
+	public get type(): string {
 		return InkFactory.Type;
 	}
 
 	/**
 	 * {@inheritDoc @fluidframework/datastore-definitions#IChannelFactory.attributes}
 	 */
-	public get attributes() {
+	public get attributes(): IChannelAttributes {
 		return InkFactory.Attributes;
 	}
 

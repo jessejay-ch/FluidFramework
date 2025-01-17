@@ -4,10 +4,8 @@
  */
 
 export {
-	Adapters,
-	Compatibility,
-	FieldAdapter,
-	TreeAdapter,
-	ViewSchemaData,
+	type Adapters,
+	type TreeAdapter,
 	AdaptedViewSchema,
-} from "./view";
+	AllowedUpdateType,
+} from "./view.js";

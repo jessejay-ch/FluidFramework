@@ -3,16 +3,16 @@
  * Licensed under the MIT License.
  */
 
-import { TypedEventEmitter } from "@fluidframework/common-utils";
-import {
-	IQuorumClients,
-	IQuorumEvents,
-	ISequencedClient,
-} from "@fluidframework/protocol-definitions";
+import { TypedEventEmitter } from "@fluid-internal/client-utils";
+import { IQuorumClients, ISequencedClient } from "@fluidframework/driver-definitions";
+import { IQuorumEvents } from "@fluidframework/driver-definitions/internal";
 
-export class TestQuorumClients extends TypedEventEmitter<IQuorumEvents> implements IQuorumClients {
+export class TestQuorumClients
+	extends TypedEventEmitter<IQuorumEvents>
+	implements IQuorumClients
+{
 	public disposed = false;
-	public dispose() {
+	public dispose(): void {
 		this.disposed = true;
 	}
 
@@ -26,17 +26,17 @@ export class TestQuorumClients extends TypedEventEmitter<IQuorumEvents> implemen
 		return this.members.get(clientId);
 	}
 
-	public addClient(clientId: string, client: ISequencedClient) {
+	public addClient(clientId: string, client: ISequencedClient): void {
 		this.members.set(clientId, client);
 		this.emit("addMember", clientId, client);
 	}
 
-	public removeClient(clientId: string) {
+	public removeClient(clientId: string): void {
 		this.members.delete(clientId);
 		this.emit("removeMember", clientId);
 	}
 
-	public reset() {
+	public reset(): void {
 		this.members.clear();
 		this.removeAllListeners();
 	}

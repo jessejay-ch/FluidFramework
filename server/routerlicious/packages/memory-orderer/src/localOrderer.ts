@@ -11,7 +11,6 @@ import {
 	CheckpointManager,
 	createDeliCheckpointManagerFromCollection,
 	DeliLambda,
-	ForemanLambda,
 	MoiraLambda,
 	ScribeLambda,
 	ScriptoriumLambda,
@@ -32,13 +31,14 @@ import {
 	IPublisher,
 	IScribe,
 	IServiceConfiguration,
-	ITaskMessageSender,
-	ITenantManager,
 	ITopic,
 	IWebSocket,
 	ILogger,
-	TokenGenerator,
+	IDocumentRepository,
+	ICheckpointRepository,
+	CheckpointService,
 } from "@fluidframework/server-services-core";
+import { getLumberBaseProperties, Lumberjack } from "@fluidframework/server-services-telemetry";
 import { ILocalOrdererSetup } from "./interfaces";
 import { LocalContext } from "./localContext";
 import { LocalKafka } from "./localKafka";
@@ -51,23 +51,30 @@ const DefaultScribe: IScribe = {
 	lastClientSummaryHead: undefined,
 	logOffset: -1,
 	minimumSequenceNumber: -1,
-	protocolState: undefined,
+	protocolState: {
+		members: [],
+		minimumSequenceNumber: 0,
+		proposals: [],
+		sequenceNumber: 0,
+		values: [],
+	},
 	sequenceNumber: -1,
 	lastSummarySequenceNumber: 0,
+	validParentSummaries: undefined,
+	isCorrupt: false,
+	protocolHead: undefined,
+	checkpointTimestamp: Date.now(),
 };
 
 const DefaultDeli: IDeliState = {
 	clients: undefined,
 	durableSequenceNumber: 0,
-	epoch: 0,
 	expHash1: defaultHash,
 	logOffset: -1,
 	sequenceNumber: 0,
 	signalClientConnectionNumber: 0,
-	term: 1,
 	lastSentMSN: 0,
 	nackMessages: undefined,
-	successfullyStartedLambdas: [],
 	checkpointTimestamp: undefined,
 };
 
@@ -89,6 +96,7 @@ class LocalSocketPublisher implements IPublisher {
 
 /**
  * Performs local ordering of messages based on an in-memory stream of operations.
+ * @internal
  */
 export class LocalOrderer implements IOrderer {
 	public static async load(
@@ -96,23 +104,28 @@ export class LocalOrderer implements IOrderer {
 		databaseManager: IDatabaseManager,
 		tenantId: string,
 		documentId: string,
-		taskMessageSender: ITaskMessageSender,
-		tenantManager: ITenantManager,
-		permission: any,
-		tokenGenerator: TokenGenerator,
 		logger: ILogger,
+		documentRepository: IDocumentRepository,
+		deliCheckpointRepository: ICheckpointRepository,
+		scribeCheckpointRepository: ICheckpointRepository,
+		deliCheckpointService: CheckpointService,
+		scribeCheckpointService: CheckpointService,
 		gitManager?: IGitManager,
 		setup: ILocalOrdererSetup = new LocalOrdererSetup(
 			tenantId,
 			documentId,
 			storage,
 			databaseManager,
+			documentRepository,
+			deliCheckpointRepository,
+			scribeCheckpointRepository,
+			deliCheckpointService,
+			scribeCheckpointService,
 			gitManager,
 		),
 		pubSub: IPubSub = new PubSub(),
 		broadcasterContext: IContext = new LocalContext(logger),
 		scriptoriumContext: IContext = new LocalContext(logger),
-		foremanContext: IContext = new LocalContext(logger),
 		scribeContext: IContext = new LocalContext(logger),
 		deliContext: IContext = new LocalContext(logger),
 		moiraContext: IContext = new LocalContext(logger),
@@ -125,15 +138,10 @@ export class LocalOrderer implements IOrderer {
 			documentDetails,
 			tenantId,
 			documentId,
-			taskMessageSender,
-			tenantManager,
 			gitManager,
-			permission,
-			tokenGenerator,
 			pubSub,
 			broadcasterContext,
 			scriptoriumContext,
-			foremanContext,
 			scribeContext,
 			deliContext,
 			moiraContext,
@@ -141,11 +149,10 @@ export class LocalOrderer implements IOrderer {
 		);
 	}
 
-	public rawDeltasKafka: LocalKafka;
-	public deltasKafka: LocalKafka;
+	public rawDeltasKafka!: LocalKafka;
+	public deltasKafka!: LocalKafka;
 
 	public scriptoriumLambda: LocalLambdaController | undefined;
-	public foremanLambda: LocalLambdaController | undefined;
 	public moiraLambda: LocalLambdaController | undefined;
 	public scribeLambda: LocalLambdaController | undefined;
 	public deliLambda: LocalLambdaController | undefined;
@@ -160,15 +167,10 @@ export class LocalOrderer implements IOrderer {
 		private readonly details: IDocumentDetails,
 		private readonly tenantId: string,
 		private readonly documentId: string,
-		private readonly taskMessageSender: ITaskMessageSender,
-		private readonly tenantManager: ITenantManager,
 		private readonly gitManager: IGitManager | undefined,
-		private readonly permission: any,
-		private readonly foremanTokenGenrator: TokenGenerator,
 		private readonly pubSub: IPubSub,
 		private readonly broadcasterContext: IContext,
 		private readonly scriptoriumContext: IContext,
-		private readonly foremanContext: IContext,
 		private readonly scribeContext: IContext,
 		private readonly deliContext: IContext,
 		private readonly moiraContext: IContext,
@@ -245,7 +247,9 @@ export class LocalOrderer implements IOrderer {
 			this.scriptoriumContext,
 			async (lambdaSetup, context) => {
 				const deltasCollection = await lambdaSetup.deltaCollectionP();
-				return new ScriptoriumLambda(deltasCollection, context, undefined);
+				return new ScriptoriumLambda(deltasCollection, context, undefined, async () =>
+					Promise.resolve(),
+				);
 			},
 		);
 
@@ -259,22 +263,6 @@ export class LocalOrderer implements IOrderer {
 					context,
 					this.serviceConfiguration,
 					undefined,
-				),
-		);
-
-		this.foremanLambda = new LocalLambdaController(
-			this.deltasKafka,
-			this.setup,
-			this.foremanContext,
-			async (_, context) =>
-				new ForemanLambda(
-					this.taskMessageSender,
-					this.tenantManager,
-					this.foremanTokenGenrator,
-					this.permission,
-					context,
-					this.tenantId,
-					this.documentId,
 				),
 		);
 
@@ -293,12 +281,12 @@ export class LocalOrderer implements IOrderer {
 			this.setup,
 			this.deliContext,
 			async (lambdaSetup, context) => {
-				const documentCollection = await lambdaSetup.documentCollectionP();
+				const checkpointService = await lambdaSetup.checkpointServiceP("deli");
 				const lastCheckpoint = JSON.parse(this.dbObject.deli);
 				const checkpointManager = createDeliCheckpointManagerFromCollection(
 					this.tenantId,
 					this.documentId,
-					documentCollection,
+					checkpointService,
 				);
 				return new DeliLambda(
 					context,
@@ -312,7 +300,7 @@ export class LocalOrderer implements IOrderer {
 					this.rawDeltasKafka,
 					this.serviceConfiguration,
 					undefined,
-					undefined,
+					checkpointService,
 				);
 			},
 		);
@@ -335,13 +323,19 @@ export class LocalOrderer implements IOrderer {
 
 	private async startScribeLambda(setup: ILocalOrdererSetup, context: IContext) {
 		// Scribe lambda
-		const [documentCollection, scribeMessagesCollection, protocolHead, scribeMessages] =
-			await Promise.all([
-				setup.documentCollectionP(),
-				setup.scribeDeltaCollectionP(),
-				setup.protocolHeadP(),
-				setup.scribeMessagesP(),
-			]);
+		const [
+			documentRepository,
+			localCheckpointCollection,
+			scribeMessagesCollection,
+			protocolHead,
+			scribeMessages,
+		] = await Promise.all([
+			setup.documentRepositoryP(),
+			setup.scribeCheckpointRepositoryP(),
+			setup.scribeDeltaCollectionP(),
+			setup.protocolHeadP(),
+			setup.scribeMessagesP(),
+		]);
 
 		const scribe = this.getScribeState();
 		const lastState = scribe.protocolState
@@ -351,87 +345,131 @@ export class LocalOrderer implements IOrderer {
 		const protocolHandler = new ProtocolOpHandler(
 			scribe.minimumSequenceNumber,
 			scribe.sequenceNumber,
-			1, // TODO (Change when local orderer also ticks epoch)
 			lastState.members,
 			lastState.proposals,
 			lastState.values,
 			() => -1,
 		);
 
+		if (!this.gitManager) {
+			throw new Error("Git manager is required to start scribe lambda.");
+		}
+
 		const summaryReader = new SummaryReader(
 			this.tenantId,
 			this.documentId,
 			this.gitManager,
 			false,
+			this.details.value.isEphemeralContainer,
 		);
 		const latestSummary = await summaryReader.readLastSummary();
 		const summaryWriter = new SummaryWriter(
 			this.tenantId,
 			this.documentId,
 			this.gitManager,
-			null /* deltaService */,
+			undefined /* deltaService */,
 			scribeMessagesCollection,
 			false /* enableWholeSummaryUpload */,
 			latestSummary.messages,
 			false /* getDeltasViaAlfred */,
 		);
+
+		const checkpointService = new CheckpointService(
+			localCheckpointCollection,
+			documentRepository,
+			false,
+		);
+
 		const checkpointManager = new CheckpointManager(
 			context,
 			this.tenantId,
 			this.documentId,
-			documentCollection,
+			documentRepository,
 			scribeMessagesCollection,
-			null /* deltaService */,
+			undefined /* deltaService */,
 			false /* getDeltasViaAlfred */,
+			false /* verifyLastOpPersistence */,
+			checkpointService,
 		);
+
+		const maxPendingCheckpointMessagesLength = 2000;
+
 		return new ScribeLambda(
 			context,
 			this.tenantId,
 			this.documentId,
 			summaryWriter,
-			summaryReader,
 			undefined,
 			checkpointManager,
 			scribe,
 			this.serviceConfiguration,
 			this.rawDeltasKafka,
 			protocolHandler,
-			1, // TODO (Change when local orderer also ticks epoch)
 			protocolHead,
 			scribeMessages.map((message) => message.operation),
 			undefined,
+			new Set<string>(),
+			true,
+			true,
+			true,
+			this.details.value.isEphemeralContainer ?? false,
+			checkpointService.getLocalCheckpointEnabled(),
+			maxPendingCheckpointMessagesLength,
 		);
 	}
 
 	private startLambdas() {
+		const lumberjackProperties = {
+			...getLumberBaseProperties(this.documentId, this.tenantId),
+		};
 		if (this.deliLambda) {
-			// eslint-disable-next-line @typescript-eslint/no-floating-promises
-			this.deliLambda.start();
+			this.deliLambda.start().catch((err) => {
+				Lumberjack.error(
+					"Error starting memory orderer deli lambda",
+					lumberjackProperties,
+					err,
+				);
+			});
 		}
 
 		if (this.scriptoriumLambda) {
-			// eslint-disable-next-line @typescript-eslint/no-floating-promises
-			this.scriptoriumLambda.start();
-		}
-
-		if (this.foremanLambda) {
-			// eslint-disable-next-line @typescript-eslint/no-floating-promises
-			this.foremanLambda.start();
+			this.scriptoriumLambda.start().catch((err) => {
+				Lumberjack.error(
+					"Error starting memory orderer scriptorium lambda",
+					lumberjackProperties,
+					err,
+				);
+			});
 		}
 
 		if (this.scribeLambda) {
-			// eslint-disable-next-line @typescript-eslint/no-floating-promises
-			this.scribeLambda.start();
+			this.scribeLambda.start().catch((err) => {
+				Lumberjack.error(
+					"Error starting memory orderer scribe lambda",
+					lumberjackProperties,
+					err,
+				);
+			});
 		}
 
 		if (this.broadcasterLambda) {
-			// eslint-disable-next-line @typescript-eslint/no-floating-promises
-			this.broadcasterLambda.start();
+			this.broadcasterLambda.start().catch((err) => {
+				Lumberjack.error(
+					"Error starting memory orderer broadcaster lambda",
+					lumberjackProperties,
+					err,
+				);
+			});
 		}
 
 		if (this.moiraLambda) {
-			// eslint-disable-next-line @typescript-eslint/no-floating-promises
-			this.moiraLambda.start();
+			this.moiraLambda.start().catch((err) => {
+				Lumberjack.error(
+					"Error starting memory orderer moira lambda",
+					lumberjackProperties,
+					err,
+				);
+			});
 		}
 	}
 
@@ -448,11 +486,6 @@ export class LocalOrderer implements IOrderer {
 		if (this.scriptoriumLambda) {
 			this.scriptoriumLambda.close();
 			this.scriptoriumLambda = undefined;
-		}
-
-		if (this.foremanLambda) {
-			this.foremanLambda.close();
-			this.foremanLambda = undefined;
 		}
 
 		if (this.scribeLambda) {

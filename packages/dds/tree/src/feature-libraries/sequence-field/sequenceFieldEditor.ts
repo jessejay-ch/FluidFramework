@@ -3,82 +3,117 @@
  * Licensed under the MIT License.
  */
 
-import { jsonableTreeFromCursor } from "../treeTextCursor";
-import { ITreeCursor, RevisionTag } from "../../core";
-import { ChangesetLocalId, FieldEditor, NodeReviver } from "../modular-schema";
-import { brand } from "../../util";
-import { Changeset, Mark, MoveId, NodeChangeType, Reattach } from "./format";
-import { MarkListFactory } from "./markListFactory";
+import { assert } from "@fluidframework/core-utils/internal";
+
+import type { ChangesetLocalId, RevisionTag } from "../../core/index.js";
+import type { FieldEditor, NodeId } from "../modular-schema/index.js";
+
+import { MarkListFactory } from "./markListFactory.js";
+import type {
+	CellId,
+	CellMark,
+	Changeset,
+	Insert,
+	Mark,
+	MarkList,
+	MoveIn,
+	MoveOut,
+} from "./types.js";
+import { splitMark } from "./utils.js";
 
 export interface SequenceFieldEditor extends FieldEditor<Changeset> {
-	insert(index: number, cursor: ITreeCursor | ITreeCursor[]): Changeset<never>;
-	delete(index: number, count: number): Changeset<never>;
+	insert(index: number, count: number, firstId: CellId, revision: RevisionTag): Changeset;
+	remove(index: number, count: number, id: ChangesetLocalId, revision: RevisionTag): Changeset;
 	revive(
 		index: number,
 		count: number,
-		detachedBy: RevisionTag,
-		reviver: NodeReviver,
-		detachIndex: number,
+		detachEvent: CellId,
+		revision: RevisionTag,
 		isIntention?: true,
-	): Changeset<never>;
+	): Changeset;
 
 	/**
 	 *
 	 * @param sourceIndex - The index of the first node move
 	 * @param count - The number of nodes to move
-	 * @param destIndex - The index the nodes should be moved to, interpreted after removing the moving nodes
-	 * @returns a tuple containing a changeset for the move out and a changeset for the move in
+	 * @param destIndex - The index the nodes should be moved to, interpreted before detaching the moved nodes
+	 * @param detachCellId - The local ID to assign to the first cell being emptied by the move
+	 * @param attachCellId - The ID to assign to the first cell being filled by the move
+	 * @param revision - The revision to assign to the move marks
 	 */
 	move(
 		sourceIndex: number,
 		count: number,
 		destIndex: number,
+		detachCellId: ChangesetLocalId,
+		attachCellId: CellId,
+		revision: RevisionTag,
+	): Changeset;
+
+	moveOut(
+		sourceIndex: number,
+		count: number,
 		id: ChangesetLocalId,
-	): [Changeset<never>, Changeset<never>];
+		revision: RevisionTag,
+	): Changeset;
+	moveIn(
+		destIndex: number,
+		count: number,
+		moveId: ChangesetLocalId,
+		attachCellId: CellId,
+		revision: RevisionTag,
+	): Changeset;
+
 	return(
 		sourceIndex: number,
 		count: number,
 		destIndex: number,
-		detachedBy: RevisionTag,
-		detachIndex: number,
-	): Changeset<never>;
+		detachCellId: CellId,
+		attachCellId: CellId,
+		revision: RevisionTag,
+	): Changeset;
 }
 
 export const sequenceFieldEditor = {
-	buildChildChange: <TNodeChange = NodeChangeType>(
+	buildChildChange: (index: number, change: NodeId): Changeset =>
+		markAtIndex(index, { count: 1, changes: change }),
+	insert: (
 		index: number,
-		change: TNodeChange,
-	): Changeset<TNodeChange> => markAtIndex(index, { type: "Modify", changes: change }),
-	insert: (index: number, cursors: ITreeCursor | ITreeCursor[]): Changeset<never> =>
-		markAtIndex(index, {
+		count: number,
+		firstId: CellId,
+		revision: RevisionTag | undefined,
+	): Changeset => {
+		const mark: CellMark<Insert> = {
 			type: "Insert",
-			content: Array.isArray(cursors)
-				? cursors.map(jsonableTreeFromCursor)
-				: [jsonableTreeFromCursor(cursors)],
-		}),
-	delete: (index: number, count: number): Changeset<never> =>
-		count === 0 ? [] : markAtIndex(index, { type: "Delete", count }),
+			id: firstId.localId,
+			count,
+			cellId: firstId,
+			revision,
+		};
+		return markAtIndex(index, mark);
+	},
+	remove: (
+		index: number,
+		count: number,
+		id: ChangesetLocalId,
+		revision: RevisionTag | undefined,
+	): Changeset =>
+		count === 0 ? [] : markAtIndex(index, { type: "Remove", count, id, revision }),
+
 	revive: (
 		index: number,
 		count: number,
-		detachedBy: RevisionTag,
-		reviver: NodeReviver,
-		detachIndex?: number,
-		isIntention?: true,
-	): Changeset<never> => {
-		// Revives are typically created to undo a delete from the prior revision.
-		// When that's the case, we know the content used to be at the index at which it is being revived.
-		const computedDetachIndex = detachIndex ?? index;
-		const mark: Reattach<never> = {
-			type: "Revive",
-			content: reviver(detachedBy, computedDetachIndex, count),
+		detachEvent: CellId,
+		revision: RevisionTag | undefined,
+	): Changeset => {
+		assert(detachEvent.revision !== undefined, 0x724 /* Detach event must have a revision */);
+		const mark: CellMark<Insert> = {
+			type: "Insert",
+			id: detachEvent.localId,
 			count,
-			detachedBy,
-			detachIndex: computedDetachIndex,
+			cellId: detachEvent,
+			revision,
 		};
-		if (isIntention) {
-			mark.isIntention = true;
-		}
 		return count === 0 ? [] : markAtIndex(index, mark);
 	},
 
@@ -86,68 +121,120 @@ export const sequenceFieldEditor = {
 		sourceIndex: number,
 		count: number,
 		destIndex: number,
-		id: ChangesetLocalId,
-	): [Changeset<never>, Changeset<never>] {
-		const moveOut: Mark<never> = {
-			type: "MoveOut",
-			id,
-			count,
-		};
-
-		const moveIn: Mark<never> = {
+		detachCellId: ChangesetLocalId,
+		attachCellId: CellId,
+		revision: RevisionTag | undefined,
+	): Changeset {
+		const moveIn: Mark = {
 			type: "MoveIn",
-			id,
+			id: detachCellId,
 			count,
+			cellId: attachCellId,
+			revision,
 		};
+		const moveOut: Mark = {
+			type: "MoveOut",
+			id: detachCellId,
+			count,
+			revision,
+		};
+		return moveMarksToMarkList(sourceIndex, count, destIndex, moveOut, moveIn);
+	},
 
-		return [markAtIndex(sourceIndex, moveOut), markAtIndex(destIndex, moveIn)];
+	moveOut(
+		sourceIndex: number,
+		count: number,
+		detachCellId: ChangesetLocalId,
+		revision: RevisionTag,
+	): Changeset {
+		const moveOut: Mark = {
+			type: "MoveOut",
+			id: detachCellId,
+			count,
+			revision,
+		};
+		return markAtIndex(sourceIndex, moveOut);
+	},
+
+	moveIn(
+		destIndex: number,
+		count: number,
+		moveId: ChangesetLocalId,
+		attachCellId: CellId,
+		revision: RevisionTag,
+	): Changeset {
+		const moveIn: Mark = {
+			type: "MoveIn",
+			id: moveId,
+			count,
+			cellId: attachCellId,
+			revision,
+		};
+		return markAtIndex(destIndex, moveIn);
 	},
 
 	return(
 		sourceIndex: number,
 		count: number,
 		destIndex: number,
-		detachedBy: RevisionTag,
-		detachIndex?: number,
-	): Changeset<never> {
-		if (count === 0) {
-			return [];
-		}
-
-		const id = brand<MoveId>(0);
-		const returnFrom: Mark<never> = {
-			type: "ReturnFrom",
-			id,
+		detachCellId: CellId,
+		attachCellId: CellId,
+		revision: RevisionTag | undefined,
+	): Changeset {
+		const moveOut: CellMark<MoveOut> = {
+			type: "MoveOut",
+			id: attachCellId.localId,
+			idOverride: detachCellId,
 			count,
-			detachedBy,
+			revision,
 		};
 
-		const returnTo: Mark<never> = {
-			type: "ReturnTo",
-			id,
+		const returnTo: CellMark<MoveIn> = {
+			type: "MoveIn",
+			id: attachCellId.localId,
 			count,
-			detachedBy,
-			// Returns are typically created to undo a move from the prior revision.
-			// When that's the case, we know the content used to be at the index to which it is being returned.
-			detachIndex: detachIndex ?? destIndex,
+			cellId: attachCellId,
+			revision,
 		};
 
-		const factory = new MarkListFactory<never>();
-		if (sourceIndex < destIndex) {
-			factory.pushOffset(sourceIndex);
-			factory.pushContent(returnFrom);
-			factory.pushOffset(destIndex - sourceIndex);
-			factory.pushContent(returnTo);
-		} else {
-			factory.pushOffset(destIndex);
-			factory.pushContent(returnTo);
-			factory.pushOffset(sourceIndex - destIndex);
-			factory.pushContent(returnFrom);
-		}
-		return factory.list;
+		return moveMarksToMarkList(sourceIndex, count, destIndex, moveOut, returnTo);
 	},
-};
+} satisfies SequenceFieldEditor;
 
-function markAtIndex<TNodeChange>(index: number, mark: Mark<TNodeChange>): Changeset<TNodeChange> {
-	return index === 0 ? [mark] : [index, mark];
+function moveMarksToMarkList(
+	sourceIndex: number,
+	count: number,
+	destIndex: number,
+	detach: CellMark<MoveOut>,
+	attach: CellMark<MoveIn>,
+): MarkList {
+	if (count === 0) {
+		return [];
+	}
+	const firstIndexBeyondMoveOut = sourceIndex + count;
+	const marks = new MarkListFactory();
+	marks.pushOffset(Math.min(sourceIndex, destIndex));
+	if (destIndex <= sourceIndex) {
+		// The destination is fully before the source
+		marks.pushContent(attach);
+		marks.pushOffset(sourceIndex - destIndex);
+		marks.pushContent(detach);
+	} else if (firstIndexBeyondMoveOut <= destIndex) {
+		// The destination is fully after the source
+		marks.pushContent(detach);
+		marks.pushOffset(destIndex - firstIndexBeyondMoveOut);
+		marks.pushContent(attach);
+	} else {
+		const firstSectionLength = destIndex - sourceIndex;
+		// The destination is in the middle of the source
+		const [detach1, detach2] = splitMark(detach, firstSectionLength);
+		marks.pushContent(detach1);
+		marks.pushContent(attach);
+		marks.pushContent(detach2);
+	}
+	return marks.list;
+}
+
+function markAtIndex(index: number, mark: Mark): Changeset {
+	return index === 0 ? [mark] : [{ count: index }, mark];
 }

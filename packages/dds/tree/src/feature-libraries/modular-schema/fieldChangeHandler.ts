@@ -3,57 +3,130 @@
  * Licensed under the MIT License.
  */
 
-import { FieldKindIdentifier, Delta, FieldKey, Value, TaggedChange, RevisionTag } from "../../core";
-import { Brand, fail, Invariant, JsonCompatibleReadOnly } from "../../util";
-import { ChangesetLocalId, CrossFieldManager } from "./crossFieldQueries";
+import type { ICodecFamily, IJsonCodec } from "../../codec/index.js";
+import type {
+	ChangeEncodingContext,
+	DeltaDetachedNodeChanges,
+	DeltaDetachedNodeId,
+	DeltaDetachedNodeRename,
+	DeltaFieldChanges,
+	DeltaFieldMap,
+	EncodedRevisionTag,
+	RevisionMetadataSource,
+	RevisionTag,
+} from "../../core/index.js";
+import type { IdAllocator, Invariant } from "../../util/index.js";
+
+import type { CrossFieldManager } from "./crossFieldQueries.js";
+import type { CrossFieldKeyRange, NodeId } from "./modularChangeTypes.js";
+import type { EncodedNodeChangeset } from "./modularChangeFormat.js";
+
+export type NestedChangesIndices = [
+	NodeId,
+	number | undefined /* inputIndex */,
+	number | undefined /* outputIndex */,
+][];
+
+/**
+ * The return value of calling {@link FieldChangeHandler.intoDelta}.
+ */
+export interface FieldChangeDelta {
+	/**
+	 * {@inheritdoc DeltaFieldChanges}
+	 */
+	readonly local?: DeltaFieldChanges;
+	/**
+	 * {@inheritdoc DeltaRoot.global}
+	 */
+	readonly global?: readonly DeltaDetachedNodeChanges[];
+	/**
+	 * {@inheritdoc DeltaRoot.rename}
+	 */
+	readonly rename?: readonly DeltaDetachedNodeRename[];
+}
 
 /**
  * Functionality provided by a field kind which will be composed with other `FieldChangeHandler`s to
  * implement a unified ChangeFamily supporting documents with multiple field kinds.
- * @alpha
  */
 export interface FieldChangeHandler<
 	TChangeset,
 	TEditor extends FieldEditor<TChangeset> = FieldEditor<TChangeset>,
 > {
 	_typeCheck?: Invariant<TChangeset>;
-	rebaser: FieldChangeRebaser<TChangeset>;
-	encoder: FieldChangeEncoder<TChangeset>;
-	editor: TEditor;
-	intoDelta(change: TChangeset, deltaFromChild: ToDelta): Delta.MarkList;
+	readonly rebaser: FieldChangeRebaser<TChangeset>;
+	readonly codecsFactory: (
+		revisionTagCodec: IJsonCodec<
+			RevisionTag,
+			EncodedRevisionTag,
+			EncodedRevisionTag,
+			ChangeEncodingContext
+		>,
+	) => ICodecFamily<TChangeset, FieldChangeEncodingContext>;
+	readonly editor: TEditor;
+	intoDelta(change: TChangeset, deltaFromChild: ToDelta): FieldChangeDelta;
+	/**
+	 * Returns the set of removed roots that should be in memory for the given change to be applied.
+	 * A removed root is relevant if any of the following is true:
+	 * - It is being inserted
+	 * - It is being restored
+	 * - It is being edited
+	 * - The ID it is associated with is being changed
+	 *
+	 * Implementations are allowed to be conservative by returning more removed roots than strictly necessary
+	 * (though they should, for the sake of performance, try to avoid doing so).
+	 *
+	 * Implementations are not allowed to return IDs for non-root trees, even if they are removed.
+	 *
+	 * @param change - The change to be applied.
+	 * @param relevantRemovedRootsFromChild - Delegate for collecting relevant removed roots from child changes.
+	 */
+	readonly relevantRemovedRoots: (
+		change: TChangeset,
+		relevantRemovedRootsFromChild: RelevantRemovedRootsFromChild,
+	) => Iterable<DeltaDetachedNodeId>;
 
 	/**
 	 * Returns whether this change is empty, meaning that it represents no modifications to the field
 	 * and could be removed from the ModularChangeset tree without changing its behavior.
 	 */
 	isEmpty(change: TChangeset): boolean;
+
+	/**
+	 * @param change - The field change to get the child changes from.
+	 *
+	 * @returns The set of `NodeId`s that correspond to nested changes in the given `change`.
+	 * Each `NodeId` is associated with the following:
+	 * - index of the node in the field in the input context of the changeset (or `undefined` if the node is not
+	 * attached in the input context).
+	 * - index of the node in the field in the output context of the changeset (or `undefined` if the node is not
+	 * attached in the output context).
+	 * For all returned entries where the index is defined,
+	 * the indices are are ordered from smallest to largest (with no duplicates).
+	 * The returned array is owned by the caller.
+	 */
+	getNestedChanges(change: TChangeset): NestedChangesIndices;
+
+	/**
+	 * @returns A list of all cross-field keys contained in the change.
+	 * This should not include cross-field keys in descendant fields.
+	 */
+	getCrossFieldKeys(change: TChangeset): CrossFieldKeyRange[];
+
+	createEmpty(): TChangeset;
 }
 
-/**
- * @alpha
- */
 export interface FieldChangeRebaser<TChangeset> {
 	/**
 	 * Compose a collection of changesets into a single one.
-	 * Every child included in the composed change must be the result of a call to `composeChild`,
-	 * and should be tagged with the revision of its parent change.
-	 * Children which were the result of an earlier call to `composeChild` should be tagged with
-	 * undefined revision if later passed as an argument to `composeChild`.
-	 * See {@link ChangeRebaser} for more details.
+	 * For each node which has a change in both changesets, `composeChild` must be called
+	 * and the result used as the composite node change.
+	 * Calling `composeChild` when one of the changesets has no node change is unnecessary but tolerated.
+	 * See `ChangeRebaser` for more details.
 	 */
 	compose(
-		changes: TaggedChange<TChangeset>[],
-		composeChild: NodeChangeComposer,
-		genId: IdAllocator,
-		crossFieldManager: CrossFieldManager,
-		revisionMetadata: RevisionMetadataSource,
-	): TChangeset;
-
-	/**
-	 * Amend `composedChange` with respect to new data in `crossFieldManager`.
-	 */
-	amendCompose(
-		composedChange: TChangeset,
+		change1: TChangeset,
+		change2: TChangeset,
 		composeChild: NodeChangeComposer,
 		genId: IdAllocator,
 		crossFieldManager: CrossFieldManager,
@@ -62,50 +135,39 @@ export interface FieldChangeRebaser<TChangeset> {
 
 	/**
 	 * @returns the inverse of `changes`.
-	 * See {@link ChangeRebaser} for details.
+	 * See `ChangeRebaser` for details.
 	 */
 	invert(
-		change: TaggedChange<TChangeset>,
-		invertChild: NodeChangeInverter,
-		reviver: NodeReviver,
+		change: TChangeset,
+		isRollback: boolean,
 		genId: IdAllocator,
+		revision: RevisionTag | undefined,
 		crossFieldManager: CrossFieldManager,
-	): TChangeset;
-
-	/**
-	 * Amend `invertedChange` with respect to new data in `crossFieldManager`.
-	 */
-	amendInvert(
-		invertedChange: TChangeset,
-		originalRevision: RevisionTag | undefined,
-		reviver: NodeReviver,
-		genId: IdAllocator,
-		crossFieldManager: CrossFieldManager,
+		revisionMetadata: RevisionMetadataSource,
 	): TChangeset;
 
 	/**
 	 * Rebase `change` over `over`.
-	 * See {@link ChangeRebaser} for details.
+	 * See `ChangeRebaser` for details.
 	 */
 	rebase(
 		change: TChangeset,
-		over: TaggedChange<TChangeset>,
+		over: TChangeset,
 		rebaseChild: NodeChangeRebaser,
 		genId: IdAllocator,
 		crossFieldManager: CrossFieldManager,
-		revisionMetadata: RevisionMetadataSource,
+		revisionMetadata: RebaseRevisionMetadata,
 	): TChangeset;
 
 	/**
-	 * Amend `rebasedChange` with respect to new data in `crossFieldManager`.
+	 * @returns `change` with any empty child node changesets removed.
 	 */
-	amendRebase(
-		rebasedChange: TChangeset,
-		over: TaggedChange<TChangeset>,
-		rebaseChild: NodeChangeRebaser,
-		genId: IdAllocator,
-		crossFieldManager: CrossFieldManager,
-		revisionMetadata: RevisionMetadataSource,
+	prune(change: TChangeset, pruneChild: NodeChangePruner): TChangeset;
+
+	replaceRevisions(
+		change: TChangeset,
+		oldRevisions: Set<RevisionTag | undefined>,
+		newRevisions: RevisionTag | undefined,
 	): TChangeset;
 }
 
@@ -114,14 +176,14 @@ export interface FieldChangeRebaser<TChangeset> {
  * This should only be used for fields where the child nodes cannot be edited.
  */
 export function referenceFreeFieldChangeRebaser<TChangeset>(data: {
-	compose: (changes: TChangeset[]) => TChangeset;
-	invert: (change: TChangeset, reviver: NodeReviver) => TChangeset;
+	compose: (change1: TChangeset, change2: TChangeset) => TChangeset;
+	invert: (change: TChangeset) => TChangeset;
 	rebase: (change: TChangeset, over: TChangeset) => TChangeset;
 }): FieldChangeRebaser<TChangeset> {
 	return isolatedFieldChangeRebaser({
-		compose: (changes, _composeChild, _genId) => data.compose(changes.map((c) => c.change)),
-		invert: (change, _invertChild, reviver, _genId) => data.invert(change.change, reviver),
-		rebase: (change, over, _rebaseChild, _genId) => data.rebase(change, over.change),
+		compose: (change1, change2, _composeChild, _genId) => data.compose(change1, change2),
+		invert: (change, _invertChild, _genId) => data.invert(change),
+		rebase: (change, over, _rebaseChild, _genId) => data.rebase(change, over),
 	});
 }
 
@@ -132,212 +194,70 @@ export function isolatedFieldChangeRebaser<TChangeset>(data: {
 }): FieldChangeRebaser<TChangeset> {
 	return {
 		...data,
-		amendCompose: () => fail("Not implemented"),
-		amendInvert: () => fail("Not implemented"),
-		amendRebase: () => fail("Not implemented"),
+		prune: (change) => change,
+		replaceRevisions: (change) => change,
 	};
 }
 
-/**
- * @alpha
- */
-export interface FieldChangeEncoder<TChangeset> {
-	/**
-	 * Encodes `change` into a JSON compatible object.
-	 */
-	encodeForJson(
-		formatVersion: number,
-		change: TChangeset,
-		encodeChild: NodeChangeEncoder,
-	): JsonCompatibleReadOnly;
-
-	/**
-	 * Decodes `change` from a JSON compatible object.
-	 */
-	decodeJson(
-		formatVersion: number,
-		change: JsonCompatibleReadOnly,
-		decodeChild: NodeChangeDecoder,
-	): TChangeset;
-}
-
-/**
- * @alpha
- */
 export interface FieldEditor<TChangeset> {
 	/**
 	 * Creates a changeset which represents the given `change` to the child at `childIndex` of this editor's field.
 	 */
-	buildChildChange(childIndex: number, change: NodeChangeset): TChangeset;
+	buildChildChange(childIndex: number, change: NodeId): TChangeset;
 }
 
 /**
  * The `index` represents the index of the child node in the input context.
  * The `index` should be `undefined` iff the child node does not exist in the input context (e.g., an inserted node).
- * @alpha
  */
-export type ToDelta = (child: NodeChangeset) => Delta.Modify;
+export type ToDelta = (child: NodeId) => DeltaFieldMap;
 
 /**
- * @alpha
  */
-export type NodeReviver = (
-	revision: RevisionTag,
-	index: number,
-	count: number,
-) => Delta.ProtoNode[];
+export type NodeChangeInverter = (change: NodeId) => NodeId;
 
 /**
- * @alpha
  */
-export type NodeChangeInverter = (
-	change: NodeChangeset,
-	index: number | undefined,
-) => NodeChangeset;
+export enum NodeAttachState {
+	Attached,
+	Detached,
+}
 
 /**
- * @alpha
  */
 export type NodeChangeRebaser = (
-	change: NodeChangeset | undefined,
-	baseChange: NodeChangeset | undefined,
-) => NodeChangeset | undefined;
-
-/**
- * @alpha
- */
-export type NodeChangeComposer = (changes: TaggedChange<NodeChangeset>[]) => NodeChangeset;
-
-/**
- * @alpha
- */
-export type NodeChangeEncoder = (change: NodeChangeset) => JsonCompatibleReadOnly;
-
-/**
- * @alpha
- */
-export type NodeChangeDecoder = (change: JsonCompatibleReadOnly) => NodeChangeset;
-
-/**
- * @alpha
- */
-export type IdAllocator = () => ChangesetLocalId;
-
-/**
- * Changeset for a subtree rooted at a specific node.
- * @alpha
- */
-export interface NodeChangeset extends HasFieldChanges {
-	valueChange?: ValueChange;
-	valueConstraint?: ValueConstraint;
-}
-
-/**
- * @alpha
- */
-export interface ValueConstraint {
-	value: Value;
-	violated: boolean;
-}
-
-/**
- * @alpha
- */
-export interface HasFieldChanges {
-	fieldChanges?: FieldChangeMap;
-}
-
-/**
- * @alpha
- */
-export interface ValueChange {
+	change: NodeId | undefined,
+	baseChange: NodeId | undefined,
 	/**
-	 * The revision in which this change occurred.
-	 * Undefined when it can be inferred from context.
+	 * Whether the node is attached to this field in the output context of the base change.
+	 * Defaults to attached if undefined.
 	 */
-	revision?: RevisionTag;
+	state?: NodeAttachState,
+) => NodeId | undefined;
 
-	/**
-	 * Can be left unset to represent the value being cleared.
-	 */
-	value?: Value;
+/**
+ */
+export type NodeChangeComposer = (
+	change1: NodeId | undefined,
+	change2: NodeId | undefined,
+) => NodeId;
+
+/**
+ */
+export type NodeChangePruner = (change: NodeId) => NodeId | undefined;
+
+/**
+ * A function that returns the set of removed roots that should be in memory for a given node changeset to be applied.
+ */
+export type RelevantRemovedRootsFromChild = (child: NodeId) => Iterable<DeltaDetachedNodeId>;
+
+export interface RebaseRevisionMetadata extends RevisionMetadataSource {
+	readonly getRevisionToRebase: () => RevisionTag | undefined;
+	readonly getBaseRevisions: () => RevisionTag[];
 }
 
-/**
- * @alpha
- */
-export interface ModularChangeset extends HasFieldChanges {
-	/**
-	 * The numerically highest `ChangesetLocalId` used in this changeset.
-	 * If undefined then this changeset contains no IDs.
-	 */
-	maxId?: ChangesetLocalId;
-	/**
-	 * The revisions included in this changeset, ordered temporally (oldest to newest).
-	 * Undefined for anonymous changesets.
-	 * Should never be empty.
-	 */
-	readonly revisions?: readonly RevisionInfo[];
-	fieldChanges: FieldChangeMap;
-	constraintViolationCount?: number;
+export interface FieldChangeEncodingContext {
+	readonly baseContext: ChangeEncodingContext;
+	encodeNode(nodeId: NodeId): EncodedNodeChangeset;
+	decodeNode(encodedNode: EncodedNodeChangeset): NodeId;
 }
-
-/**
- * A callback that returns the index of the changeset associated with the given RevisionTag among the changesets being
- * composed or rebased. This index is solely meant to communicate relative ordering, and is only valid within the scope of the
- * compose or rebase operation.
- *
- * During composition, the index reflects the order of the changeset within the overall composed changeset that is
- * being produced.
- *
- * During rebase, the indices of the base changes are all lower than the indices of the change being rebased.
- * @alpha
- */
-export type RevisionIndexer = (tag: RevisionTag) => number;
-
-/**
- * @alpha
- */
-export interface RevisionMetadataSource {
-	readonly getIndex: RevisionIndexer;
-	readonly getInfo: (tag: RevisionTag) => RevisionInfo;
-}
-
-/**
- * @alpha
- */
-export interface RevisionInfo {
-	readonly tag: RevisionTag;
-	/**
-	 * True when the changeset was produced as part of a rebase sandwich as opposed to for the purpose of undo.
-	 * Considered false if undefined.
-	 */
-	readonly isRollback?: boolean;
-}
-
-/**
- * @alpha
- */
-export type FieldChangeMap = Map<FieldKey, FieldChange>;
-
-/**
- * @alpha
- */
-export interface FieldChange {
-	fieldKind: FieldKindIdentifier;
-
-	/**
-	 * If defined, `change` is part of the specified revision.
-	 * Undefined in the following cases:
-	 * A) A revision is specified on an ancestor of this `FieldChange`, in which case `change` is part of that revision.
-	 * B) `change` is composed of multiple revisions.
-	 * C) `change` is part of an anonymous revision.
-	 */
-	revision?: RevisionTag;
-	change: FieldChangeset;
-}
-
-/**
- * @alpha
- */
-export type FieldChangeset = Brand<unknown, "FieldChangeset">;

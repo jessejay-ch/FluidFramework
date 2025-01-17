@@ -15,20 +15,27 @@ import {
 	IRunner,
 	IRunnerFactory,
 	IWebServerFactory,
+	IReadinessCheck,
 } from "@fluidframework/server-services-core";
 import * as utils from "@fluidframework/server-services-utils";
 import { Provider } from "nconf";
 import * as winston from "winston";
-import Redis from "ioredis";
 import { RedisCache } from "@fluidframework/server-services";
 import { RiddlerRunner } from "./runner";
 import { ITenantDocument } from "./tenantManager";
+import { IRiddlerResourcesCustomizations } from "./customizations";
+import { ITenantRepository, MongoTenantRepository } from "./mongoTenantRepository";
+import { closeRedisClientConnections, StartupCheck } from "@fluidframework/server-services-shared";
 
+/**
+ * @internal
+ */
 export class RiddlerResources implements IResources {
 	public webServerFactory: IWebServerFactory;
 
 	constructor(
 		public readonly config: Provider,
+		public readonly tenantRepository: ITenantRepository,
 		public readonly tenantsCollectionName: string,
 		public readonly mongoManager: MongoManager,
 		public readonly port: any,
@@ -37,39 +44,71 @@ export class RiddlerResources implements IResources {
 		public readonly defaultHistorianUrl: string,
 		public readonly defaultInternalHistorianUrl: string,
 		public readonly secretManager: ISecretManager,
-		public readonly cache: RedisCache,
+		public readonly fetchTenantKeyMetricIntervalMs: number,
+		public readonly riddlerStorageRequestMetricIntervalMs: number,
+		public readonly tenantKeyGenerator: utils.ITenantKeyGenerator,
+		public readonly startupCheck: IReadinessCheck,
+		public readonly redisClientConnectionManagers: utils.IRedisClientConnectionManager[],
+		public readonly cache?: RedisCache,
+		public readonly readinessCheck?: IReadinessCheck,
 	) {
 		const httpServerConfig: services.IHttpServerConfig = config.get("system:httpServer");
-		this.webServerFactory = new services.BasicWebServerFactory(httpServerConfig);
+		const nodeClusterConfig: Partial<services.INodeClusterConfig> | undefined = config.get(
+			"riddler:nodeClusterConfig",
+		);
+		const useNodeCluster = config.get("riddler:useNodeCluster");
+		this.webServerFactory = useNodeCluster
+			? new services.NodeClusterWebServerFactory(httpServerConfig, nodeClusterConfig)
+			: new services.BasicWebServerFactory(httpServerConfig);
 	}
 
 	public async dispose(): Promise<void> {
-		await this.mongoManager.close();
+		const mongoManagerCloseP = this.mongoManager.close();
+		const redisClientConnectionManagersCloseP = closeRedisClientConnections(
+			this.redisClientConnectionManagers,
+		);
+		await Promise.all([mongoManagerCloseP, redisClientConnectionManagersCloseP]);
 	}
 }
 
+/**
+ * @internal
+ */
 export class RiddlerResourcesFactory implements IResourcesFactory<RiddlerResources> {
-	public async create(config: Provider): Promise<RiddlerResources> {
+	public async create(
+		config: Provider,
+		customizations?: IRiddlerResourcesCustomizations,
+	): Promise<RiddlerResources> {
 		// Cache connection
 		const redisConfig = config.get("redisForTenantCache");
-		let cache: RedisCache;
+		let cache: RedisCache | undefined;
+		// List of Redis client connection managers that need to be closed on dispose
+		const redisClientConnectionManagers: utils.IRedisClientConnectionManager[] = [];
 		if (redisConfig) {
-			const redisOptions: Redis.RedisOptions = {
-				host: redisConfig.host,
-				port: redisConfig.port,
-				password: redisConfig.pass,
-			};
-			if (redisConfig.tls) {
-				redisOptions.tls = {
-					servername: redisConfig.host,
-				};
-			}
 			const redisParams = {
 				expireAfterSeconds: redisConfig.keyExpireAfterSeconds as number | undefined,
 			};
-			const redisClient = new Redis(redisOptions);
 
-			cache = new RedisCache(redisClient, redisParams);
+			const retryDelays = {
+				retryDelayOnFailover: 100,
+				retryDelayOnClusterDown: 100,
+				retryDelayOnTryAgain: 100,
+				retryDelayOnMoved: redisConfig.retryDelayOnMoved ?? 100,
+				maxRedirections: redisConfig.maxRedirections ?? 16,
+			};
+
+			const redisClientConnectionManagerForTenantCache =
+				customizations?.redisClientConnectionManagerForTenantCache
+					? customizations.redisClientConnectionManagerForTenantCache
+					: new utils.RedisClientConnectionManager(
+							undefined,
+							redisConfig,
+							redisConfig.enableClustering,
+							redisConfig.slotsRefreshTimeout,
+							retryDelays,
+					  );
+			redisClientConnectionManagers.push(redisClientConnectionManagerForTenantCache);
+			cache = new RedisCache(redisClientConnectionManagerForTenantCache, redisParams);
 		}
 		// Database connection
 		const factory = await services.getDbFactory(config);
@@ -83,13 +122,20 @@ export class RiddlerResourcesFactory implements IResourcesFactory<RiddlerResourc
 		const globalDbEnabled = config.get("mongo:globalDbEnabled") as boolean;
 		if (globalDbEnabled) {
 			const globalDbReconnect = (config.get("mongo:globalDbReconnect") as boolean) ?? false;
-			globalDbMongoManager = new MongoManager(factory, globalDbReconnect, null, true);
+			globalDbMongoManager = new MongoManager(
+				factory,
+				globalDbReconnect,
+				undefined /* reconnectDelayMs */,
+				true /* global */,
+			);
 		}
 
 		const mongoManager = globalDbEnabled ? globalDbMongoManager : operationsDbMongoManager;
 		const db: IDb = await mongoManager.getDatabase();
 
 		const collection = db.collection<ITenantDocument>(tenantsCollectionName);
+		const tenantRepository =
+			customizations?.tenantRepository ?? new MongoTenantRepository(collection);
 		const tenants = config.get("tenantConfig") as any[];
 		const upsertP = tenants.map(async (tenant) => {
 			tenant.key = secretManager.encryptSecret(tenant.key);
@@ -125,8 +171,18 @@ export class RiddlerResourcesFactory implements IResourcesFactory<RiddlerResourc
 		const defaultInternalHistorianUrl =
 			config.get("worker:internalBlobStorageUrl") || defaultHistorianUrl;
 
+		const fetchTenantKeyMetricIntervalMs = config.get("apiCounters:fetchTenantKeyMetricMs");
+		const riddlerStorageRequestMetricIntervalMs = config.get(
+			"apiCounters:riddlerStorageRequestMetricMs",
+		);
+		const tenantKeyGenerator = customizations?.tenantKeyGenerator
+			? customizations.tenantKeyGenerator
+			: new utils.TenantKeyGenerator();
+
+		const startupCheck = new StartupCheck();
 		return new RiddlerResources(
 			config,
+			tenantRepository,
 			tenantsCollectionName,
 			mongoManager,
 			port,
@@ -135,24 +191,38 @@ export class RiddlerResourcesFactory implements IResourcesFactory<RiddlerResourc
 			defaultHistorianUrl,
 			defaultInternalHistorianUrl,
 			secretManager,
+			fetchTenantKeyMetricIntervalMs,
+			riddlerStorageRequestMetricIntervalMs,
+			tenantKeyGenerator,
+			startupCheck,
+			redisClientConnectionManagers,
 			cache,
+			customizations?.readinessCheck,
 		);
 	}
 }
 
+/**
+ * @internal
+ */
 export class RiddlerRunnerFactory implements IRunnerFactory<RiddlerResources> {
 	public async create(resources: RiddlerResources): Promise<IRunner> {
 		return new RiddlerRunner(
 			resources.webServerFactory,
-			resources.tenantsCollectionName,
+			resources.tenantRepository,
 			resources.port,
-			resources.mongoManager,
 			resources.loggerFormat,
 			resources.baseOrdererUrl,
 			resources.defaultHistorianUrl,
 			resources.defaultInternalHistorianUrl,
 			resources.secretManager,
+			resources.fetchTenantKeyMetricIntervalMs,
+			resources.riddlerStorageRequestMetricIntervalMs,
+			resources.tenantKeyGenerator,
+			resources.startupCheck,
 			resources.cache,
+			resources.config,
+			resources.readinessCheck,
 		);
 	}
 }

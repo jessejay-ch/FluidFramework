@@ -4,35 +4,50 @@
  */
 
 export {
-	ContainerMessageType,
-	ContainerRuntimeMessage,
 	ISummaryRuntimeOptions,
 	ISummaryBaseConfiguration,
 	ISummaryConfigurationHeuristics,
 	ISummaryConfigurationDisableSummarizer,
 	ISummaryConfigurationDisableHeuristics,
 	IContainerRuntimeOptions,
-	IRootSummaryTreeWithStats,
-	isRuntimeMessage,
-	RuntimeMessage,
+	IContainerRuntimeOptionsInternal,
+	loadContainerRuntime,
+	LoadContainerRuntimeParams,
 	agentSchedulerId,
 	ContainerRuntime,
-	RuntimeHeaders,
-	AllowTombstoneRequestHeaderKey,
+	DeletedResponseHeaderKey,
 	TombstoneResponseHeaderKey,
+	InactiveResponseHeaderKey,
 	ISummaryConfiguration,
 	DefaultSummaryConfiguration,
 	ICompressionRuntimeOptions,
 	CompressionAlgorithms,
-} from "./containerRuntime";
-export { FluidDataStoreRegistry } from "./dataStoreRegistry";
-export { IGCRuntimeOptions, IGCStats } from "./gc";
+	RuntimeHeaderData,
+	disabledCompressionConfig,
+} from "./containerRuntime.js";
 export {
-	IPendingFlush,
-	IPendingLocalState,
-	IPendingMessage,
-	IPendingState,
-} from "./pendingStateManager";
+	ContainerMessageType,
+	UnknownContainerRuntimeMessage,
+} from "./messageTypes.js";
+export { IBlobManagerLoadInfo } from "./blobManager/index.js";
+export { FluidDataStoreRegistry } from "./dataStoreRegistry.js";
+export {
+	detectOutboundReferences,
+	RuntimeHeaders,
+	ChannelCollectionFactory,
+	AllowTombstoneRequestHeaderKey,
+} from "./channelCollection.js";
+export {
+	GCNodeType,
+	IGCMetadata,
+	GCFeatureMatrix,
+	GCVersion,
+	IGCRuntimeOptions,
+	IMarkPhaseStats,
+	ISweepPhaseStats,
+	IGCNodeUpdatedProps,
+	IGCStats,
+} from "./gc/index.js";
 export {
 	IAckedSummary,
 	ISummarizer,
@@ -40,7 +55,6 @@ export {
 	ISummaryCancellationToken,
 	neverCancelledSummaryToken,
 	Summarizer,
-	SummarizerStopReason,
 	SummaryCollection,
 	EnqueueSummarizeResult,
 	IAckSummaryResult,
@@ -48,17 +62,18 @@ export {
 	IBroadcastSummaryResult,
 	ICancellationToken,
 	IConnectableRuntime,
+	IContainerRuntimeMetadata,
+	ICreateContainerMetadata,
 	IEnqueueSummarizeOptions,
 	IGenerateSummaryTreeResult,
 	IGeneratedSummaryStats,
 	INackSummaryResult,
 	IOnDemandSummarizeOptions,
-	IProvideSummarizer,
 	IRefreshSummaryAckOptions,
 	ISubmitSummaryOpResult,
 	ISubmitSummaryOptions,
+	ISerializedElection,
 	ISummarizeOptions,
-	ISummarizerEvents,
 	ISummarizerInternalsProvider,
 	ISummarizerRuntime,
 	ISummarizingWarning,
@@ -69,10 +84,40 @@ export {
 	ISummary,
 	ISummaryCollectionOpEvents,
 	ISummaryAckMessage,
+	ISummaryMetadataMessage,
 	ISummaryNackMessage,
 	ISummaryOpMessage,
 	OpActionEventListener,
 	OpActionEventName,
 	ICancellableSummarizerController,
-} from "./summary";
-export { IChunkedOp, unpackRuntimeMessage } from "./opLifecycle";
+	SubmitSummaryFailureData,
+	SummaryStage,
+	IRetriableFailureError,
+	IdCompressorMode,
+	IDocumentSchema,
+	DocumentSchemaValueType,
+	IDocumentSchemaCurrent,
+	currentDocumentVersionSchema,
+	DocumentsSchemaController,
+	IDocumentSchemaChangeMessage,
+	IDocumentSchemaFeatures,
+	ReadFluidDataStoreAttributes,
+	IFluidDataStoreAttributes0,
+	IFluidDataStoreAttributes1,
+	IFluidDataStoreAttributes2,
+	OmitAttributesVersions,
+} from "./summary/index.js";
+export { IChunkedOp, unpackRuntimeMessage } from "./opLifecycle/index.js";
+export { ChannelCollection } from "./channelCollection.js";
+export {
+	IFluidDataStoreContextInternal,
+	ISnapshotDetails,
+	LocalFluidDataStoreContext,
+	LocalFluidDataStoreContextBase,
+	FluidDataStoreContext,
+	IFluidDataStoreContextProps,
+	ILocalFluidDataStoreContextProps,
+	ILocalDetachedFluidDataStoreContextProps,
+	IFluidDataStoreContextEvents,
+} from "./dataStoreContext.js";
+export { DataStoreContexts } from "./dataStoreContexts.js";

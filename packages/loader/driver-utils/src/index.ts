@@ -3,23 +3,15 @@
  * Licensed under the MIT License.
  */
 
-export { BlobAggregationStorage, SnapshotExtractor } from "./blobAggregationStorage";
-export { BlobCacheStorageService } from "./blobCacheStorageService";
-export { buildSnapshotTree } from "./buildSnapshotTree";
-export { DocumentStorageServiceProxy } from "./documentStorageServiceProxy";
-export { EmptyDocumentDeltaStorageService } from "./emptyDocumentDeltaStorageService";
-export { UsageError } from "./error";
-export { ensureFluidResolvedUrl, isFluidResolvedUrl } from "./fluidResolvedUrl";
-export { InsecureUrlResolver } from "./insecureUrlResolver";
-export { MapWithExpiration } from "./mapWithExpiration";
+export { buildSnapshotTree } from "./buildSnapshotTree.js";
+export { BlobTreeEntry, TreeTreeEntry, AttachmentTreeEntry } from "./blob.js";
+export { DocumentStorageServiceProxy } from "./documentStorageServiceProxy.js";
+export { UsageError } from "./error.js";
+export { InsecureUrlResolver } from "./insecureUrlResolver.js";
 export {
 	canBeCoalescedByService,
 	isRuntimeMessage,
-	isUnpackedRuntimeMessage,
-	MessageType2,
-} from "./messageRecognition";
-export { MultiDocumentServiceFactory } from "./multiDocumentServiceFactory";
-export { configurableUrlResolver, MultiUrlResolver } from "./multiUrlResolver";
+} from "./messageRecognition.js";
 export {
 	AuthorizationError,
 	canRetryOnError,
@@ -31,7 +23,6 @@ export {
 	GenericNetworkError,
 	getRetryDelayFromError,
 	getRetryDelaySecondsFromError,
-	IAnyDriverError,
 	isOnline,
 	LocationRedirectionError,
 	NetworkErrorBasic,
@@ -39,8 +30,8 @@ export {
 	OnlineStatus,
 	RetryableError,
 	ThrottlingError,
-} from "./network";
-export { logNetworkFailure, waitForConnectedState } from "./networkUtils";
+} from "./network.js";
+export { logNetworkFailure } from "./networkUtils.js";
 export {
 	emptyMessageStream,
 	ParallelRequests,
@@ -48,21 +39,23 @@ export {
 	requestOps,
 	streamFromMessages,
 	streamObserver,
-} from "./parallelRequests";
-export { PrefetchDocumentStorageService } from "./prefetchDocumentStorageService";
-export { RateLimiter } from "./rateLimiter";
-export { readAndParse } from "./readAndParse";
-export { IProgress, runWithRetry } from "./runWithRetry";
+} from "./parallelRequests.js";
+export { PrefetchDocumentStorageService } from "./prefetchDocumentStorageService.js";
+export { RateLimiter } from "./rateLimiter.js";
+export { readAndParse } from "./readAndParse.js";
+export { calculateMaxWaitTime, IProgress, runWithRetry } from "./runWithRetry.js";
 export {
-	combineAppAndProtocolSummary,
 	CombinedAppAndProtocolSummary,
 	getDocAttributesFromProtocolSummary,
 	getQuorumValuesFromProtocolSummary,
 	isCombinedAppAndProtocolSummary,
-} from "./summaryForCreateNew";
-export { convertSummaryTreeToSnapshotITree } from "./treeConversions";
+} from "./summaryForCreateNew.js";
+export { convertSummaryTreeToSnapshotITree } from "./treeConversions.js";
 export {
-	convertSnapshotAndBlobsToSummaryTree,
-	ISummaryTreeAssemblerProps,
-	SummaryTreeAssembler,
-} from "./treeUtils";
+	applyStorageCompression,
+	ICompressionStorageConfig,
+	SummaryCompressionAlgorithm,
+	blobHeadersBlobName,
+} from "./adapters/index.js";
+export { getSnapshotTree, isInstanceOfISnapshot } from "./storageUtils.js";
+export { buildGitTreeHierarchy, getGitMode, getGitType } from "./protocol/index.js";

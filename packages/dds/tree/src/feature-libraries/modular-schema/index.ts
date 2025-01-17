@@ -4,60 +4,92 @@
  */
 
 export {
-	isNeverField,
-	isNeverTree,
 	allowsRepoSuperset,
 	allowsTreeSchemaIdentifierSuperset,
 	allowsFieldSuperset,
 	allowsTreeSuperset,
-} from "./comparison";
+} from "./comparison.js";
+export { isNeverField, isNeverTree } from "./isNeverTree.js";
 export {
-	ChangesetLocalId,
-	CrossFieldManager,
-	CrossFieldQuerySet,
+	addCrossFieldQuery,
+	type CrossFieldManager,
+	type CrossFieldMap,
+	type CrossFieldQuerySet,
 	CrossFieldTarget,
-	idAllocatorFromMaxId,
-} from "./crossFieldQueries";
-export { FieldKind, FullSchemaPolicy, Multiplicity } from "./fieldKind";
+	setInCrossFieldMap,
+} from "./crossFieldQueries.js";
 export {
-	IdAllocator,
-	isolatedFieldChangeRebaser,
+	ChangesetLocalIdSchema,
+	EncodedChangeAtomId,
+	EncodedRevisionInfo,
+	EncodedModularChangeset,
+	EncodedNodeChangeset,
+} from "./modularChangeFormat.js";
+export { FlexFieldKind, type FullSchemaPolicy } from "./fieldKind.js";
+export { FieldKindWithEditor } from "./fieldKindWithEditor.js";
+export {
+	type FieldChangeHandler,
+	type FieldChangeDelta,
+	type FieldChangeRebaser,
+	type FieldEditor,
+	type NodeChangeComposer,
+	type NodeChangeInverter,
+	type NodeChangeRebaser,
+	type NodeChangePruner,
+	referenceFreeFieldChangeRebaser,
+	type RebaseRevisionMetadata,
+	type RelevantRemovedRootsFromChild,
+	type ToDelta,
+	NodeAttachState,
+	type FieldChangeEncodingContext,
+	type NestedChangesIndices,
+} from "./fieldChangeHandler.js";
+export type {
+	CrossFieldKeyRange,
 	FieldChange,
-	FieldChangeEncoder,
-	FieldChangeHandler,
 	FieldChangeMap,
-	FieldChangeRebaser,
 	FieldChangeset,
-	FieldEditor,
 	HasFieldChanges,
 	ModularChangeset,
-	NodeChangeComposer,
-	NodeChangeDecoder,
-	NodeChangeEncoder,
-	NodeChangeInverter,
-	NodeChangeRebaser,
-	NodeChangeset,
-	NodeReviver,
-	referenceFreeFieldChangeRebaser,
-	RevisionMetadataSource,
-	RevisionIndexer,
-	RevisionInfo,
-	ToDelta,
-	ValueChange,
-	ValueConstraint,
-} from "./fieldChangeHandler";
+	NodeExistsConstraint,
+	NodeId,
+} from "./modularChangeTypes.js";
 export {
 	convertGenericChange,
-	EncodedGenericChange,
-	EncodedGenericChangeset,
-	GenericChange,
 	genericChangeHandler,
-	GenericChangeset,
 	genericFieldKind,
-} from "./genericFieldKind";
-export { ModularChangeFamily, ModularEditBuilder, EditDescription } from "./modularChangeFamily";
-export { FieldTypeView, TreeViewSchema, ViewSchemaCollection, ViewSchema } from "./view";
-
-// Split this up into separate import and export for compatibility with API-Extractor.
-import * as TypedSchema from "./typedSchema";
-export { TypedSchema };
+} from "./genericFieldKind.js";
+export type { GenericChangeset } from "./genericFieldKindTypes.js";
+export {
+	ModularChangeFamily,
+	ModularEditBuilder,
+	type EditDescription,
+	type GlobalEditDescription,
+	type FieldEditDescription,
+	rebaseRevisionMetadataFromInfo,
+	intoDelta,
+	relevantRemovedRoots,
+	updateRefreshers,
+} from "./modularChangeFamily.js";
+export { makeModularChangeCodecFamily } from "./modularChangeCodecs.js";
+export type {
+	FieldKindConfiguration,
+	FieldKindConfigurationEntry,
+} from "./fieldKindConfiguration.js";
+export {
+	getAllowedContentDiscrepancies,
+	isRepoSuperset,
+	type AllowedTypeDiscrepancy,
+	type FieldKindDiscrepancy,
+	type ValueSchemaDiscrepancy,
+	type FieldDiscrepancy,
+	type NodeDiscrepancy,
+	type NodeKindDiscrepancy,
+	type NodeFieldsDiscrepancy,
+	type LinearExtension,
+	type Realizer,
+	fieldRealizer,
+	PosetComparisonResult,
+	comparePosetElements,
+	posetLte,
+} from "./discrepancies.js";

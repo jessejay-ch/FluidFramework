@@ -3,12 +3,13 @@
  * Licensed under the MIT License.
  */
 
-import { EventEmitter } from "events";
+import events_pkg from "events_pkg";
+const { EventEmitter } = events_pkg;
 import * as util from "util";
+import { Lumberjack } from "@fluidframework/server-services-telemetry";
 import {
 	IConsumer,
 	IPartition,
-	IPartitionWithEpoch,
 	IQueuedMessage,
 	IZookeeperClient,
 } from "@fluidframework/server-services-core";
@@ -21,26 +22,28 @@ const defaultReconnectDelay = 5000;
 
 /**
  * Kafka consumer using the kafka-node library
+ * @internal
  */
 export class KafkaNodeConsumer implements IConsumer {
-	private client: kafka.KafkaClient;
-	private consumerGroup: kafka.ConsumerGroup;
+	private client!: kafka.KafkaClient;
+	private consumerGroup!: kafka.ConsumerGroup;
 	private readonly events = new EventEmitter();
-	private readonly zookeeper: IZookeeperClient;
+	private readonly zookeeper?: IZookeeperClient;
 
 	constructor(
 		private readonly clientOptions: kafka.KafkaClientOptions,
 		clientId: string,
 		public readonly groupId: string,
 		public readonly topic: string,
-		private readonly zookeeperEndpoint?: string,
+		zookeeperEndpoint?: string,
 		private readonly topicPartitions?: number,
 		private readonly topicReplicationFactor?: number,
 		private readonly reconnectDelay: number = defaultReconnectDelay,
 	) {
 		clientOptions.clientId = clientId;
-		// eslint-disable-next-line @typescript-eslint/no-floating-promises
-		this.connect();
+		this.connect().catch((err) => {
+			Lumberjack.error("Error connecting to kafka", undefined, err);
+		});
 		if (zookeeperEndpoint) {
 			this.zookeeper = new ZookeeperClient(zookeeperEndpoint);
 		}
@@ -87,7 +90,7 @@ export class KafkaNodeConsumer implements IConsumer {
 	public async close(): Promise<void> {
 		await util.promisify(((callback) => this.consumerGroup.close(false, callback)) as any)();
 		await util.promisify(((callback) => this.client.close(callback)) as any)();
-		if (this.zookeeperEndpoint) {
+		if (this.zookeeper) {
 			this.zookeeper.close();
 		}
 	}
@@ -125,14 +128,16 @@ export class KafkaNodeConsumer implements IConsumer {
 			// Close the client if it exists
 			if (this.client) {
 				this.client.close();
-				this.client = undefined;
+				// This gets reassigned immediately in `this.connect()`
+				this.client = undefined as unknown as kafka.KafkaClient;
 			}
 
 			this.events.emit("error", error);
 
 			setTimeout(() => {
-				// eslint-disable-next-line @typescript-eslint/no-floating-promises
-				this.connect();
+				this.connect().catch((err) => {
+					Lumberjack.error("Error retrying connecting to kafka", undefined, err);
+				});
 			}, this.reconnectDelay);
 
 			return;
@@ -167,14 +172,7 @@ export class KafkaNodeConsumer implements IConsumer {
 			const payloads = (this.consumerGroup as any).topicPayloads;
 			const partitions = this.getPartitions(payloads);
 
-			let partitionsWithEpoch: IPartitionWithEpoch[];
-			try {
-				partitionsWithEpoch = await this.fetchPartitionEpochs(partitions);
-			} catch (err) {
-				this.events.emit("error", err);
-			}
-
-			this.events.emit("rebalanced", partitionsWithEpoch);
+			this.events.emit("rebalanced", partitions);
 		});
 
 		this.consumerGroup.on("message", (message: any) => {
@@ -196,32 +194,5 @@ export class KafkaNodeConsumer implements IConsumer {
 			partition: parseInt(partition.partition, 10),
 			topic: partition.topic,
 		}));
-	}
-
-	private async fetchPartitionEpochs(partitions: IPartition[]): Promise<IPartitionWithEpoch[]> {
-		let epochs: number[];
-
-		if (this.zookeeperEndpoint) {
-			const epochsP = new Array<Promise<number>>();
-			for (const partition of partitions) {
-				epochsP.push(
-					this.zookeeper.getPartitionLeaderEpoch(this.topic, partition.partition),
-				);
-			}
-
-			epochs = await Promise.all(epochsP);
-		} else {
-			epochs = new Array(partitions.length).fill(0);
-		}
-
-		const partitionsWithEpoch: IPartitionWithEpoch[] = [];
-
-		for (let i = 0; i < partitions.length; ++i) {
-			const partitionWithEpoch = partitions[i] as IPartitionWithEpoch;
-			partitionWithEpoch.leaderEpoch = epochs[i];
-			partitionsWithEpoch.push(partitionWithEpoch);
-		}
-
-		return partitionsWithEpoch;
 	}
 }

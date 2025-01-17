@@ -3,32 +3,36 @@
  * Licensed under the MIT License.
  */
 
-import { ITelemetryBaseEvent } from '@fluidframework/common-definitions';
-import { LoaderHeader } from '@fluidframework/container-definitions';
-import { MockFluidDataStoreRuntime } from '@fluidframework/test-runtime-utils';
+import { strict as assert } from 'assert';
+
+import { LoaderHeader } from '@fluidframework/container-definitions/internal';
+import { ITelemetryBaseEvent } from '@fluidframework/core-interfaces';
+import { MockFluidDataStoreRuntime, validateAssertionError } from '@fluidframework/test-runtime-utils/internal';
 import { expect } from 'chai';
-import { StableRange, StablePlace, BuildNode, Change } from '../../ChangeTypes';
-import { Mutable } from '../../Common';
-import { EditLog } from '../../EditLog';
-import { areRevisionViewsSemanticallyEqual } from '../../EditUtilities';
-import { SharedTreeDiagnosticEvent } from '../../EventTypes';
-import { NodeId, StableNodeId, TraitLabel } from '../../Identifiers';
-import { SharedTreeOpType, SharedTreeUpdateOp, TreeNodeSequence, WriteFormat } from '../../persisted-types';
-import { SharedTree } from '../../SharedTree';
-import { TreeNodeHandle } from '../../TreeNodeHandle';
-import { nilUuid } from '../../UuidUtilities';
-import { applyTestEdits } from '../Summary.tests';
-import { buildLeaf } from './TestNode';
+
+import { BuildNode, Change, StablePlace, StableRange } from '../../ChangeTypes.js';
+import { Mutable } from '../../Common.js';
+import { EditLog } from '../../EditLog.js';
+import { areRevisionViewsSemanticallyEqual } from '../../EditUtilities.js';
+import { SharedTreeDiagnosticEvent } from '../../EventTypes.js';
+import { NodeId, StableNodeId, TraitLabel } from '../../Identifiers.js';
+import { SharedTree } from '../../SharedTree.js';
+import { TreeNodeHandle } from '../../TreeNodeHandle.js';
+import { nilUuid } from '../../UuidUtilities.js';
+import { SharedTreeOpType, SharedTreeUpdateOp, TreeNodeSequence, WriteFormat } from '../../persisted-types/index.js';
+import { applyTestEdits } from '../Summary.tests.js';
+
+import { buildLeaf } from './TestNode.js';
 import {
+	SharedTreeTestingComponents,
+	SharedTreeTestingOptions,
 	applyNoop,
 	setUpLocalServerTestSharedTree,
 	setUpTestTree,
-	SharedTreeTestingComponents,
-	SharedTreeTestingOptions,
 	spyOnSubmittedOps,
 	testTrait,
 	waitForSummary,
-} from './TestUtilities';
+} from './TestUtilities.js';
 
 function spyOnVersionChanges(tree: SharedTree): WriteFormat[] {
 	const versions: WriteFormat[] = [];
@@ -54,14 +58,20 @@ export function runSharedTreeVersioningTests(
 		};
 
 		it('defaults to latest version if no version is specified when creating factory', () => {
-			const sharedTree = SharedTree.getFactory().create(new MockFluidDataStoreRuntime(), 'SharedTree');
+			const sharedTree = SharedTree.create(
+				new MockFluidDataStoreRuntime({ registry: [SharedTree.getFactory()] }),
+				'SharedTree'
+			);
 			const writeFormats = Object.values(WriteFormat);
 			expect(sharedTree.getWriteFormat()).to.equal(writeFormats[writeFormats.length - 1]);
 		});
 
 		it('only processes edit ops if they have the same version', () => {
 			const { tree, containerRuntimeFactory } = setUpTestSharedTree(treeOptions);
-			const { tree: newerTree } = setUpTestSharedTree({ containerRuntimeFactory, ...secondTreeOptions });
+			const { tree: newerTree } = setUpTestSharedTree({
+				containerRuntimeFactory,
+				...secondTreeOptions,
+			});
 
 			expect(tree.edits.length).to.equal(0);
 			expect(newerTree.edits.length).to.equal(0);
@@ -94,11 +104,7 @@ export function runSharedTreeVersioningTests(
 
 			// Verify even though one edit was applied, 2 edit ops were sent due to the version upgrade.
 			expect(ops.length).to.equal(3);
-			expect(ops.map((op) => op.type)).to.eql([
-				SharedTreeOpType.Update,
-				SharedTreeOpType.Edit,
-				SharedTreeOpType.Edit,
-			]);
+			expect(ops.map((op) => op.type)).to.eql([SharedTreeOpType.Update, SharedTreeOpType.Edit, SharedTreeOpType.Edit]);
 
 			expect(ops[1].version).to.equal(oldVersion);
 			expect(ops[2].version).to.equal(newVersion);
@@ -114,15 +120,19 @@ export function runSharedTreeVersioningTests(
 
 		it('throws if an edit op with a newer version than the write version is received', () => {
 			const { tree, containerRuntimeFactory } = setUpTestSharedTree(treeOptions);
-			const { tree: newerTree } = setUpTestSharedTree({ containerRuntimeFactory, ...secondTreeOptions });
+			const { tree: newerTree } = setUpTestSharedTree({
+				containerRuntimeFactory,
+				...secondTreeOptions,
+			});
 
 			expect(tree.edits.length).to.equal(0);
 			expect(newerTree.edits.length).to.equal(0);
 
 			// Process an edit and expect it to throw
 			applyNoop(newerTree);
-			expect(() => containerRuntimeFactory.processAllMessages()).to.throw(
-				'Newer op version received by a client that has yet to be updated.'
+			assert.throws(
+				() => containerRuntimeFactory.processAllMessages(),
+				(e: Error) => validateAssertionError(e, 'Newer op version received by a client that has yet to be updated.')
 			);
 		});
 
@@ -242,7 +252,10 @@ export function runSharedTreeVersioningTests(
 			const summary = tree.saveSummary();
 
 			// Load the summary into a newer tree to trigger a version update op
-			const { tree: newerTree } = setUpTestSharedTree({ containerRuntimeFactory, ...secondTreeOptions });
+			const { tree: newerTree } = setUpTestSharedTree({
+				containerRuntimeFactory,
+				...secondTreeOptions,
+			});
 			newerTree.loadSummary(summary);
 			containerRuntimeFactory.processAllMessages();
 
@@ -254,11 +267,7 @@ export function runSharedTreeVersioningTests(
 
 			expect(versions).to.eql([newVersion]);
 			expect(ops.length).to.equal(3);
-			expect(ops.map((op) => op.type)).to.eql([
-				SharedTreeOpType.Edit,
-				SharedTreeOpType.Update,
-				SharedTreeOpType.Edit,
-			]);
+			expect(ops.map((op) => op.type)).to.eql([SharedTreeOpType.Edit, SharedTreeOpType.Update, SharedTreeOpType.Edit]);
 
 			expect(ops[0].version).to.equal(oldVersion);
 			expect(ops[2].version).to.equal(newVersion);
@@ -395,6 +404,10 @@ export function runSharedTreeVersioningTests(
 			const { tree: tree2 } = await setUpLocalServerTestSharedTree({
 				writeFormat: WriteFormat.v0_1_1,
 				testObjectProvider,
+				// To be removed ADO:5464
+				featureGates: {
+					'Fluid.Container.ForceWriteConnection': true,
+				},
 			});
 
 			await testObjectProvider.ensureSynchronized();
@@ -477,6 +490,10 @@ export function runSharedTreeVersioningTests(
 			const { tree: tree2 } = await setUpLocalServerTestSharedTree({
 				writeFormat: WriteFormat.v0_1_1,
 				testObjectProvider,
+				// To be removed ADO:5464
+				featureGates: {
+					'Fluid.Container.ForceWriteConnection': true,
+				},
 			});
 
 			await testObjectProvider.ensureSynchronized();
@@ -493,7 +510,10 @@ export function runSharedTreeVersioningTests(
 			});
 
 			it('emits RequestVersionUpdate events', () => {
-				const { tree, containerRuntimeFactory } = setUpTestSharedTree({ ...treeOptions, logger });
+				const { tree, containerRuntimeFactory } = setUpTestSharedTree({
+					...treeOptions,
+					logger,
+				});
 				const { tree: newerTree } = setUpTestSharedTree({
 					containerRuntimeFactory,
 					...secondTreeOptions,
@@ -513,7 +533,10 @@ export function runSharedTreeVersioningTests(
 			});
 
 			it('emits VersionUpdate events', () => {
-				const { tree, containerRuntimeFactory } = setUpTestSharedTree({ ...treeOptions, logger });
+				const { tree, containerRuntimeFactory } = setUpTestSharedTree({
+					...treeOptions,
+					logger,
+				});
 				const { tree: newerTree } = setUpTestSharedTree({
 					containerRuntimeFactory,
 					...secondTreeOptions,
@@ -533,7 +556,10 @@ export function runSharedTreeVersioningTests(
 			});
 
 			it('emits error events on VersionUpdate failure', () => {
-				const { tree, containerRuntimeFactory } = setUpTestSharedTree({ ...treeOptions, logger });
+				const { tree, containerRuntimeFactory } = setUpTestSharedTree({
+					...treeOptions,
+					logger,
+				});
 				const op: SharedTreeUpdateOp = {
 					type: SharedTreeOpType.Update,
 					version: newVersion,
@@ -548,7 +574,10 @@ export function runSharedTreeVersioningTests(
 					event.error === 'Simulated issue in update';
 
 				expect(events.some(matchesFailedVersionUpdate)).to.equal(false);
-				expect(() => containerRuntimeFactory.processAllMessages()).to.throw(/Simulated issue in update/);
+				assert.throws(
+					() => containerRuntimeFactory.processAllMessages(),
+					(e: Error) => validateAssertionError(e, /Simulated issue in update/)
+				);
 				expect(events.some(matchesFailedVersionUpdate)).to.equal(true);
 			});
 		});

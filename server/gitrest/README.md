@@ -4,8 +4,6 @@ Provides a REST API to a GitHub repository. It's API is based off of GitHub's RE
 
 ## Building and running
 
-Because nodegit is built as a native module it's simplest to build and run historian from within a Docker container.
-
 We reuse our production container for this purpose. In development mode this does a double build (once in the
 container build and a second time when mounting your source directory). Future work may want to create a development
 specific container.
@@ -50,23 +48,6 @@ docker-compose restart gitrest
 
 `docker run -t gitrest npm test`
 
-## Nodegit Workarounds
-
-We hit a nodegit bug around tree_entry so are using a private version until it can get merged in. The private version is
-hosted via a gzipped tar file stored on Azure.
-
-This led to a couple issues itself. One is with node-pre-gyp and the package-lock.json https://github.com/mapbox/node-pre-gyp/issues/298
-
-To workaround this we are temporarily disabling the package-lock.json file.
-
-Should the above get fixed and we can go back to package-lock there would still be an issue running npm update with
-the gzipped reference https://github.com/npm/npm/issues/17835
-
-Should you need to update you'll want to remove the nodegit reference first, perform the update, then install it
-back in.
-
-There is a PR out to nodegit. Once they merge it in and publish a new version we can avoid both issues.
-
 ## Example REST API usage
 
 Create the repo
@@ -108,8 +89,45 @@ curl -H "Content-Type: application/json" -X POST -d '{"tag": "v1.0", "message": 
 curl --verbose localhost:3000/repos/prague/test/git/tags/2f208d6d4c5698feada2b5dad3886a0ceff4f80b
 ```
 
+<!-- AUTO-GENERATED-CONTENT:START (README_FOOTER) -->
+
+<!-- prettier-ignore-start -->
+<!-- NOTE: This section is automatically generated using @fluid-tools/markdown-magic. Do not update these generated contents directly. -->
+
+## Contribution Guidelines
+
+There are many ways to [contribute](https://github.com/microsoft/FluidFramework/blob/main/CONTRIBUTING.md) to Fluid.
+
+-   Participate in Q&A in our [GitHub Discussions](https://github.com/microsoft/FluidFramework/discussions).
+-   [Submit bugs](https://github.com/microsoft/FluidFramework/issues) and help us verify fixes as they are checked in.
+-   Review the [source code changes](https://github.com/microsoft/FluidFramework/pulls).
+-   [Contribute bug fixes](https://github.com/microsoft/FluidFramework/blob/main/CONTRIBUTING.md).
+
+Detailed instructions for working in the repo can be found in the [Wiki](https://github.com/microsoft/FluidFramework/wiki).
+
+This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
+For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+
+This project may contain Microsoft trademarks or logos for Microsoft projects, products, or services.
+Use of these trademarks or logos must follow Microsoft’s [Trademark & Brand Guidelines](https://www.microsoft.com/trademarks).
+Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
+
+## Help
+
+Not finding what you're looking for in this README? Check out [fluidframework.com](https://fluidframework.com/docs/).
+
+Still not finding what you're looking for? Please [file an issue](https://github.com/microsoft/FluidFramework/wiki/Submitting-Bugs-and-Feature-Requests).
+
+Thank you!
+
 ## Trademark
 
-This project may contain Microsoft trademarks or logos for Microsoft projects, products, or services. Use of these trademarks
-or logos must follow Microsoft's [Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
+This project may contain Microsoft trademarks or logos for Microsoft projects, products, or services.
+
+Use of these trademarks or logos must follow Microsoft's [Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
+
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
+
+<!-- prettier-ignore-end -->
+
+<!-- AUTO-GENERATED-CONTENT:END -->

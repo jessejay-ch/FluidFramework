@@ -3,44 +3,59 @@
  * Licensed under the MIT License.
  */
 
-import { assert, unreachableCase } from "@fluidframework/common-utils";
-import { UsageError } from "@fluidframework/container-utils";
-import { List } from "./collections";
-import { EndOfTreeSegment } from "./endOfTreeSegment";
-import { LocalReferenceCollection, LocalReferencePosition } from "./localReference";
-import { IMergeTreeDeltaCallbackArgs } from "./mergeTreeDeltaCallback";
-import { ISegment, toRemovalInfo } from "./mergeTreeNodes";
-import { depthFirstNodeWalk } from "./mergeTreeNodeWalk";
-import { TrackingGroup } from "./mergeTreeTracking";
-import { IJSONSegment, MergeTreeDeltaType, ReferenceType } from "./ops";
-import { matchProperties, PropertySet } from "./properties";
-import { DetachedReferencePosition } from "./referencePositions";
+import { assert, unreachableCase } from "@fluidframework/core-utils/internal";
+import { UsageError } from "@fluidframework/telemetry-utils/internal";
+
+import { DoublyLinkedList } from "./collections/index.js";
+import { EndOfTreeSegment } from "./endOfTreeSegment.js";
+import { LocalReferenceCollection, LocalReferencePosition } from "./localReference.js";
+import { MergeTree, findRootMergeBlock } from "./mergeTree.js";
+import { IMergeTreeDeltaCallbackArgs } from "./mergeTreeDeltaCallback.js";
+import { depthFirstNodeWalk } from "./mergeTreeNodeWalk.js";
+import {
+	assertSegmentLeaf,
+	isSegmentLeaf,
+	toSegmentLeaf,
+	type ISegmentLeaf,
+	type ISegmentPrivate,
+} from "./mergeTreeNodes.js";
+import { ITrackingGroup, Trackable, UnorderedTrackingGroup } from "./mergeTreeTracking.js";
+import { IJSONSegment, MergeTreeDeltaType, ReferenceType } from "./ops.js";
+import { PropertySet, matchProperties } from "./properties.js";
+import { DetachedReferencePosition } from "./referencePositions.js";
+import { toRemovalInfo } from "./segmentInfos.js";
 
 /**
- * Revertibles are new and require the option
- * mergeTreeUseNewLengthCalculations to be set as true on the underlying merge tree
- * in order to function correctly.
- *
+ * @legacy
  * @alpha
  */
 export type MergeTreeDeltaRevertible =
 	| {
 			operation: typeof MergeTreeDeltaType.INSERT;
-			trackingGroup: TrackingGroup;
+			trackingGroup: ITrackingGroup;
 	  }
 	| {
 			operation: typeof MergeTreeDeltaType.REMOVE;
-			trackingGroup: TrackingGroup;
+			trackingGroup: ITrackingGroup;
 	  }
 	| {
 			operation: typeof MergeTreeDeltaType.ANNOTATE;
-			trackingGroup: TrackingGroup;
+			trackingGroup: ITrackingGroup;
 			propertyDeltas: PropertySet;
 	  };
 
-type TypedRevertible<T extends MergeTreeDeltaRevertible["operation"]> = MergeTreeDeltaRevertible & {
-	operation: T;
-};
+/**
+ * Tests whether x is a MergeTreeDeltaRevertible
+ * @internal
+ */
+export function isMergeTreeDeltaRevertible(x: unknown): x is MergeTreeDeltaRevertible {
+	return !!x && typeof x === "object" && "operation" in x && "trackingGroup" in x;
+}
+
+type TypedRevertible<T extends MergeTreeDeltaRevertible["operation"]> =
+	MergeTreeDeltaRevertible & {
+		operation: T;
+	};
 
 interface RemoveSegmentRefProperties {
 	/**
@@ -54,110 +69,113 @@ interface RemoveSegmentRefProperties {
 }
 
 /**
- * Revertibles are new and require the option
- * mergeTreeUseNewLengthCalculations to be set as true on the underlying merge tree
- * in order to function correctly.
- *
+ * @legacy
  * @alpha
  */
 export interface MergeTreeRevertibleDriver {
-	insertFromSpec(pos: number, spec: IJSONSegment);
-	removeRange(start: number, end: number);
-	annotateRange(start: number, end: number, props: PropertySet);
-	createLocalReferencePosition(
-		segment: ISegment,
-		offset: number,
-		refType: ReferenceType,
-		properties: PropertySet | undefined,
-	): LocalReferencePosition;
-	localReferencePositionToPosition(lref: LocalReferencePosition): number;
-	getPosition(segment: ISegment): number;
-	getContainingSegment(pos: number): {
-		segment: ISegment | undefined;
-		offset: number | undefined;
-	};
+	insertFromSpec(pos: number, spec: IJSONSegment): void;
+	removeRange(start: number, end: number): void;
+	annotateRange(start: number, end: number, props: PropertySet): void;
 }
 
 /**
  * exported for test only. should not be exported out the the package
  * @internal
  */
-export type InternalRevertDriver = MergeTreeRevertibleDriver & {
-	__mergeTreeRevertible?: {
-		detachedReferences?: EndOfTreeSegment;
-		refCallbacks?: LocalReferencePosition["callbacks"];
+export interface MergeTreeWithRevert extends MergeTree {
+	__mergeTreeRevertible: {
+		detachedReferences: EndOfTreeSegment;
+		refCallbacks: LocalReferencePosition["callbacks"];
 	};
-};
+}
+
+export type PickPartial<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>;
+function findMergeTreeWithRevert(trackable: Trackable): MergeTreeWithRevert {
+	const segmentOrNode = trackable.isLeaf() ? trackable : trackable.getSegment();
+	const maybeRoot = findRootMergeBlock(toSegmentLeaf(segmentOrNode));
+	assert(
+		maybeRoot?.mergeTree !== undefined,
+		0x5c2 /* trackable is invalid as it is not in a rooted merge tree. */,
+	);
+	const mergeTree: PickPartial<MergeTreeWithRevert, "__mergeTreeRevertible"> =
+		maybeRoot.mergeTree;
+
+	if (mergeTree.__mergeTreeRevertible === undefined) {
+		const detachedReferences = new EndOfTreeSegment(maybeRoot.mergeTree);
+		const refCallbacks: MergeTreeWithRevert["__mergeTreeRevertible"]["refCallbacks"] = {
+			afterSlide: (r: LocalReferencePosition) => {
+				if (mergeTree.referencePositionToLocalPosition(r) === DetachedReferencePosition) {
+					const refs = LocalReferenceCollection.setOrGet(detachedReferences);
+					refs.addAfterTombstones([r]);
+				}
+			},
+		};
+		mergeTree.__mergeTreeRevertible = {
+			refCallbacks,
+			detachedReferences,
+		};
+	}
+	return mergeTree as MergeTreeWithRevert;
+}
 
 function appendLocalInsertToRevertibles(
 	deltaArgs: IMergeTreeDeltaCallbackArgs,
 	revertibles: MergeTreeDeltaRevertible[],
-) {
+): MergeTreeDeltaRevertible[] {
 	if (revertibles[revertibles.length - 1]?.operation !== MergeTreeDeltaType.INSERT) {
 		revertibles.push({
 			operation: MergeTreeDeltaType.INSERT,
-			trackingGroup: new TrackingGroup(),
+			trackingGroup: new UnorderedTrackingGroup(),
 		});
 	}
 	const last = revertibles[revertibles.length - 1];
-	deltaArgs.deltaSegments.forEach((t) => last.trackingGroup.link(t.segment));
+	for (const t of deltaArgs.deltaSegments) last.trackingGroup.link(t.segment);
 
 	return revertibles;
 }
 
 function appendLocalRemoveToRevertibles(
-	driver: MergeTreeRevertibleDriver,
 	deltaArgs: IMergeTreeDeltaCallbackArgs,
 	revertibles: MergeTreeDeltaRevertible[],
-) {
+): MergeTreeDeltaRevertible[] {
 	if (revertibles[revertibles.length - 1]?.operation !== MergeTreeDeltaType.REMOVE) {
 		revertibles.push({
 			operation: MergeTreeDeltaType.REMOVE,
-			trackingGroup: new TrackingGroup(),
+			trackingGroup: new UnorderedTrackingGroup(),
 		});
 	}
 	const last = revertibles[revertibles.length - 1];
 
-	deltaArgs.deltaSegments.forEach((t) => {
+	const mergeTreeWithRevert = findMergeTreeWithRevert(deltaArgs.deltaSegments[0].segment);
+
+	for (const t of deltaArgs.deltaSegments) {
 		const props: RemoveSegmentRefProperties = {
-			segSpec: t.segment.toJSONObject(),
+			segSpec: t.segment.toJSONObject() as IJSONSegment,
 			referenceSpace: "mergeTreeDeltaRevertible",
 		};
-		const ref = driver.createLocalReferencePosition(
+		const ref = mergeTreeWithRevert.createLocalReferencePosition(
 			t.segment,
 			0,
 			ReferenceType.SlideOnRemove,
 			props,
 		);
-		const internalDriver: InternalRevertDriver = driver;
-		const driverRevertibleProps = (internalDriver.__mergeTreeRevertible ??= {});
-		ref.callbacks = driverRevertibleProps.refCallbacks ??= {
-			afterSlide: (r: LocalReferencePosition) => {
-				if (driver.localReferencePositionToPosition(r) === DetachedReferencePosition) {
-					const detached = (driverRevertibleProps.detachedReferences ??=
-						// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-						new EndOfTreeSegment(r.getSegment()!));
-					const refs = (detached.localRefs ??= new LocalReferenceCollection(detached));
-					refs.addAfterTombstones([r]);
-				}
-			},
-		};
-		t.segment.trackingCollection.trackingGroups.forEach((tg) => {
+		ref.callbacks = mergeTreeWithRevert.__mergeTreeRevertible.refCallbacks;
+		for (const tg of t.segment.trackingCollection.trackingGroups) {
 			tg.link(ref);
 			tg.unlink(t.segment);
-		});
+		}
 
 		last.trackingGroup.link(ref);
-	});
+	}
 	return revertibles;
 }
 
 function appendLocalAnnotateToRevertibles(
 	deltaArgs: IMergeTreeDeltaCallbackArgs,
 	revertibles: MergeTreeDeltaRevertible[],
-) {
+): MergeTreeDeltaRevertible[] {
 	let last = revertibles[revertibles.length - 1];
-	deltaArgs.deltaSegments.forEach((ds) => {
+	for (const ds of deltaArgs.deltaSegments) {
 		const propertyDeltas = ds.propertyDeltas;
 		if (propertyDeltas) {
 			if (
@@ -169,76 +187,88 @@ function appendLocalAnnotateToRevertibles(
 				last = {
 					operation: MergeTreeDeltaType.ANNOTATE,
 					propertyDeltas,
-					trackingGroup: new TrackingGroup(),
+					trackingGroup: new UnorderedTrackingGroup(),
 				};
 				last.trackingGroup.link(ds.segment);
 				revertibles.push(last);
 			}
 		}
-	});
+	}
 	return revertibles;
 }
 
 /**
- * Revertibles are new and require the option
- * mergeTreeUseNewLengthCalculations to be set as true on the underlying merge tree
- * in order to function correctly.
+ * Appends a merge tree delta to the list of revertibles.
+ *
+ * @legacy
  * @alpha
  */
 export function appendToMergeTreeDeltaRevertibles(
-	driver: MergeTreeRevertibleDriver,
 	deltaArgs: IMergeTreeDeltaCallbackArgs,
 	revertibles: MergeTreeDeltaRevertible[],
-) {
+): void {
+	if (deltaArgs.deltaSegments.length === 0) {
+		return;
+	}
 	switch (deltaArgs.operation) {
-		case MergeTreeDeltaType.INSERT:
+		case MergeTreeDeltaType.INSERT: {
 			appendLocalInsertToRevertibles(deltaArgs, revertibles);
 			break;
+		}
 
-		case MergeTreeDeltaType.REMOVE:
-			appendLocalRemoveToRevertibles(driver, deltaArgs, revertibles);
+		case MergeTreeDeltaType.REMOVE: {
+			appendLocalRemoveToRevertibles(deltaArgs, revertibles);
 			break;
+		}
 
-		case MergeTreeDeltaType.ANNOTATE:
+		case MergeTreeDeltaType.ANNOTATE: {
 			appendLocalAnnotateToRevertibles(deltaArgs, revertibles);
 			break;
+		}
 
-		default:
-			throw new UsageError(`Unsupported event delta type: ${deltaArgs.operation}`);
+		default: {
+			throw new UsageError("Unsupported event delta type", {
+				operation: deltaArgs.operation,
+			});
+		}
 	}
 }
 
 /**
- * Revertibles are new and require the option
- * mergeTreeUseNewLengthCalculations to be set as true on the underlying merge tree
- * in order to function correctly.
+ * Removes all revertibles from the list of revertibles.
+ *
+ * @legacy
  * @alpha
  */
-export function discardMergeTreeDeltaRevertible(revertibles: MergeTreeDeltaRevertible[]) {
-	revertibles.forEach((r) => {
-		r.trackingGroup.tracked.forEach((t) => {
+export function discardMergeTreeDeltaRevertible(
+	revertibles: MergeTreeDeltaRevertible[],
+): void {
+	for (const r of revertibles) {
+		for (const t of r.trackingGroup.tracked) {
 			t.trackingCollection.unlink(r.trackingGroup);
 			// remove untracked local references
 			if (t.trackingCollection.empty && !t.isLeaf()) {
-				t.getSegment()?.localRefs?.removeLocalRef(t);
+				const segment: ISegmentPrivate | undefined = t.getSegment();
+				segment?.localRefs?.removeLocalRef(t);
 			}
-		});
-	});
+		}
+	}
 }
 
 function revertLocalInsert(
 	driver: MergeTreeRevertibleDriver,
+	mergeTreeWithRevert: MergeTreeWithRevert,
 	revertible: TypedRevertible<typeof MergeTreeDeltaType.INSERT>,
-) {
+): void {
 	while (revertible.trackingGroup.size > 0) {
 		const tracked = revertible.trackingGroup.tracked[0];
 		assert(
 			tracked.trackingCollection.unlink(revertible.trackingGroup),
 			0x3f1 /* tracking group removed */,
 		);
-		assert(tracked.isLeaf(), 0x3f2 /* inserts must track segments */);
+		assert(isSegmentLeaf(tracked), 0x3f2 /* inserts must track segments */);
 		if (toRemovalInfo(tracked) === undefined) {
-			const start = driver.getPosition(tracked);
+			const start = getPosition(mergeTreeWithRevert, tracked);
 			driver.removeRange(start, start + tracked.cachedLength);
 		}
 	}
@@ -246,8 +276,9 @@ function revertLocalInsert(
 
 function revertLocalRemove(
 	driver: MergeTreeRevertibleDriver,
+	mergeTreeWithRevert: MergeTreeWithRevert,
 	revertible: TypedRevertible<typeof MergeTreeDeltaType.REMOVE>,
-) {
+): void {
 	while (revertible.trackingGroup.size > 0) {
 		const tracked = revertible.trackingGroup.tracked[0];
 
@@ -258,14 +289,14 @@ function revertLocalRemove(
 
 		assert(!tracked.isLeaf(), 0x3f4 /* removes must track local refs */);
 
-		let realPos = driver.localReferencePositionToPosition(tracked);
 		const refSeg = tracked.getSegment();
+		let realPos = mergeTreeWithRevert.referencePositionToLocalPosition(tracked);
 
 		// References which are on EndOfStringSegment don't return detached for pos,
 		// they will return the length of the merge-tree. this case just catches
 		// random references, likely not created in the revertible flow,
 		// that are tying to be reverted for some reason.
-		if (realPos === DetachedReferencePosition || refSeg === undefined) {
+		if (realPos === DetachedReferencePosition || !isSegmentLeaf(refSeg)) {
 			throw new UsageError("Cannot insert at detached references position");
 		}
 
@@ -275,16 +306,22 @@ function revertLocalRemove(
 
 		const props = tracked.properties as RemoveSegmentRefProperties;
 		driver.insertFromSpec(realPos, props.segSpec);
-		const insertSegment = driver.getContainingSegment(realPos).segment;
-		assert(insertSegment !== undefined, 0x3f5 /* insert segment must exist at position */);
+		const insertSegment = mergeTreeWithRevert.getContainingSegment(
+			realPos,
+			mergeTreeWithRevert.collabWindow.currentSeq,
+			mergeTreeWithRevert.collabWindow.clientId,
+		).segment;
+		assertSegmentLeaf(insertSegment);
 
-		const localSlideFilter = (lref: LocalReferencePosition) =>
+		const localSlideFilter = (lref: LocalReferencePosition): boolean =>
 			(lref.properties as Partial<RemoveSegmentRefProperties>)?.referenceSpace ===
 			"mergeTreeDeltaRevertible";
 
-		const insertRef: Partial<Record<"before" | "after", List<LocalReferencePosition>>> = {};
+		const insertRef: Partial<
+			Record<"before" | "after", DoublyLinkedList<LocalReferencePosition>>
+		> = {};
 		const forward = insertSegment.ordinal < refSeg.ordinal;
-		const refHandler = (lref: LocalReferencePosition) => {
+		const refHandler = (lref: LocalReferencePosition): false | undefined => {
 			// once we reach it keep the original reference where it is
 			// we'll move tracking groups, and remove it as a last step.
 			if (tracked === lref) {
@@ -292,20 +329,19 @@ function revertLocalRemove(
 			}
 			if (localSlideFilter(lref)) {
 				if (forward) {
-					const before = (insertRef.before ??= new List());
+					const before = (insertRef.before ??= new DoublyLinkedList());
 					before.push(lref);
 				} else {
-					const after = (insertRef.after ??= new List());
+					const after = (insertRef.after ??= new DoublyLinkedList());
 					after.unshift(lref);
 				}
 			}
 		};
 		depthFirstNodeWalk(
-			// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-			insertSegment.parent!,
+			insertSegment.parent,
 			insertSegment,
 			undefined,
-			(seg) => {
+			(seg: ISegmentPrivate) => {
 				if (seg.localRefs?.empty === false) {
 					return seg.localRefs.walkReferences(refHandler, undefined, forward);
 				}
@@ -314,18 +350,17 @@ function revertLocalRemove(
 			undefined,
 			forward,
 		);
-		const internalDriver: InternalRevertDriver = driver;
-		if (internalDriver.__mergeTreeRevertible?.detachedReferences?.localRefs?.has(tracked)) {
+		if (
+			mergeTreeWithRevert?.__mergeTreeRevertible?.detachedReferences?.localRefs?.has(tracked)
+		) {
 			assert(forward, 0x3f6 /* forward should always be true when detached */);
-			internalDriver.__mergeTreeRevertible.detachedReferences.localRefs.walkReferences(
+			mergeTreeWithRevert?.__mergeTreeRevertible.detachedReferences.localRefs.walkReferences(
 				refHandler,
 			);
 		}
 
 		if (insertRef !== undefined) {
-			const localRefs = (insertSegment.localRefs ??= new LocalReferenceCollection(
-				insertSegment,
-			));
+			const localRefs = LocalReferenceCollection.setOrGet(insertSegment);
 			if (insertRef.before?.empty === false) {
 				localRefs.addBeforeTombstones(insertRef.before.map((n) => n.data));
 			}
@@ -334,55 +369,74 @@ function revertLocalRemove(
 			}
 		}
 
-		tracked.trackingCollection.trackingGroups.forEach((tg) => {
+		for (const tg of tracked.trackingCollection.trackingGroups) {
 			tg.link(insertSegment);
 			tg.unlink(tracked);
-		});
-		tracked.getSegment()?.localRefs?.removeLocalRef(tracked);
+		}
+		const segment: ISegmentPrivate | undefined = tracked.getSegment();
+		segment?.localRefs?.removeLocalRef(tracked);
 	}
 }
 
 function revertLocalAnnotate(
 	driver: MergeTreeRevertibleDriver,
+	mergeTreeWithRevert: MergeTreeWithRevert,
 	revertible: TypedRevertible<typeof MergeTreeDeltaType.ANNOTATE>,
-) {
+): void {
 	while (revertible.trackingGroup.size > 0) {
 		const tracked = revertible.trackingGroup.tracked[0];
 		const unlinked = tracked.trackingCollection.unlink(revertible.trackingGroup);
-		assert(unlinked && tracked.isLeaf(), 0x3f7 /* annotates must track segments */);
+		assert(unlinked && isSegmentLeaf(tracked), 0x3f7 /* annotates must track segments */);
 		if (toRemovalInfo(tracked) === undefined) {
-			const start = driver.getPosition(tracked);
+			const start = getPosition(mergeTreeWithRevert, tracked);
 			driver.annotateRange(start, start + tracked.cachedLength, revertible.propertyDeltas);
 		}
 	}
 }
 
+function getPosition(mergeTreeWithRevert: MergeTreeWithRevert, segment: ISegmentLeaf): number {
+	return mergeTreeWithRevert.getPosition(
+		segment,
+		mergeTreeWithRevert.collabWindow.currentSeq,
+		mergeTreeWithRevert.collabWindow.clientId,
+	);
+}
+
 /**
- * Revertibles are new and require the option
- * mergeTreeUseNewLengthCalculations to be set as true on the underlying merge tree
- * in order to function correctly.
+ * Reverts all operations in the list of revertibles.
+ *
+ * @legacy
  * @alpha
  */
 export function revertMergeTreeDeltaRevertibles(
 	driver: MergeTreeRevertibleDriver,
 	revertibles: MergeTreeDeltaRevertible[],
-) {
+): void {
+	let mergeTreeWithRevert: MergeTreeWithRevert | undefined;
+
 	while (revertibles.length > 0) {
 		// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
 		const r = revertibles.pop()!;
 		const operation = r.operation;
-		switch (operation) {
-			case MergeTreeDeltaType.INSERT:
-				revertLocalInsert(driver, r);
-				break;
-			case MergeTreeDeltaType.REMOVE:
-				revertLocalRemove(driver, r);
-				break;
-			case MergeTreeDeltaType.ANNOTATE:
-				revertLocalAnnotate(driver, r);
-				break;
-			default:
-				unreachableCase(operation);
+		if (r.trackingGroup.size > 0) {
+			mergeTreeWithRevert ??= findMergeTreeWithRevert(r.trackingGroup.tracked[0]);
+			switch (operation) {
+				case MergeTreeDeltaType.INSERT: {
+					revertLocalInsert(driver, mergeTreeWithRevert, r);
+					break;
+				}
+				case MergeTreeDeltaType.REMOVE: {
+					revertLocalRemove(driver, mergeTreeWithRevert, r);
+					break;
+				}
+				case MergeTreeDeltaType.ANNOTATE: {
+					revertLocalAnnotate(driver, mergeTreeWithRevert, r);
+					break;
+				}
+				default: {
+					unreachableCase(operation);
+				}
+			}
 		}
 	}
 }

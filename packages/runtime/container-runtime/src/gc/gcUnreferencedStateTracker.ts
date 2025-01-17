@@ -3,10 +3,14 @@
  * Licensed under the MIT License.
  */
 
-import { assert, Timer } from "@fluidframework/common-utils";
-import { UnreferencedState } from "./gcDefinitions";
+import { assert, Timer } from "@fluidframework/core-utils/internal";
+import { validatePrecondition } from "@fluidframework/telemetry-utils/internal";
 
-/** A wrapper around common-utils Timer that requires the timeout when calling start/restart */
+import { UnreferencedState } from "./gcDefinitions.js";
+
+/**
+ * A wrapper around common-utils Timer that requires the timeout when calling start/restart
+ */
 class TimerWithNoDefaultTimeout extends Timer {
 	constructor(private readonly callback: () => void) {
 		// The default timeout/handlers will never be used since start/restart pass overrides below
@@ -15,7 +19,7 @@ class TimerWithNoDefaultTimeout extends Timer {
 		});
 	}
 
-	start(timeoutMs: number) {
+	start(timeoutMs: number): void {
 		super.start(timeoutMs, this.callback);
 	}
 
@@ -25,8 +29,23 @@ class TimerWithNoDefaultTimeout extends Timer {
 }
 
 /**
+ * The collection of UnreferencedStateTrackers for all unreferenced nodes. Ensures stopTracking is called when deleting
+ */
+export class UnreferencedStateTrackerMap extends Map<string, UnreferencedStateTracker> {
+	/**
+	 * Delete the given key, and stop tracking if that node was actually unreferenced
+	 */
+	delete(key: string): boolean {
+		// Stop tracking so as to clear out any running timers.
+		this.get(key)?.stopTracking();
+		// Delete the node as we don't need to track it any more.
+		return super.delete(key);
+	}
+}
+
+/**
  * Helper class that tracks the state of an unreferenced node such as the time it was unreferenced and if it can
- * be deleted by the sweep phase.
+ * be tombstoned or deleted by the sweep phase.
  */
 export class UnreferencedStateTracker {
 	private _state: UnreferencedState = UnreferencedState.Active;
@@ -34,65 +53,118 @@ export class UnreferencedStateTracker {
 		return this._state;
 	}
 
-	/** Timer to indicate when an unreferenced object is considered Inactive */
+	/**
+	 * Timer to indicate when an unreferenced object is considered Inactive
+	 */
 	private readonly inactiveTimer: TimerWithNoDefaultTimeout;
-	/** Timer to indicate when an unreferenced object is Sweep-Ready */
+	/**
+	 * Timer to indicate when an unreferenced object is Tombstone-Ready
+	 */
+	private readonly tombstoneTimer: TimerWithNoDefaultTimeout;
+	/**
+	 * Timer to indicate when an unreferenced object is Sweep-Ready
+	 */
 	private readonly sweepTimer: TimerWithNoDefaultTimeout;
 
 	constructor(
 		public readonly unreferencedTimestampMs: number,
-		/** The time after which node transitions to Inactive state. */
+		/**
+		 * The time after which node transitions to Inactive state.
+		 */
 		private readonly inactiveTimeoutMs: number,
-		/** The current reference timestamp used to track how long this node has been unreferenced for. */
+		/**
+		 * The current reference timestamp used to track how long this node has been unreferenced for.
+		 */
 		currentReferenceTimestampMs: number,
-		/** The time after which node transitions to SweepReady state; undefined if session expiry is disabled. */
-		private readonly sweepTimeoutMs: number | undefined,
+		/**
+		 * The time after which node transitions to TombstoneReady state; undefined if session expiry is disabled.
+		 */
+		private readonly tombstoneTimeoutMs: number | undefined,
+		/**
+		 * The delay from TombstoneReady to SweepReady (only applies if tombstoneTimeoutMs is defined)
+		 */
+		private readonly sweepGracePeriodMs: number,
 	) {
-		if (this.sweepTimeoutMs !== undefined) {
-			assert(
-				this.inactiveTimeoutMs <= this.sweepTimeoutMs,
-				0x3b0 /* inactive timeout must not be greater than the sweep timeout */,
-			);
-		}
+		validatePrecondition(
+			this.tombstoneTimeoutMs === undefined ||
+				this.tombstoneTimeoutMs >= this.inactiveTimeoutMs,
+			"inactiveTimeoutMs must not be greater than the tombstoneTimeoutMs",
+		);
 
 		this.sweepTimer = new TimerWithNoDefaultTimeout(() => {
 			this._state = UnreferencedState.SweepReady;
 			assert(
-				!this.inactiveTimer.hasTimer,
-				0x3b1 /* inactiveTimer still running after sweepTimer fired! */,
+				!this.inactiveTimer.hasTimer && !this.tombstoneTimer.hasTimer,
+				0x863 /* inactiveTimer or tombstoneTimer still running after sweepTimer fired! */,
 			);
+		});
+
+		this.tombstoneTimer = new TimerWithNoDefaultTimeout(() => {
+			this._state = UnreferencedState.TombstoneReady;
+			assert(
+				!this.inactiveTimer.hasTimer,
+				0x864 /* inactiveTimer still running after tombstoneTimer fired! */,
+			); // aka 0x3b1
+
+			if (this.sweepGracePeriodMs > 0) {
+				// After the node becomes tombstone ready, start the sweep timer after which the node will be ready for sweep.
+				this.sweepTimer.restart(this.sweepGracePeriodMs);
+			} else {
+				this._state = UnreferencedState.SweepReady;
+			}
 		});
 
 		this.inactiveTimer = new TimerWithNoDefaultTimeout(() => {
 			this._state = UnreferencedState.Inactive;
 
-			// After the node becomes inactive, start the sweep timer after which the node will be ready for sweep.
-			if (this.sweepTimeoutMs !== undefined) {
-				this.sweepTimer.restart(this.sweepTimeoutMs - this.inactiveTimeoutMs);
+			// After the node becomes inactive, start the tombstone timer after which the node will be ready for tombstone.
+			if (this.tombstoneTimeoutMs !== undefined) {
+				this.tombstoneTimer.restart(this.tombstoneTimeoutMs - this.inactiveTimeoutMs);
 			}
 		});
+
 		this.updateTracking(currentReferenceTimestampMs);
 	}
 
-	/* Updates the unreferenced state based on the provided timestamp. */
-	public updateTracking(currentReferenceTimestampMs: number) {
+	/**
+	 * Updates the unreferenced state based on the provided timestamp.
+	 */
+	public updateTracking(currentReferenceTimestampMs: number): void {
 		const unreferencedDurationMs = currentReferenceTimestampMs - this.unreferencedTimestampMs;
 
-		// If the node has been unreferenced for sweep timeout amount of time, update the state to SweepReady.
-		if (this.sweepTimeoutMs !== undefined && unreferencedDurationMs >= this.sweepTimeoutMs) {
+		// Below we will set the appropriate timer (or none). Any running timers are superceded by the new currentReferenceTimestampMs
+		this.clearTimers();
+
+		// If the node has been unreferenced long enough, update the state to SweepReady.
+		if (
+			this.tombstoneTimeoutMs !== undefined &&
+			unreferencedDurationMs >= this.tombstoneTimeoutMs + this.sweepGracePeriodMs
+		) {
 			this._state = UnreferencedState.SweepReady;
-			this.clearTimers();
 			return;
 		}
 
-		// If the node has been unreferenced for inactive timeoutMs amount of time, update the state to inactive.
-		// Also, start a timer for the sweep timeout.
+		// If the node has been unreferenced long enough, update the state to TombstoneReady.
+		// Also, start a timer for the remainder of the sweep delay.
+		if (
+			this.tombstoneTimeoutMs !== undefined &&
+			unreferencedDurationMs >= this.tombstoneTimeoutMs
+		) {
+			this._state = UnreferencedState.TombstoneReady;
+
+			this.sweepTimer.restart(
+				this.tombstoneTimeoutMs + this.sweepGracePeriodMs - unreferencedDurationMs,
+			);
+			return;
+		}
+
+		// If the node has been unreferenced for long enough, update the state to inactive.
+		// Also, start a timer for the remainder of the tombstone timeout.
 		if (unreferencedDurationMs >= this.inactiveTimeoutMs) {
 			this._state = UnreferencedState.Inactive;
-			this.inactiveTimer.clear();
 
-			if (this.sweepTimeoutMs !== undefined) {
-				this.sweepTimer.restart(this.sweepTimeoutMs - unreferencedDurationMs);
+			if (this.tombstoneTimeoutMs !== undefined) {
+				this.tombstoneTimer.restart(this.tombstoneTimeoutMs - unreferencedDurationMs);
 			}
 			return;
 		}
@@ -101,13 +173,16 @@ export class UnreferencedStateTracker {
 		this.inactiveTimer.restart(this.inactiveTimeoutMs - unreferencedDurationMs);
 	}
 
-	private clearTimers() {
+	private clearTimers(): void {
 		this.inactiveTimer.clear();
+		this.tombstoneTimer.clear();
 		this.sweepTimer.clear();
 	}
 
-	/** Stop tracking this node. Reset the unreferenced timers and state, if any. */
-	public stopTracking() {
+	/**
+	 * Stop tracking this node. Reset the unreferenced timers and state, if any.
+	 */
+	public stopTracking(): void {
 		this.clearTimers();
 		this._state = UnreferencedState.Active;
 	}

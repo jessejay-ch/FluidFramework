@@ -7,6 +7,7 @@
 import sha1 from "sha.js/sha1";
 // eslint-disable-next-line import/no-internal-modules
 import sha256 from "sha.js/sha256";
+
 import { IsoBuffer } from "./bufferNode";
 
 /**
@@ -19,6 +20,9 @@ import { IsoBuffer } from "./bufferNode";
  * @param algorithm - The hash algorithm to use, artificially constrained by what is used internally.
  * @param hashEncoding - The encoding of the returned hash, also artificially constrained.
  * @returns The hash of the content of the buffer.
+ *
+ * @deprecated Moved to the `@fluidframework-internal/client-utils` package.
+ * @internal
  */
 export async function hashFile(
 	file: IsoBuffer,
@@ -46,6 +50,9 @@ export async function hashFile(
  *
  * @param file - The contents of the file in a buffer
  * @returns The sha1 hash of the content of the buffer with the `blob` prefix and size
+ *
+ * @deprecated Moved to the `@fluidframework-internal/client-utils` package.
+ * @internal
  */
 export async function gitHashFile(file: IsoBuffer): Promise<string> {
 	const size = file.byteLength;

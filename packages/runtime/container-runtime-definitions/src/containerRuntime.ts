@@ -3,64 +3,176 @@
  * Licensed under the MIT License.
  */
 
-import { IEventProvider } from "@fluidframework/common-definitions";
-import { AttachState, IDeltaManager, ILoaderOptions } from "@fluidframework/container-definitions";
-import { IRequest, IResponse, IFluidRouter, FluidObject } from "@fluidframework/core-interfaces";
-import { IDocumentStorageService } from "@fluidframework/driver-definitions";
-import {
-	IClientDetails,
+import type { AttachState } from "@fluidframework/container-definitions";
+import type { IDeltaManager } from "@fluidframework/container-definitions/internal";
+import type {
+	FluidObject,
+	IEvent,
+	IEventProvider,
+	IRequest,
+	IResponse,
+} from "@fluidframework/core-interfaces";
+import type { IFluidHandleContext } from "@fluidframework/core-interfaces/internal";
+import type { IClientDetails } from "@fluidframework/driver-definitions";
+import type {
+	IDocumentStorageService,
 	IDocumentMessage,
-	IHelpMessage,
 	ISequencedDocumentMessage,
-} from "@fluidframework/protocol-definitions";
-import {
+} from "@fluidframework/driver-definitions/internal";
+import type {
 	FlushMode,
 	IContainerRuntimeBase,
 	IContainerRuntimeBaseEvents,
-	IDataStore,
-	IFluidDataStoreContextDetached,
 	IProvideFluidDataStoreRegistry,
-} from "@fluidframework/runtime-definitions";
+} from "@fluidframework/runtime-definitions/internal";
 
 /**
- * @deprecated Not necessary if consumers add a new dataStore to the container by storing its handle.
+ * @deprecated Will be removed in future major release. Migrate all usage of IFluidRouter to the "entryPoint" pattern. Refer to Removing-IFluidRouter.md
+ * @legacy
+ * @alpha
  */
-export interface IDataStoreWithBindToContext_Deprecated extends IDataStore {
-	fluidDataStoreChannel?: { bindToContext?(): void };
+export interface IContainerRuntimeWithResolveHandle_Deprecated extends IContainerRuntime {
+	readonly IFluidHandleContext: IFluidHandleContext;
+	resolveHandle(request: IRequest): Promise<IResponse>;
 }
 
 /**
- * @deprecated This will be removed in a later release.
+ * Events emitted by {@link IContainerRuntime}.
+ * @legacy
+ * @alpha
+ * @sealed
  */
-export const IContainerRuntime: keyof IProvideContainerRuntime = "IContainerRuntime";
-
-/**
- * @deprecated This will be removed in a later release.
- */
-export interface IProvideContainerRuntime {
-	/**
-	 * @deprecated This will be removed in a later release.
-	 */
-	IContainerRuntime: IContainerRuntime;
-}
-
-export interface IContainerRuntimeEvents extends IContainerRuntimeBaseEvents {
-	(event: "dirty" | "disconnected" | "dispose" | "saved" | "attached", listener: () => void);
+export interface IContainerRuntimeEvents
+	extends IContainerRuntimeBaseEvents,
+		ISummarizerEvents {
+	(event: "dirty" | "disconnected" | "saved" | "attached", listener: () => void);
 	(event: "connected", listener: (clientId: string) => void);
-	(event: "localHelp", listener: (message: IHelpMessage) => void);
 }
 
+/**
+ * @legacy
+ * @alpha
+ * @sealed
+ */
+export type SummarizerStopReason =
+	/**
+	 * Summarizer client failed to summarize in all attempts.
+	 */
+	| "failToSummarize"
+	/**
+	 * Parent client reported that it is no longer connected.
+	 */
+	| "parentNotConnected"
+	/**
+	 * Parent client reported that it is no longer elected the summarizer.
+	 * This is the normal flow; a disconnect will always trigger the parent
+	 * client to no longer be elected as responsible for summaries. Then it
+	 * tries to stop its spawned summarizer client.
+	 */
+	| "notElectedParent"
+	/**
+	 * We are not already running the summarizer and we are not the current elected client id.
+	 */
+	| "notElectedClient"
+	/**
+	 * Summarizer client was disconnected
+	 */
+	| "summarizerClientDisconnected"
+	/**
+	 * running summarizer threw an exception
+	 */
+	| "summarizerException"
+	/**
+	 * The previous summary state on the summarizer is not the most recently acked summary. this also happens when the
+	 * first submitSummary attempt fails for any reason and there's a 2nd summary attempt without an ack
+	 */
+	| "latestSummaryStateStale";
+
+/**
+ * @legacy
+ * @alpha
+ * @sealed
+ */
+export interface ISummarizeEventProps {
+	result: "success" | "failure" | "canceled";
+	currentAttempt: number;
+	maxAttempts: number;
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	error?: any;
+	/**
+	 * Result message of a failed summarize attempt
+	 */
+	failureMessage?: string;
+	/**
+	 * Was this summarize attempt part of the lastSummary process?
+	 */
+	isLastSummary?: boolean;
+}
+
+/**
+ * @legacy
+ * @alpha
+ * @sealed
+ */
+export interface ISummarizerObservabilityProps {
+	numUnsummarizedRuntimeOps: number;
+	numUnsummarizedNonRuntimeOps: number;
+}
+
+/**
+ * @legacy
+ * @alpha
+ * @sealed
+ */
+export interface ISummarizerEvents extends IEvent {
+	(
+		event: "summarize",
+		listener: (props: ISummarizeEventProps & ISummarizerObservabilityProps) => void,
+	);
+	(
+		event: "summarizeAllAttemptsFailed",
+		listener: (
+			props: Omit<ISummarizeEventProps, "result"> & ISummarizerObservabilityProps,
+		) => void,
+	);
+	(
+		event: "summarizerStop",
+		listener: (
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			props: { stopReason: SummarizerStopReason; error?: any } & ISummarizerObservabilityProps,
+		) => void,
+	);
+	(
+		event: "summarizerStart",
+		listener: (props: { onBehalfOf: string } & ISummarizerObservabilityProps) => void,
+	);
+	(
+		event: "summarizerStartupFailed",
+		listener: (
+			props: { reason: SummarizerStopReason } & ISummarizerObservabilityProps,
+		) => void,
+	);
+}
+
+/**
+ * @legacy
+ * @alpha
+ * @sealed
+ */
 export type IContainerRuntimeBaseWithCombinedEvents = IContainerRuntimeBase &
 	IEventProvider<IContainerRuntimeEvents>;
 
-/*
+/**
  * Represents the runtime of the container. Contains helper functions/state of the container.
+ * @legacy
+ * @alpha
+ * @sealed
  */
 export interface IContainerRuntime
-	extends IProvideContainerRuntime,
-		IProvideFluidDataStoreRegistry,
+	extends IProvideFluidDataStoreRegistry,
 		IContainerRuntimeBaseWithCombinedEvents {
-	readonly options: ILoaderOptions;
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	readonly options: Record<string | number, any>;
 	readonly clientId: string | undefined;
 	readonly clientDetails: IClientDetails;
 	readonly connected: boolean;
@@ -74,24 +186,6 @@ export interface IContainerRuntime
 	readonly attachState: AttachState;
 
 	/**
-	 * Returns the runtime of the data store.
-	 * @param id - Id supplied during creating the data store.
-	 * @param wait - True if you want to wait for it.
-	 */
-	getRootDataStore(id: string, wait?: boolean): Promise<IFluidRouter>;
-
-	/**
-	 * Creates detached data store context. Data store initialization is considered complete
-	 * only after context.attachRuntime() is called.
-	 * @param pkg - package path
-	 * @param rootDataStoreId - data store ID (unique name). Must not contain slashes.
-	 */
-	createDetachedRootDataStore(
-		pkg: Readonly<string[]>,
-		rootDataStoreId: string,
-	): IFluidDataStoreContextDetached;
-
-	/**
 	 * Returns true if document is dirty, i.e. there are some pending local changes that
 	 * either were not sent out to delta stream or were not yet acknowledged.
 	 */
@@ -103,10 +197,4 @@ export interface IContainerRuntime
 	 * @param relativeUrl - A relative request within the container
 	 */
 	getAbsoluteUrl(relativeUrl: string): Promise<string | undefined>;
-
-	/**
-	 * Resolves handle URI
-	 * @param request - request to resolve
-	 */
-	resolveHandle(request: IRequest): Promise<IResponse>;
 }

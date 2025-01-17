@@ -3,14 +3,48 @@
  * Licensed under the MIT License.
  */
 
-import { RevisionTag } from "../../core";
-import { brand, Brand, NestedSet } from "../../util";
-import { IdAllocator } from "./fieldChangeHandler";
+import type { ChangesetLocalId, RevisionTag } from "../../core/index.js";
+import { RangeMap, type RangeQueryResult } from "../../util/index.js";
+import type { NodeId } from "./modularChangeTypes.js";
 
-export type CrossFieldQuerySet = NestedSet<RevisionTag | undefined, ChangesetLocalId>;
+export type CrossFieldMap<T> = Map<RevisionTag | undefined, RangeMap<T>>;
+export type CrossFieldQuerySet = CrossFieldMap<boolean>;
+
+export function addCrossFieldQuery(
+	set: CrossFieldQuerySet,
+	revision: RevisionTag | undefined,
+	id: ChangesetLocalId,
+	count: number,
+): void {
+	setInCrossFieldMap(set, revision, id, count, true);
+}
+
+export function setInCrossFieldMap<T>(
+	map: CrossFieldMap<T>,
+	revision: RevisionTag | undefined,
+	id: ChangesetLocalId,
+	count: number,
+	value: T,
+): void {
+	let rangeMap = map.get(revision);
+	if (rangeMap === undefined) {
+		rangeMap = new RangeMap();
+		map.set(revision, rangeMap);
+	}
+	rangeMap.set(id, count, value);
+}
+
+export function getFirstFromCrossFieldMap<T>(
+	map: CrossFieldMap<T>,
+	revision: RevisionTag | undefined,
+	id: ChangesetLocalId,
+	count: number,
+): RangeQueryResult<T> {
+	const rangeMap = map.has(revision) ? (map.get(revision) as RangeMap<T>) : new RangeMap<T>();
+	return rangeMap.get(id, count);
+}
 
 /**
- * @alpha
  */
 export enum CrossFieldTarget {
 	Source,
@@ -20,50 +54,48 @@ export enum CrossFieldTarget {
 /**
  * Used by {@link FieldChangeHandler} implementations for exchanging information across other fields
  * while rebasing, composing, or inverting a change.
- * @alpha
  */
 export interface CrossFieldManager<T = unknown> {
 	/**
-	 * Returns the data associated with triplet key of `target`, `revision`, and `id`.
+	 * Returns the first data range associated with the key of `target`, `revision`, between `id` and `id + count`.
 	 * Calling this records a dependency for the current field on this key if `addDependency` is true.
 	 */
 	get(
 		target: CrossFieldTarget,
 		revision: RevisionTag | undefined,
 		id: ChangesetLocalId,
+		count: number,
 		addDependency: boolean,
-	): T | undefined;
+	): RangeQueryResult<T>;
 
 	/**
-	 * If there is no data for this key, sets the value to `newValue`.
-	 * Then returns the data for this key.
+	 * Sets the range of keys to `newValue`.
 	 * If `invalidateDependents` is true, all fields which took a dependency on this key will be considered invalidated
-	 * and will be given a chance to address the new data in `amendRebase`, `amendInvert`, or `amendCompose`,
-	 * as appropriate.
+	 * and will be given a chance to address the new data in `amendCompose`, or a second pass of `rebase` or `invert` as appropriate.
 	 */
-	getOrCreate(
+	set(
 		target: CrossFieldTarget,
 		revision: RevisionTag | undefined,
 		id: ChangesetLocalId,
+		count: number,
 		newValue: T,
 		invalidateDependents: boolean,
-	): T;
-}
+	): void;
 
-/**
- * An ID which is unique within a revision of a `ModularChangeset`.
- * A `ModularChangeset` which is a composition of multiple revisions may contain duplicate `ChangesetLocalId`s,
- * but they are unique when qualified by the revision of the change they are used in.
- * @alpha
- */
-export type ChangesetLocalId = Brand<number, "ChangesetLocalId">;
+	/**
+	 * This must be called whenever a new node is moved into this field as part of the current rebase, compose, or invert.
+	 * Calling this for a node which was already in the field is tolerated.
+	 */
+	onMoveIn(id: NodeId): void;
 
-/**
- * @alpha
- */
-export function idAllocatorFromMaxId(maxId: ChangesetLocalId | undefined = undefined): IdAllocator {
-	let currId = maxId ?? -1;
-	return () => {
-		return brand(++currId);
-	};
+	/**
+	 * This must be called whenever a new cross field key is moved into this field as part of the current rebase or compose.
+	 * Calling this for a key which was already in the field is tolerated.
+	 */
+	moveKey(
+		target: CrossFieldTarget,
+		revision: RevisionTag | undefined,
+		id: ChangesetLocalId,
+		count: number,
+	): void;
 }

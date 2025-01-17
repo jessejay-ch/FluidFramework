@@ -3,9 +3,7 @@
  * Licensed under the MIT License.
  */
 
-import { AsyncLocalStorage } from "async_hooks";
-import * as querystring from "querystring";
-import type { AxiosRequestHeaders } from "axios";
+import type { RawAxiosRequestHeaders } from "axios";
 import * as git from "@fluidframework/gitresources";
 import {
 	IGetRefParamsExternal,
@@ -17,13 +15,17 @@ import {
 	RestWrapper,
 	IWholeFlatSummary,
 	IWholeSummaryPayloadType,
+	LatestSummaryId,
 } from "@fluidframework/server-services-client";
 import { ITenantStorage, runWithRetry } from "@fluidframework/server-services-core";
-import * as uuid from "uuid";
+import { v4 as uuid } from "uuid";
 import * as winston from "winston";
-import { getCorrelationId } from "@fluidframework/server-services-utils";
-import { BaseTelemetryProperties, Lumberjack } from "@fluidframework/server-services-telemetry";
-import { getRequestErrorTranslator } from "../utils";
+import {
+	BaseTelemetryProperties,
+	Lumberjack,
+	getGlobalTelemetryContext,
+} from "@fluidframework/server-services-telemetry";
+import { Constants, getRequestErrorTranslator } from "../utils";
 import { ICache } from "./definitions";
 
 // We include the historian version in the user-agent string
@@ -31,7 +33,7 @@ import { ICache } from "./definitions";
 const packageDetails = require("../../package.json");
 const userAgent = `Historian/${packageDetails.version}`;
 
-const latestSummarySha = "latest";
+const LatestSummaryShaKey = `${LatestSummaryId}-sha`;
 
 export interface IDocument {
 	existing: boolean;
@@ -59,11 +61,13 @@ export class RestGitService {
 		private readonly tenantId: string,
 		private readonly documentId: string,
 		private readonly cache?: ICache,
-		private readonly asyncLocalStorage?: AsyncLocalStorage<string>,
 		private readonly storageName?: string,
 		private readonly storageUrl?: string,
+		private readonly isEphemeralContainer?: boolean,
+		private readonly maxCacheableSummarySize?: number,
+		private readonly simplifiedCustomData?: string,
 	) {
-		const defaultHeaders: AxiosRequestHeaders =
+		const defaultHeaders: RawAxiosRequestHeaders =
 			storageName !== undefined
 				? {
 						"User-Agent": userAgent,
@@ -80,6 +84,14 @@ export class RestGitService {
 			);
 			defaultHeaders.Authorization = `Basic ${token.toString("base64")}`;
 		}
+		if (this.simplifiedCustomData) {
+			defaultHeaders[Constants.SimplifiedCustomData] = this.simplifiedCustomData;
+		}
+
+		// We set the flag only for ephemeral containers
+		if (this.isEphemeralContainer) {
+			defaultHeaders[Constants.IsEphemeralContainer] = this.isEphemeralContainer;
+		}
 		this.lumberProperties = {
 			[BaseTelemetryProperties.tenantId]: this.tenantId,
 			[BaseTelemetryProperties.documentId]: this.documentId,
@@ -87,33 +99,29 @@ export class RestGitService {
 
 		const baseUrl = this.storageUrl || storage.url;
 
-		winston.info(
-			`Created RestGitService: ${JSON.stringify({
-				"BaseUrl": baseUrl,
-				"Storage-Routing-Id": this.getStorageRoutingHeaderValue(),
-				"Storage-Name": this.storageName,
-			})}`,
-		);
+		const restGitServiceCreationLog = `Created RestGitService: ${JSON.stringify({
+			"BaseUrl": baseUrl,
+			"Storage-Routing-Id": this.getStorageRoutingHeaderValue(),
+			"Storage-Name": this.storageName,
+			"Is-Ephemeral-Container": this.isEphemeralContainer,
+		})}`;
 
-		Lumberjack.info(
-			`Created RestGitService: ${JSON.stringify({
-				"BaseUrl": baseUrl,
-				"Storage-Routing-Id": this.getStorageRoutingHeaderValue(),
-				"Storage-Name": this.storageName,
-			})}`,
-			this.lumberProperties,
-		);
+		winston.info(restGitServiceCreationLog);
+		Lumberjack.info(restGitServiceCreationLog, this.lumberProperties);
 
 		this.restWrapper = new BasicRestWrapper(
 			baseUrl,
 			undefined,
 			undefined,
 			undefined,
-			defaultHeaders,
+			defaultHeaders as any,
 			undefined,
 			undefined,
 			undefined,
-			() => getCorrelationId(this.asyncLocalStorage) || uuid.v4(),
+			() =>
+				getGlobalTelemetryContext().getProperties().correlationId ??
+				uuid() /* getCorrelationId */,
+			() => getGlobalTelemetryContext().getProperties() /* getTelemetryContextProperties */,
 		);
 	}
 
@@ -143,26 +151,28 @@ export class RestGitService {
 		return createResults;
 	}
 
-	public async getContent(path: string, ref: string): Promise<any> {
-		const query = querystring.stringify({ ref });
+	public async getContent(path: string, ref: string | undefined): Promise<any> {
+		const query = new URLSearchParams();
+		if (ref !== undefined) {
+			query.set("ref", ref);
+		}
 		return this.get(
-			`/repos/${this.getRepoPath()}/contents/${encodeURIComponent(path)}?${query}`,
+			`/repos/${this.getRepoPath()}/contents/${encodeURIComponent(path)}?${query.toString()}`,
 		);
 	}
 
 	public async getCommits(sha: string, count: number): Promise<git.ICommitDetails[]> {
-		let config;
+		const queryParams: { count: string; sha: string; config?: string } = {
+			count: count.toString(),
+			sha,
+		};
 		if (this.writeToExternalStorage) {
 			const getRefParams: IGetRefParamsExternal = {
 				config: { enabled: true },
 			};
-			config = encodeURIComponent(JSON.stringify(getRefParams));
+			queryParams.config = encodeURIComponent(JSON.stringify(getRefParams));
 		}
-		const query = querystring.stringify({
-			count,
-			sha,
-			config,
-		});
+		const query = new URLSearchParams(queryParams).toString();
 		return this.get(`/repos/${this.getRepoPath()}/commits?${query}`);
 	}
 
@@ -222,7 +232,7 @@ export class RestGitService {
 	public async createRef(params: ICreateRefParamsExternal): Promise<git.IRef> {
 		// We modify this param to prevent writes to external storage if tenant is not linked
 		if (!this.writeToExternalStorage) {
-			params.config.enabled = false;
+			params.config = { ...params.config, enabled: false };
 		}
 		return this.post(`/repos/${this.getRepoPath()}/git/refs`, params);
 	}
@@ -236,15 +246,25 @@ export class RestGitService {
 			summaryParams,
 			initial !== undefined ? { initial } : undefined,
 		);
+		// JSON.stringify is not ideal for performance here, but it is better than crashing the cache service.
+		const summarySize = JSON.stringify(summaryResponse).length;
 		if (
 			summaryParams.type === "container" &&
-			(summaryResponse as IWholeFlatSummary).trees !== undefined
+			(summaryResponse as IWholeFlatSummary).trees !== undefined &&
+			(this.maxCacheableSummarySize === undefined ||
+				summarySize <= this.maxCacheableSummarySize)
 		) {
 			// Cache the written summary for future retrieval. If this fails, next summary retrieval
 			// will receive an older version, but that is OK. Client will catch up with ops.
 			this.setCache<IWholeFlatSummary>(
 				this.getSummaryCacheKey(summaryParams.type),
 				summaryResponse as IWholeFlatSummary,
+			);
+			// Important: separately cache latest summary's sha for efficiently checking if a
+			// summary read for a specific sha is actually looking for latest summary.
+			this.setCache<string>(
+				this.getSummaryCacheKey(summaryParams.type, LatestSummaryShaKey),
+				summaryResponse.id,
 			);
 		} else {
 			// Delete previous summary from cache so next summary retrieval is forced to go to the service.
@@ -265,43 +285,56 @@ export class RestGitService {
 		return this.delete<boolean>(`/repos/${this.getRepoPath()}/git/summaries`, headers);
 	}
 
+	/**
+	 * Retrieve a summary from cache or storage.
+	 * @param sha - version id for the requested summary. When using Git, this is the commit sha for the summary.
+	 * @param _useCache - Ignored. See [#14623](https://github.com/microsoft/FluidFramework/issues/14623) for more details.
+	 */
 	public async getSummary(sha: string, _useCache: boolean): Promise<IWholeFlatSummary> {
-		const summaryFetch = async () =>
+		// Fetch a summary requested by sha
+		const summaryFetch = async (): Promise<IWholeFlatSummary> =>
 			this.get<IWholeFlatSummary>(
 				`/repos/${this.getRepoPath()}/git/summaries/${encodeURIComponent(sha)}`,
 			);
-
-		if (sha !== latestSummarySha) {
-			// Never cache specific summary versions.
-			return summaryFetch();
-		}
 
 		// Currently, only "container" type summaries are retrieved from storage.
 		// In the future, we might want to also retrieve "channels". When that happens,
 		// our APIs will change so we specify what type we want to retrieve during
 		// the request.
-		const summaryCacheKey = this.getSummaryCacheKey("container");
+		const latestSummaryCacheKey = this.getSummaryCacheKey("container");
 
-		// To do: Right now, we enable the cache anytime. We will choose either one of the following options:
-		// 1. Always using the cache but clearing the cache at session end from the server.
-		// 2. The driver fix to disable cache only on session start or cluster change if we can detect it.
-		// if (!useCache) {
-		//     // We set the useCache flag as false when we fetch the initial latest summary for a document.
-		//     // In that scenario, useCache as false means that we need to get the summary from storage and bypass the
-		//     // cache, since the cached data might be obsolete due to a cluster change. After fetching the value from
-		//     // storage, we add it to the cache so it can be up-to-date. As a result, subsequent requests that use
-		//     // the cache can read the correct value.
-		//     return this.fetchAndCache(summaryCacheKey, summaryFetch);
-		// }
-
-		// If we get to this point, we want to obtain the latest summary, and we want to try reading it from the cache.
-		return this.resolve(summaryCacheKey, summaryFetch, true);
+		if (sha === LatestSummaryId) {
+			// Attempt to retrieve the latest summary from cache or storage, using specific `LatestSummaryCacheKey`.
+			// If retrieved from storage, this operation will also cache the retrieved value.
+			return this.resolve(latestSummaryCacheKey, summaryFetch, true);
+		}
+		// It is possible that the client will request the latest summary via specific sha instead of special "latest" sha.
+		// If we already have latest cached, we want to avoid hitting storage, so first check if the sha is the latest summary's sha.
+		// Important: we first check _only_ the sha in order to avoid unnecessarily reading an entire summary into memory from the cache.
+		const latestSummaryShaCacheKey = this.getSummaryCacheKey("container", LatestSummaryShaKey);
+		const cachedLatestSummarySha = await this.getCache<string | undefined>(
+			latestSummaryShaCacheKey,
+		);
+		if (cachedLatestSummarySha === sha) {
+			// If the requested sha is the same as the cached latest summary's sha, we should retrieve it
+			// from cache.
+			const cachedLatestSummary =
+				await this.getCache<IWholeFlatSummary>(latestSummaryCacheKey);
+			// If latest summary sha is cached, but the summary itself does not exist in cache, retrieve the requested summary
+			// by specific version as normal and do not cache it.
+			if (cachedLatestSummary) {
+				return cachedLatestSummary;
+			}
+		}
+		// We only cache the latest summary for each document, so if the requested summary is not latest,
+		// retrieve it without caching.
+		return summaryFetch();
 	}
 
 	public async updateRef(ref: string, params: IPatchRefParamsExternal): Promise<git.IRef> {
 		// We modify this param to prevent writes to external storage if tenant is not linked
 		if (!this.writeToExternalStorage) {
-			params.config.enabled = false;
+			params.config = { ...params.config, enabled: false };
 		}
 		return this.patch(`/repos/${this.getRepoPath()}/git/refs/${ref}`, params);
 	}
@@ -334,7 +367,7 @@ export class RestGitService {
 		return this.resolve(
 			key,
 			async () => {
-				const query = querystring.stringify({ recursive: recursive ? 1 : 0 });
+				const query = new URLSearchParams({ recursive: recursive ? "1" : "0" }).toString();
 				return this.get<git.ITree>(
 					`/repos/${this.getRepoPath()}/git/trees/${encodeURIComponent(sha)}?${query}`,
 				);
@@ -380,7 +413,7 @@ export class RestGitService {
 
 				const submoduleCommits = new Array<string>();
 				const quorumValuesSha = new Array<string>();
-				let quorumValues: string;
+				let quorumValues: string | undefined;
 
 				baseTree.tree.forEach((entry) => {
 					if (entry.path.includes("quorum")) {
@@ -467,7 +500,7 @@ export class RestGitService {
 	private async post<T>(
 		url: string,
 		requestBody: any,
-		query?: Record<string, unknown>,
+		query?: Record<string, string | number | boolean>,
 	): Promise<T> {
 		return this.restWrapper
 			.post<T>(url, requestBody, query, {
@@ -497,16 +530,37 @@ export class RestGitService {
 		if (this.cache) {
 			// Attempt to cache to Redis - log any errors but don't fail
 			runWithRetry(
-				async () => this.cache.set(key, value),
-				"RestGitService.setCache",
-				3,
-				1000,
-				winston,
+				async () => this.cache?.set(key, value) /* api */,
+				"RestGitService.setCache" /* callName */,
+				3 /* maxRetries */,
+				1000 /* retryAfterMs */,
+				this.lumberProperties /* telemetryProperties */,
 			).catch((error) => {
 				winston.error(`Error caching ${key} to redis`, error);
 				Lumberjack.error(`Error caching ${key} to redis`, this.lumberProperties, error);
 			});
 		}
+	}
+
+	private async getCache<T>(key: string): Promise<T | undefined> {
+		if (this.cache) {
+			// Attempt to cache to Redis - log any errors but don't fail
+			const cachedValue = await runWithRetry(
+				async () => this.cache?.get<T>(key) /* api */,
+				"RestGitService.getCache" /* callName */,
+				3 /* maxRetries */,
+				1000 /* retryAfterMs */,
+				this.lumberProperties /* telemetryProperties */,
+			).catch((error) => {
+				winston.error(`Error fetching ${key} from cache`, error);
+				Lumberjack.error(`Error fetching ${key} from cache`, this.lumberProperties, error);
+				return undefined;
+			});
+			if (cachedValue !== null) {
+				return cachedValue;
+			}
+		}
+		return undefined;
 	}
 
 	/**
@@ -540,13 +594,9 @@ export class RestGitService {
 	}
 
 	private async resolve<T>(key: string, fetch: () => Promise<T>, useCache: boolean): Promise<T> {
-		if (this.cache && useCache) {
+		if (useCache) {
 			// Attempt to grab the value from the cache. Log any errors but don't fail the request
-			const cachedValue: T | undefined = await this.cache.get<T>(key).catch((error) => {
-				winston.error(`Error fetching ${key} from cache`, error);
-				Lumberjack.error(`Error fetching ${key} from cache`, this.lumberProperties, error);
-				return undefined;
-			});
+			const cachedValue: T | undefined = await this.getCache<T>(key);
 
 			if (cachedValue) {
 				winston.info(`Resolving ${key} from cache`);
@@ -561,7 +611,11 @@ export class RestGitService {
 		return fetch();
 	}
 
-	private getSummaryCacheKey(type: IWholeSummaryPayloadType): string {
-		return `${this.tenantId}:${this.documentId}:summary:${type}`;
+	private getSummaryCacheKey(type: IWholeSummaryPayloadType, extraIdentifier?: string): string {
+		const key: string[] = [this.tenantId, this.documentId, "summary", type];
+		if (extraIdentifier) {
+			key.push(extraIdentifier);
+		}
+		return key.join(":");
 	}
 }

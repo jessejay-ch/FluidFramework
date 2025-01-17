@@ -4,25 +4,29 @@
  */
 
 import {
-	OdspDocumentServiceFactory,
-	createOdspCreateContainerRequest,
-	createOdspUrl,
-	OdspDriverUrlResolver,
-} from "@fluidframework/odsp-driver";
-import {
-	HostStoragePolicy,
-	ISnapshotOptions,
-	IOpsCachingPolicy,
-	ICollabSessionOptions,
-} from "@fluidframework/odsp-driver-definitions";
-import {
+	OptionsMatrix,
 	booleanCases,
 	generatePairwiseOptions,
-	OptionsMatrix,
 	numberCases,
-} from "@fluidframework/test-pairwise-generator";
-import { pkgVersion } from "./packageVersion";
+} from "@fluid-private/test-pairwise-generator";
+import {
+	OdspDocumentServiceFactory,
+	OdspDriverUrlResolver,
+	createOdspCreateContainerRequest,
+	createOdspUrl,
+} from "@fluidframework/odsp-driver/internal";
+import {
+	HostStoragePolicy,
+	ICollabSessionOptions,
+	IOpsCachingPolicy,
+	ISnapshotOptions,
+} from "@fluidframework/odsp-driver-definitions/internal";
 
+import { pkgVersion } from "./packageVersion.js";
+
+/**
+ * @internal
+ */
 export const OdspDriverApi = {
 	version: pkgVersion,
 	OdspDocumentServiceFactory,
@@ -31,6 +35,9 @@ export const OdspDriverApi = {
 	createOdspUrl, // REVIEW: does this need to be back compat?
 };
 
+/**
+ * @internal
+ */
 export type OdspDriverApiType = typeof OdspDriverApi;
 
 const odspSnapshotOptions: OptionsMatrix<ISnapshotOptions> = {
@@ -50,8 +57,12 @@ const odspOpsCaching: OptionsMatrix<IOpsCachingPolicy> = {
 const odspSessionOptions: OptionsMatrix<ICollabSessionOptions> = {
 	unauthenticatedUserDisplayName: [undefined],
 	forceAccessTokenViaAuthorizationHeader: [undefined],
+	displayName: [undefined],
 };
 
+/**
+ * @internal
+ */
 export const generateOdspHostStoragePolicy = (seed: number) => {
 	const odspHostPolicyMatrix: OptionsMatrix<HostStoragePolicy> = {
 		concurrentSnapshotFetch: booleanCases,

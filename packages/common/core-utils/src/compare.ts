@@ -6,7 +6,8 @@
 /**
  * Compare two arrays.  Returns true if their elements are equivalent and in the same order.
  *
- * @internal
+ * @legacy
+ * @alpha
  *
  * @param left - The first array to compare
  * @param right - The second array to compare
@@ -19,7 +20,7 @@ export const compareArrays = <T>(
 	comparator: (leftItem: T, rightItem: T, index: number) => boolean = (
 		leftItem: T,
 		rightItem: T,
-	) => Object.is(leftItem, rightItem),
+	): boolean => Object.is(leftItem, rightItem),
 ): boolean => {
 	// PERF: 'for-loop' and 'Array.every()' tied.
 	//       '===' and 'Object.is()' tied.

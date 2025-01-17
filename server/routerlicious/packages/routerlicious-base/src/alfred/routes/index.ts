@@ -3,6 +3,8 @@
  * Licensed under the MIT License.
  */
 
+import { TypedEventEmitter } from "@fluidframework/common-utils";
+import { ICollaborationSessionEvents } from "@fluidframework/server-lambdas";
 import {
 	IDeltaService,
 	IDocumentStorage,
@@ -10,12 +12,17 @@ import {
 	ITenantManager,
 	IThrottler,
 	ICache,
-	ICollection,
-	IDocument,
+	IDocumentRepository,
+	ITokenRevocationManager,
+	IRevokedTokenChecker,
+	IClusterDrainingChecker,
+	IFluidAccessTokenGenerator,
+	IReadinessCheck,
 } from "@fluidframework/server-services-core";
 import { Router } from "express";
 import { Provider } from "nconf";
 import { IAlfredTenant } from "@fluidframework/server-services-client";
+import { IDocumentDeleteService } from "../services";
 import * as api from "./api";
 
 export interface IRoutes {
@@ -26,27 +33,43 @@ export interface IRoutes {
 export function create(
 	config: Provider,
 	tenantManager: ITenantManager,
-	tenantThrottler: IThrottler,
+	tenantThrottlers: Map<string, IThrottler>,
 	clusterThrottlers: Map<string, IThrottler>,
 	singleUseTokenCache: ICache,
 	deltaService: IDeltaService,
 	storage: IDocumentStorage,
 	producer: IProducer,
 	appTenants: IAlfredTenant[],
-	documentsCollection: ICollection<IDocument>,
+	documentRepository: IDocumentRepository,
+	documentDeleteService: IDocumentDeleteService,
+	startupCheck: IReadinessCheck,
+	tokenRevocationManager?: ITokenRevocationManager,
+	revokedTokenChecker?: IRevokedTokenChecker,
+	collaborationSessionEventEmitter?: TypedEventEmitter<ICollaborationSessionEvents>,
+	clusterDrainingChecker?: IClusterDrainingChecker,
+	readinessCheck?: IReadinessCheck,
+	fluidAccessTokenGenerator?: IFluidAccessTokenGenerator,
 ) {
 	return {
 		api: api.create(
 			config,
 			tenantManager,
-			tenantThrottler,
+			tenantThrottlers,
 			clusterThrottlers,
 			singleUseTokenCache,
 			storage,
 			deltaService,
 			producer,
 			appTenants,
-			documentsCollection,
+			documentRepository,
+			documentDeleteService,
+			startupCheck,
+			tokenRevocationManager,
+			revokedTokenChecker,
+			collaborationSessionEventEmitter,
+			clusterDrainingChecker,
+			readinessCheck,
+			fluidAccessTokenGenerator,
 		),
 	};
 }

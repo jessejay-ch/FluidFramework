@@ -2,7 +2,6 @@
  * Copyright (c) Microsoft Corporation and contributors. All rights reserved.
  * Licensed under the MIT License.
  */
-import { MonoRepoKind, isMonoRepoKind } from "@fluidframework/build-tools";
 
 /**
  * A type that represents independent packages (as opposed to those that are part of a release group).
@@ -17,19 +16,27 @@ import { MonoRepoKind, isMonoRepoKind } from "@fluidframework/build-tools";
 export type ReleasePackage = string;
 
 /**
- * An enum that represents known release groups.
- *
- * @internal
+ * An array of known release groups.
  */
-export type ReleaseGroup = MonoRepoKind;
+export const knownReleaseGroups = [
+	"build-tools",
+	"client",
+	"server",
+	"gitrest",
+	"historian",
+] as const;
+
+/**
+ * A type that represents release groups.
+ */
+export type ReleaseGroup = (typeof knownReleaseGroups)[number];
 
 /**
  * A type guard used to determine if a string is a ReleaseGroup.
- *
- * @internal
  */
 export function isReleaseGroup(str: string | undefined): str is ReleaseGroup {
-	return isMonoRepoKind(str);
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+	return str === undefined ? false : knownReleaseGroups.includes(str as any);
 }
 
 /**

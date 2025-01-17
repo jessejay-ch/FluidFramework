@@ -9,26 +9,57 @@ export {
 	validateTokenClaims,
 	validateTokenClaimsExpiration,
 } from "./auth";
-export { convertSortedNumberArrayToRanges } from "./array";
-export { CorrelationIdHeaderName, DriverVersionHeaderName, LatestSummaryId } from "./constants";
+export {
+	convertSortedNumberArrayToRanges,
+	dedupeSortedArray,
+	mergeKArrays,
+	mergeSortedArrays,
+} from "./array";
+export {
+	CorrelationIdHeaderName,
+	DriverVersionHeaderName,
+	LatestSummaryId,
+	TelemetryContextHeaderName,
+} from "./constants";
 export {
 	createFluidServiceNetworkError,
 	INetworkErrorDetails,
+	InternalErrorCode,
 	isNetworkError,
 	NetworkError,
 	throwFluidServiceNetworkError,
 } from "./error";
 export { choose, getRandomName } from "./generateNames";
 export { GitManager } from "./gitManager";
-export { getAuthorizationTokenFromCredentials, Historian, ICredentials } from "./historian";
+export { Heap, IHeapComparator } from "./heap";
+export {
+	getAuthorizationTokenFromCredentials,
+	Historian,
+	ICredentials,
+	parseToken,
+} from "./historian";
 export { IAlfredTenant, ISession } from "./interfaces";
 export { promiseTimeout } from "./promiseTimeout";
 export { RestLessClient, RestLessFieldNames } from "./restLessClient";
 export { BasicRestWrapper, RestWrapper } from "./restWrapper";
 export { defaultHash, getNextHash } from "./rollingHash";
-export { canRead, canSummarize, canWrite, canRevokeToken } from "./scopes";
+export {
+	canRead,
+	canSummarize,
+	canWrite,
+	canRevokeToken,
+	canDeleteDoc,
+	TokenRevokeScopeType,
+	DocDeleteScopeType,
+} from "./scopes";
+export {
+	getQuorumTreeEntries,
+	mergeAppAndProtocolTree,
+	generateServiceProtocolEntries,
+} from "./scribeHelper";
 export {
 	ICreateRefParamsExternal,
+	IExternalWriterConfig,
 	IGetRefParamsExternal,
 	IGitCache,
 	IGitManager,
@@ -63,7 +94,13 @@ export {
 	buildTreePath,
 	convertSummaryTreeToWholeSummaryTree,
 	convertWholeFlatSummaryToSnapshotTreeAndBlobs,
+	convertFirstSummaryWholeSummaryTreeToSummaryTree,
 } from "./storageUtils";
 export { SummaryTreeUploadManager } from "./summaryTreeUploadManager";
-export { getOrCreateRepository } from "./utils";
+export {
+	ITimeoutContext,
+	getGlobalTimeoutContext,
+	setGlobalTimeoutContext,
+} from "./timeoutContext";
+export { getOrCreateRepository, getRandomInt } from "./utils";
 export { WholeSummaryUploadManager } from "./wholeSummaryUploadManager";

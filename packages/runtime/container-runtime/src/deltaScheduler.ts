@@ -3,12 +3,12 @@
  * Licensed under the MIT License.
  */
 
-import { ITelemetryLogger } from "@fluidframework/common-definitions";
-import { performance } from "@fluidframework/common-utils";
-import { IDeltaManager } from "@fluidframework/container-definitions";
-import { IDocumentMessage, ISequencedDocumentMessage } from "@fluidframework/protocol-definitions";
+import { performance, type TypedEventEmitter } from "@fluid-internal/client-utils";
+import { IDeltaManagerFull } from "@fluidframework/container-definitions/internal";
+import { ISequencedDocumentMessage } from "@fluidframework/driver-definitions/internal";
+import type { IContainerRuntimeBaseEvents } from "@fluidframework/runtime-definitions/internal";
+import { ITelemetryLoggerExt, formatTick } from "@fluidframework/telemetry-utils/internal";
 
-import { TelemetryLogger } from "@fluidframework/telemetry-utils";
 /**
  * DeltaScheduler is responsible for the scheduling of inbound delta queue in cases where there
  * is more than one op a particular run of the queue. It does not schedule if there is just one
@@ -23,7 +23,6 @@ import { TelemetryLogger } from "@fluidframework/telemetry-utils";
  * processed, the time and number of turns it took to process the ops.
  */
 export class DeltaScheduler {
-	private readonly deltaManager: IDeltaManager<ISequencedDocumentMessage, IDocumentMessage>;
 	// The time for processing ops in a single turn.
 	public static readonly processingTime = 50;
 
@@ -51,16 +50,22 @@ export class DeltaScheduler {
 		| undefined;
 
 	constructor(
-		deltaManager: IDeltaManager<ISequencedDocumentMessage, IDocumentMessage>,
-		private readonly logger: ITelemetryLogger,
+		private readonly deltaManager: IDeltaManagerFull,
+		private readonly runtimeEventsEmitter: TypedEventEmitter<IContainerRuntimeBaseEvents>,
+		private readonly logger: ITelemetryLoggerExt,
 	) {
-		this.deltaManager = deltaManager;
-		this.deltaManager.inbound.on("idle", () => {
-			this.inboundQueueIdle();
-		});
+		this.deltaManager.inbound.on("idle", this.inboundQueueIdle);
+		runtimeEventsEmitter.on("batchBegin", this.batchBegin);
+		runtimeEventsEmitter.on("batchEnd", this.batchEnd);
 	}
 
-	public batchBegin(message: ISequencedDocumentMessage) {
+	public dispose(): void {
+		this.deltaManager.inbound.off("idle", this.inboundQueueIdle);
+		this.runtimeEventsEmitter.off("batchBegin", this.batchBegin);
+		this.runtimeEventsEmitter.off("batchEnd", this.batchEnd);
+	}
+
+	private readonly batchBegin = (message: ISequencedDocumentMessage): void => {
 		if (!this.processingStartTime) {
 			this.processingStartTime = performance.now();
 		}
@@ -77,9 +82,9 @@ export class DeltaScheduler {
 				startTime: performance.now(),
 			};
 		}
-	}
+	};
 
-	public batchEnd(message: ISequencedDocumentMessage) {
+	private readonly batchEnd = (error: unknown, message: ISequencedDocumentMessage): void => {
 		if (this.schedulingLog) {
 			this.schedulingLog.numberOfBatchesProcessed++;
 			this.schedulingLog.lastSequenceNumber = message.sequenceNumber;
@@ -112,20 +117,16 @@ export class DeltaScheduler {
 					if (this.schedulingLog) {
 						this.logger.sendTelemetryEvent({
 							eventName: "InboundOpsPartialProcessingTime",
-							duration: TelemetryLogger.formatTick(elapsedTime),
+							duration: formatTick(elapsedTime),
 							opsProcessed:
 								this.schedulingLog.lastSequenceNumber -
 								this.schedulingLog.firstSequenceNumber +
 								1,
 							opsRemainingToProcess: this.deltaManager.inbound.length,
-							processingTime: TelemetryLogger.formatTick(
-								this.schedulingLog.totalProcessingTime,
-							),
+							processingTime: formatTick(this.schedulingLog.totalProcessingTime),
 							numberOfTurns: this.schedulingLog.numberOfTurns,
 							batchesProcessed: this.schedulingLog.numberOfBatchesProcessed,
-							timeToResume: TelemetryLogger.formatTick(
-								performance.now() - currentTime,
-							),
+							timeToResume: formatTick(performance.now() - currentTime),
 						});
 					}
 					this.deltaManager.inbound.resume();
@@ -134,9 +135,9 @@ export class DeltaScheduler {
 				this.processingStartTime = undefined;
 			}
 		}
-	}
+	};
 
-	private inboundQueueIdle() {
+	private readonly inboundQueueIdle = (): void => {
 		if (this.schedulingLog) {
 			// Add the time taken for processing the final ops to the total processing time in the
 			// telemetry log object.
@@ -148,13 +149,11 @@ export class DeltaScheduler {
 				eventName: "InboundOpsProcessingTime",
 				opsRemainingToProcess: this.schedulingLog.opsRemainingToProcess,
 				numberOfTurns: this.schedulingLog.numberOfTurns,
-				processingTime: TelemetryLogger.formatTick(this.schedulingLog.totalProcessingTime),
+				processingTime: formatTick(this.schedulingLog.totalProcessingTime),
 				opsProcessed:
-					this.schedulingLog.lastSequenceNumber -
-					this.schedulingLog.firstSequenceNumber +
-					1,
+					this.schedulingLog.lastSequenceNumber - this.schedulingLog.firstSequenceNumber + 1,
 				batchesProcessed: this.schedulingLog.numberOfBatchesProcessed,
-				duration: TelemetryLogger.formatTick(currentTime - this.schedulingLog.startTime),
+				duration: formatTick(currentTime - this.schedulingLog.startTime),
 				schedulingCount: this.schedulingCount,
 			});
 
@@ -168,7 +167,7 @@ export class DeltaScheduler {
 		// Reset the processing times.
 		this.processingStartTime = undefined;
 		this.currentAllowedProcessingTimeForTurn = DeltaScheduler.processingTime;
-	}
+	};
 
 	/**
 	 * This function tells whether we should run the scheduler.

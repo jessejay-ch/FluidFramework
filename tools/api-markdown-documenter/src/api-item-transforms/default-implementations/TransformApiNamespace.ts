@@ -2,19 +2,21 @@
  * Copyright (c) Microsoft Corporation and contributors. All rights reserved.
  * Licensed under the MIT License.
  */
-import { ApiItem, ApiNamespace } from "@microsoft/api-extractor-model";
 
-import { MarkdownDocumenterConfiguration } from "../../Configuration";
-import { SectionNode } from "../../documentation-domain";
-import { transformApiModuleLike } from "./TransformApiModuleLike";
+import type { ApiItem, ApiNamespace } from "@microsoft/api-extractor-model";
+
+import type { SectionNode } from "../../documentation-domain/index.js";
+import type { ApiItemTransformationConfiguration } from "../configuration/index.js";
+
+import { transformApiModuleLike } from "./TransformApiModuleLike.js";
 
 /**
- * Default policy for rendering doc sections for `Namespace` items.
+ * Default documentation transform for `Namespace` items.
  */
 export function transformApiNamespace(
 	apiNamespace: ApiNamespace,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 	generateChildContent: (apiItem: ApiItem) => SectionNode[],
 ): SectionNode[] {
-	return transformApiModuleLike(apiNamespace, apiNamespace.members, config, generateChildContent);
+	return transformApiModuleLike(apiNamespace, config, generateChildContent);
 }
