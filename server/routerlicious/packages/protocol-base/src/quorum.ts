@@ -3,21 +3,30 @@
  * Licensed under the MIT License.
  */
 
-import { EventEmitter } from "events";
+import events_pkg from "events_pkg";
+const { EventEmitter } = events_pkg;
 
-import { assert, TypedEventEmitter } from "@fluidframework/common-utils";
+import { TypedEventEmitter } from "@fluidframework/common-utils";
 import {
 	ICommittedProposal,
 	IQuorum,
 	IQuorumClients,
-	IQuorumClientsEvents,
-	IQuorumEvents,
 	IQuorumProposals,
-	IQuorumProposalsEvents,
 	ISequencedClient,
 	ISequencedDocumentMessage,
 	ISequencedProposal,
 } from "@fluidframework/protocol-definitions";
+
+/**
+ * Throws if condition is false.
+ * @privateRemarks
+ * TODO: Migrate this to a common assert pattern or library for server code.
+ */
+function assert(condition: boolean, message: string): asserts condition {
+	if (!condition) {
+		throw new Error(message);
+	}
+}
 
 /**
  * Structure for tracking proposals that have been sequenced but not approved yet.
@@ -33,11 +42,13 @@ class PendingProposal implements ISequencedProposal {
 
 /**
  * Snapshot format for a QuorumClients
+ * @alpha
  */
 export type QuorumClientsSnapshot = [string, ISequencedClient][];
 
 /**
  * Snapshot format for a QuorumProposals
+ * @alpha
  */
 // eslint-disable-next-line @typescript-eslint/consistent-type-definitions
 export type QuorumProposalsSnapshot = {
@@ -47,6 +58,7 @@ export type QuorumProposalsSnapshot = {
 
 /**
  * Snapshot format for a Quorum
+ * @alpha
  */
 export interface IQuorumSnapshot {
 	members: QuorumClientsSnapshot;
@@ -56,9 +68,10 @@ export interface IQuorumSnapshot {
 
 /**
  * The QuorumClients is used to track members joining and leaving the collaboration session.
+ * @internal
  */
 export class QuorumClients
-	extends TypedEventEmitter<IQuorumClientsEvents>
+	extends TypedEventEmitter<IQuorumClients["on"]>
 	implements IQuorumClients
 {
 	private readonly members: Map<string, ISequencedClient>;
@@ -94,8 +107,8 @@ export class QuorumClients
 	 * Adds a new client to the quorum
 	 */
 	public addMember(clientId: string, details: ISequencedClient) {
-		assert(!!clientId, 0x46f /* clientId has to be non-empty string */);
-		assert(!this.members.has(clientId), 0x1ce /* clientId not found */);
+		assert(!!clientId, "clientId has to be non-empty string");
+		assert(!this.members.has(clientId), "clientId not found");
 		this.members.set(clientId, details);
 		this.emit("addMember", clientId, details);
 
@@ -107,8 +120,8 @@ export class QuorumClients
 	 * Removes a client from the quorum
 	 */
 	public removeMember(clientId: string) {
-		assert(!!clientId, 0x470 /* clientId has to be non-empty string */);
-		assert(this.members.has(clientId), 0x1cf /* clientId not found */);
+		assert(!!clientId, "clientId has to be non-empty string");
+		assert(this.members.has(clientId), "clientId not found");
 		this.members.delete(clientId);
 		this.emit("removeMember", clientId);
 
@@ -138,9 +151,10 @@ export class QuorumClients
 /**
  * The QuorumProposals holds a key/value store.  Proposed values become finalized in the store once all connected
  * clients have seen the proposal.
+ * @internal
  */
 export class QuorumProposals
-	extends TypedEventEmitter<IQuorumProposalsEvents>
+	extends TypedEventEmitter<IQuorumProposals["on"]>
 	implements IQuorumProposals
 {
 	private readonly proposals: Map<number, PendingProposal>;
@@ -316,7 +330,7 @@ export class QuorumProposals
 		local: boolean,
 		clientSequenceNumber: number,
 	) {
-		assert(!this.proposals.has(sequenceNumber), 0x1d0 /* sequenceNumber not found */);
+		assert(!this.proposals.has(sequenceNumber), "sequenceNumber not found");
 
 		const proposal = new PendingProposal(sequenceNumber, key, value, local);
 		this.proposals.set(sequenceNumber, proposal);
@@ -368,6 +382,23 @@ export class QuorumProposals
 			// clear the values cache
 			this.valuesSnapshotCache = undefined;
 
+			// check if there are multiple proposals with matching keys
+			let proposalSettled = false;
+			let proposalKeySeen = false;
+			for (const [, p] of this.proposals) {
+				if (p.key === committedProposal.key) {
+					if (!proposalKeySeen) {
+						// set proposalSettled to true if the proposal key match is unique thus far
+						proposalSettled = true;
+					} else {
+						// set proposalSettled to false if matching proposal key is not unique
+						proposalSettled = false;
+						break;
+					}
+					proposalKeySeen = true;
+				}
+			}
+
 			this.emit(
 				"approveProposal",
 				committedProposal.sequenceNumber,
@@ -375,6 +406,17 @@ export class QuorumProposals
 				committedProposal.value,
 				committedProposal.approvalSequenceNumber,
 			);
+
+			// emit approveProposalComplete when all pending proposals are processed
+			if (proposalSettled) {
+				this.emit(
+					"approveProposalComplete",
+					committedProposal.sequenceNumber,
+					committedProposal.key,
+					committedProposal.value,
+					committedProposal.approvalSequenceNumber,
+				);
+			}
 
 			this.proposals.delete(proposal.sequenceNumber);
 
@@ -403,8 +445,9 @@ export class QuorumProposals
 /**
  * A quorum represents all clients currently within the collaboration window. As well as the values
  * they have agreed upon and any pending proposals.
+ * @internal
  */
-export class Quorum extends TypedEventEmitter<IQuorumEvents> implements IQuorum {
+export class Quorum extends TypedEventEmitter<IQuorum["on"]> implements IQuorum {
 	private readonly quorumClients: QuorumClients;
 	private readonly quorumProposals: QuorumProposals;
 	private isDisposed: boolean = false;

@@ -7,6 +7,9 @@
  * Declare the subset of Buffer functionality we want to make available instead of
  * exposing the entirely of Node's typings.  This should match the public interface
  * of the browser implementation, so any changes made in one should be made in both.
+ *
+ * @deprecated Moved to the `@fluidframework-internal/client-utils` package.
+ * @internal
  */
 export declare class Buffer extends Uint8Array {
 	toString(encoding?: string): string;
@@ -18,7 +21,17 @@ export declare class Buffer extends Uint8Array {
 	static from(value, encodingOrOffset?, length?): IsoBuffer;
 	static isBuffer(obj: any): obj is Buffer;
 }
+
+/**
+ * @deprecated Moved to the `@fluidframework-internal/client-utils` package.
+ * @internal
+ */
 export const IsoBuffer = Buffer;
+
+/**
+ * @deprecated Moved to the `@fluidframework-internal/client-utils` package.
+ * @internal
+ */
 export type IsoBuffer = Buffer;
 
 /**
@@ -28,15 +41,21 @@ export type IsoBuffer = Buffer;
  * @param encoding - Optional target encoding; only "utf8" and "base64" are
  * supported, with "utf8" being default.
  * @returns The converted string.
+ *
+ * @deprecated Moved to the `@fluidframework-internal/client-utils` package.
+ * @internal
  */
 export function Uint8ArrayToString(arr: Uint8Array, encoding?: string): string {
 	// Make this check because Buffer.from(arr) will always do a buffer copy
-	return Buffer.isBuffer(arr) ? arr.toString(encoding) : Buffer.from(arr).toString(encoding);
+	return (Buffer.isBuffer(arr) ? arr : Buffer.from(arr)).toString(encoding);
 }
 
 /**
  * Convert base64 or utf8 string to array buffer.
  * @param encoding - The input string's encoding.
+ *
+ * @deprecated Moved to the `@fluidframework-internal/client-utils` package.
+ * @internal
  */
 export function stringToBuffer(input: string, encoding: string): ArrayBufferLike {
 	const iso = IsoBuffer.from(input, encoding);
@@ -54,6 +73,9 @@ export function stringToBuffer(input: string, encoding: string): ArrayBufferLike
  * @param blob - The binary blob
  * @param encoding - Output string's encoding
  * @returns The blob in string format
+ *
+ * @deprecated Moved to the `@fluidframework-internal/client-utils` package.
+ * @internal
  */
 export const bufferToString = (blob: ArrayBufferLike, encoding: string): string =>
 	IsoBuffer.from(blob).toString(encoding);

@@ -14,8 +14,41 @@ class MongoNetworkTransientTransactionError extends BaseMongoExceptionRetryRule 
 
 	public match(error: any): boolean {
 		return (
-			error.errorLabels?.length &&
+			Array.isArray(error.errorLabels) &&
+			error.errorLabels.length > 0 &&
 			(error.errorLabels as string[]).includes("TransientTransactionError")
+		);
+	}
+}
+
+class MongoNetworkConnectionClosedError extends BaseMongoExceptionRetryRule {
+	protected defaultRetryDecision: boolean = true;
+
+	constructor(retryRuleOverride: Map<string, boolean>) {
+		super("MongoNetworkConnectionClosedError", retryRuleOverride);
+	}
+
+	public match(error: any): boolean {
+		return (
+			typeof error.message === "string" &&
+			/^connection .+ closed$/.test(error.message as string) === true // matches any message of format "connection <some-info> closed"
+		);
+	}
+}
+
+class MongoNetworkSocketDisconnectedError extends BaseMongoExceptionRetryRule {
+	private static readonly errorMessage =
+		"Client network socket disconnected before secure TLS connection was established";
+	protected defaultRetryDecision: boolean = true;
+
+	constructor(retryRuleOverride: Map<string, boolean>) {
+		super("MongoNetworkSocketDisconnectedError", retryRuleOverride);
+	}
+
+	public match(error: any): boolean {
+		return (
+			typeof error.message === "string" &&
+			error.message === MongoNetworkSocketDisconnectedError.errorMessage
 		);
 	}
 }
@@ -26,6 +59,8 @@ export function createMongoNetworkErrorRetryRuleset(
 ): IMongoExceptionRetryRule[] {
 	const mongoNetworkErrorRetryRuleset: IMongoExceptionRetryRule[] = [
 		new MongoNetworkTransientTransactionError(retryRuleOverride),
+		new MongoNetworkConnectionClosedError(retryRuleOverride),
+		new MongoNetworkSocketDisconnectedError(retryRuleOverride),
 	];
 
 	return mongoNetworkErrorRetryRuleset;

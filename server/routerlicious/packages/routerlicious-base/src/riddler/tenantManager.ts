@@ -3,30 +3,41 @@
  * Licensed under the MIT License.
  */
 
-import * as crypto from "crypto";
 import {
+	EncryptionKeyVersion,
+	IEncryptedTenantKeys,
+	IPlainTextAndEncryptedTenantKeys,
 	ITenantConfig,
 	ITenantCustomData,
 	ITenantKeys,
 	ITenantOrderer,
 	ITenantStorage,
+	ITenantPrivateKeys,
 	KeyName,
-	MongoManager,
 	ISecretManager,
 	ICache,
+	type IEncryptedPrivateTenantKeys,
+	type IFluidAccessToken,
 } from "@fluidframework/server-services-core";
 import { isNetworkError, NetworkError } from "@fluidframework/server-services-client";
+import { BaseTelemetryProperties, Lumberjack } from "@fluidframework/server-services-telemetry";
 import {
-	BaseTelemetryProperties,
-	LumberEventName,
-	Lumberjack,
-} from "@fluidframework/server-services-telemetry";
+	IApiCounters,
+	InMemoryApiCounters,
+	ITenantKeyGenerator,
+	isKeylessFluidAccessClaimEnabled,
+	generateToken,
+} from "@fluidframework/server-services-utils";
 import * as jwt from "jsonwebtoken";
 import * as _ from "lodash";
 import * as winston from "winston";
+import { ITenantRepository } from "./mongoTenantRepository";
+import type { IUser, ScopeType } from "@fluidframework/protocol-definitions";
+import { v4 as uuid } from "uuid";
 
 /**
  * Tenant details stored to the document database
+ * @internal
  */
 export interface ITenantDocument {
 	// Database ID for the tenant. Id is only marked optional because the database will provide it
@@ -34,10 +45,10 @@ export interface ITenantDocument {
 	_id: string;
 
 	// API key for the given tenant
-	key: string;
+	key?: string;
 
 	// second key for the given tenant
-	secondaryKey: string;
+	secondaryKey?: string;
 
 	// Storage provider details
 	storage: ITenantStorage;
@@ -54,20 +65,169 @@ export interface ITenantDocument {
 	// Timestamp of when this tenant will be hard deleted.
 	// Only applicable if the tenant is disabled.
 	scheduledDeletionTime?: string;
+
+	// Optional private keys, used for keyless tenants
+	privateKeys?: ITenantPrivateKeys;
 }
 
+enum FetchTenantKeyMetric {
+	RetrieveFromCacheSucess = "retrieveFromCacheSuccess",
+	NotFoundInCache = "notFoundInCache",
+	RetrieveFromCacheError = "retrieveFromCacheError",
+	SetKeyInCacheSuccess = "settingKeyInCacheSucceeded",
+	SetKeyInCacheFailure = "settingKeyInCacheFailed",
+}
+
+enum StorageRequestMetric {
+	// Cache requests
+	CacheRequestStarted = "cacheRequestStarted",
+	CacheRequestCompleted = "cacheRequestCompleted",
+	// Database requests
+	DatabaseRequestStarted = "databaseRequestStarted",
+	DatabaseRequestCompleted = "databaseRequestCompleted",
+	// errors
+	CacheError = "cacheError",
+	DatabaseError = "databaseError",
+}
+
+/**
+ * @internal
+ */
 export class TenantManager {
 	private readonly isCacheEnabled;
+	private readonly fetchTenantKeyApiCounter: IApiCounters = new InMemoryApiCounters(
+		Object.values(FetchTenantKeyMetric),
+	);
+	private readonly storageRequestApiCounter: IApiCounters = new InMemoryApiCounters(
+		Object.values(StorageRequestMetric),
+	);
 	constructor(
-		private readonly mongoManager: MongoManager,
-		private readonly collectionName: string,
+		private readonly tenantRepository: ITenantRepository,
 		private readonly baseOrdererUrl: string,
 		private readonly defaultHistorianUrl: string,
 		private readonly defaultInternalHistorianUrl: string,
 		private readonly secretManager: ISecretManager,
+		private readonly fetchTenantKeyMetricInterval: number,
+		private readonly riddlerStorageRequestMetricInterval: number,
+		private readonly tenantKeyGenerator: ITenantKeyGenerator,
 		private readonly cache?: ICache,
 	) {
 		this.isCacheEnabled = this.cache ? true : false;
+		if (fetchTenantKeyMetricInterval) {
+			setInterval(() => {
+				if (!this.fetchTenantKeyApiCounter.countersAreActive) {
+					return;
+				}
+				Lumberjack.info(
+					"Fetch tenant key api counters",
+					this.fetchTenantKeyApiCounter.getCounters(),
+				);
+				this.fetchTenantKeyApiCounter.resetAllCounters();
+			}, this.fetchTenantKeyMetricInterval);
+		}
+
+		if (riddlerStorageRequestMetricInterval) {
+			setInterval(() => {
+				if (!this.storageRequestApiCounter.countersAreActive) {
+					return;
+				}
+				Lumberjack.info(
+					"Riddler storage request api counters",
+					this.storageRequestApiCounter.getCounters(),
+				);
+				this.storageRequestApiCounter.resetAllCounters();
+			}, this.riddlerStorageRequestMetricInterval);
+		}
+	}
+
+	private isTenantPrivateKeyAccessEnabled(tenant: ITenantDocument): boolean {
+		return tenant.privateKeys ? true : false;
+	}
+
+	// Currently key and secondary are not optional, but this is to make sure we don't break anything if they are optional in the future
+	private isTenantSharedKeyAccessEnabled(tenant: ITenantDocument): boolean {
+		return tenant.key || tenant.secondaryKey ? true : false;
+	}
+
+	public async signToken(
+		tenantId: string,
+		documentId: string,
+		scopes: ScopeType[],
+		user?: IUser,
+		lifetime: number = 60 * 60,
+		ver: string = "1.0",
+		jti: string = uuid(),
+		includeDisabledTenant = false,
+	): Promise<IFluidAccessToken> {
+		const lumberProperties = {
+			[BaseTelemetryProperties.tenantId]: tenantId,
+			includeDisabledTenant,
+			documentId,
+			scopes,
+			lifetime,
+			ver,
+			jti,
+		};
+		const tenantDocument = await this.getTenantDocument(tenantId, includeDisabledTenant);
+		if (tenantDocument === undefined) {
+			Lumberjack.error(
+				`No tenant found when signing token for tenant id ${tenantId}`,
+				lumberProperties,
+			);
+			throw new NetworkError(404, "Tenant is disabled or does not exist.");
+		}
+
+		// If the tenant is a keyless tenant, always use the private keys to sign the token
+		const isTenantPrivateKeyAccessEnabled =
+			this.isTenantPrivateKeyAccessEnabled(tenantDocument);
+
+		const keys = this.decryptKeys(
+			tenantDocument,
+			lumberProperties,
+			isTenantPrivateKeyAccessEnabled,
+		);
+
+		// Added this check here again to ensure linting doesn't complain about tenantDocument.privateKeys being possibly undefined
+		const signingKey = tenantDocument.privateKeys
+			? (
+					await this.returnPrivateKeysInOrder(
+						tenantId,
+						{
+							// If isTenantPrivateKeyAccessEnabled is true, then privateKeys is not undefined
+							key: keys.key1,
+							keyNextRotationTime: tenantDocument.privateKeys.keyNextRotationTime,
+							secondaryKey: keys.key2,
+							secondaryKeyNextRotationTime:
+								tenantDocument.privateKeys.secondaryKeyNextRotationTime,
+						},
+						lumberProperties,
+					)
+			  ).key1
+			: keys.key1;
+
+		Lumberjack.info("Signing token with key1", {
+			...lumberProperties,
+			isTenantPrivateKeyAccessEnabled,
+		});
+		const token = generateToken(
+			tenantId,
+			documentId,
+			signingKey,
+			scopes,
+			user,
+			lifetime,
+			ver,
+			jti,
+			isTenantPrivateKeyAccessEnabled,
+		);
+		Lumberjack.info("Token signed with key1", {
+			...lumberProperties,
+			isTenantPrivateKeyAccessEnabled,
+		});
+
+		return {
+			fluidAccessToken: token,
+		};
 	}
 
 	/**
@@ -79,15 +239,22 @@ export class TenantManager {
 		includeDisabledTenant = false,
 		bypassCache = false,
 	): Promise<void> {
-		const tenantKeys = await this.getTenantKeys(tenantId, includeDisabledTenant);
+		const isKeylessAccessValidation = isKeylessFluidAccessClaimEnabled(token);
+		const tenantKeys = await this.getTenantKeys(
+			tenantId,
+			includeDisabledTenant,
+			false,
+			isKeylessAccessValidation,
+		);
 		const lumberProperties = {
 			[BaseTelemetryProperties.tenantId]: tenantId,
 			includeDisabledTenant,
+			isKeylessAccessValidation,
 		};
 
 		// Try validating with Key 1
 		try {
-			await this.validateTokenWithKey(tenantKeys.key1, KeyName.key1, token);
+			await this.validateTokenWithKey(tenantKeys.key1, KeyName.key1, token, lumberProperties);
 			return;
 		} catch (error) {
 			if (isNetworkError(error)) {
@@ -98,13 +265,15 @@ export class TenantManager {
 							`Error with tenant key 1 token verification while key 2 is not present. Deleting key from cache.`,
 							lumberProperties,
 						);
-						await this.deleteKeyFromCache(tenantId).catch((err) => {
-							Lumberjack.error(
-								`Error deleting keys from the cache.`,
-								lumberProperties,
-								err,
-							);
-						});
+						await this.deleteKeyFromCache(tenantId, isKeylessAccessValidation).catch(
+							(err) => {
+								Lumberjack.error(
+									`Error deleting keys from the cache.`,
+									lumberProperties,
+									err,
+								);
+							},
+						);
 					}
 					throw error;
 				}
@@ -117,7 +286,7 @@ export class TenantManager {
 		}
 		// If Key 1 validation fails, try with Key 2
 		try {
-			await this.validateTokenWithKey(tenantKeys.key2, KeyName.key2, token);
+			await this.validateTokenWithKey(tenantKeys.key2, KeyName.key2, token, lumberProperties);
 		} catch (error) {
 			if (isNetworkError(error)) {
 				if (error.code === 403) {
@@ -128,13 +297,15 @@ export class TenantManager {
 							`Error with key 2 token validation. Deleting key from cache.`,
 							lumberProperties,
 						);
-						await this.deleteKeyFromCache(tenantId).catch((err) => {
-							Lumberjack.error(
-								`Error deleting keys from the cache.`,
-								lumberProperties,
-								err,
-							);
-						});
+						await this.deleteKeyFromCache(tenantId, isKeylessAccessValidation).catch(
+							(err) => {
+								Lumberjack.error(
+									`Error deleting keys from the cache.`,
+									lumberProperties,
+									err,
+								);
+							},
+						);
 						// Assume we used a cached key, and try again by bypassing cache.
 						return this.validateToken(
 							tenantId,
@@ -156,6 +327,7 @@ export class TenantManager {
 		key: string,
 		keyName: string,
 		token: string,
+		lumberjackProperties: any = {},
 	): Promise<boolean> {
 		return new Promise<boolean>((resolve, reject) => {
 			jwt.verify(token, key, (error) => {
@@ -167,8 +339,16 @@ export class TenantManager {
 				// When `exp` claim exists in token claims, jsonwebtoken verifies token expiration.
 
 				if (error instanceof jwt.TokenExpiredError) {
+					Lumberjack.error(
+						`Token expired validated with ${keyName}.`,
+						lumberjackProperties,
+					);
 					reject(new NetworkError(401, `Token expired validated with ${keyName}.`));
 				} else {
+					Lumberjack.error(
+						`Invalid token validated with ${keyName}.`,
+						lumberjackProperties,
+					);
 					reject(new NetworkError(403, `Invalid token validated with ${keyName}.`));
 				}
 			});
@@ -196,13 +376,7 @@ export class TenantManager {
 			tenant.customData.externalStorageData.accessInfo = this.decryptAccessInfo(accessInfo);
 		}
 
-		return {
-			id: tenant._id,
-			orderer: tenant.orderer,
-			storage: tenant.storage,
-			customData: tenant.customData,
-			scheduledDeletionTime: tenant.scheduledDeletionTime,
-		};
+		return this.buildTenantConfig(tenant);
 	}
 
 	/**
@@ -211,20 +385,60 @@ export class TenantManager {
 	public async getAllTenants(includeDisabledTenant = false): Promise<ITenantConfig[]> {
 		const tenants = await this.getAllTenantDocuments(includeDisabledTenant);
 
-		return tenants.map((tenant) => ({
-			id: tenant._id,
-			orderer: tenant.orderer,
-			storage: tenant.storage,
-			customData: tenant.customData,
-			scheduledDeletionTime: tenant.scheduledDeletionTime,
-		}));
+		return tenants.map((tenant) => this.buildTenantConfig(tenant));
 	}
 
-	/**
-	 * Generates a random tenant key
-	 */
-	private generateTenantKey(): string {
-		return crypto.randomBytes(16).toString("hex");
+	private async createTenantKeys(
+		tenantId: string,
+		latestKeyVersion: EncryptionKeyVersion,
+		createPrivateKeys = false,
+	): Promise<IPlainTextAndEncryptedTenantKeys | ITenantPrivateKeys> {
+		const tenantKey = this.tenantKeyGenerator.generateTenantKey();
+		const encryptedTenantKey = this.secretManager.encryptSecret(tenantKey, latestKeyVersion);
+		if (encryptedTenantKey == null) {
+			winston.error("Private tenant key encryption failed.");
+			Lumberjack.error("Private tenant key encryption failed.", {
+				[BaseTelemetryProperties.tenantId]: tenantId,
+			});
+			throw new NetworkError(500, "Private tenant key encryption failed.");
+		}
+
+		const secondaryTenantKey = this.tenantKeyGenerator.generateTenantKey();
+		const encryptedSecondaryTenantKey = this.secretManager.encryptSecret(
+			secondaryTenantKey,
+			latestKeyVersion,
+		);
+		if (encryptedSecondaryTenantKey == null) {
+			winston.error("Private secondary tenant key encryption failed.");
+			Lumberjack.error("Private secondary tenant key encryption failed.", {
+				[BaseTelemetryProperties.tenantId]: tenantId,
+			});
+			throw new NetworkError(500, "Private secondary tenant key encryption failed.");
+		}
+
+		if (createPrivateKeys) {
+			// Current time in seconds
+			const now = Math.round(new Date().getTime() / 1000);
+			// Initial key rotation time is 12 hours from now, secondary key is 24 hours from now
+			const privateKeys: ITenantPrivateKeys = {
+				key: encryptedTenantKey,
+				keyNextRotationTime: now + (24 * 60 * 60) / 2, // 12 hours from now
+				secondaryKey: encryptedSecondaryTenantKey,
+				secondaryKeyNextRotationTime: now + 24 * 60 * 60, // 24 hours from now
+			};
+			// Set the key to use in the cache, this changes based on the rotation time
+			await this.cache?.set(`${this.getRedisKeyPrefix(tenantId, true)}:keyToUse`, "primary");
+			return privateKeys;
+		}
+
+		const tenantKeys: IPlainTextAndEncryptedTenantKeys = {
+			key1: tenantKey,
+			key2: secondaryTenantKey,
+			encryptedTenantKey1: encryptedTenantKey,
+			encryptedTenantKey2: encryptedSecondaryTenantKey,
+		};
+
+		return tenantKeys;
 	}
 
 	/**
@@ -235,66 +449,197 @@ export class TenantManager {
 		storage: ITenantStorage,
 		orderer: ITenantOrderer,
 		customData: ITenantCustomData,
-	): Promise<ITenantConfig & { key: string }> {
-		const db = await this.mongoManager.getDatabase();
-		const collection = db.collection<ITenantDocument>(this.collectionName);
-
-		const tenantKey1 = this.generateTenantKey();
-		const encryptedTenantKey1 = this.secretManager.encryptSecret(tenantKey1);
-		if (encryptedTenantKey1 == null) {
-			winston.error("Tenant key1 encryption failed.");
-			Lumberjack.error("Tenant key1 encryption failed.", {
-				[BaseTelemetryProperties.tenantId]: tenantId,
-			});
-			throw new NetworkError(500, "Tenant key1 encryption failed.");
+		enableSharedKeyAccess = true,
+		enablePrivateKeyAccess = false,
+	): Promise<ITenantConfig & { key: string | undefined }> {
+		const latestKeyVersion = this.secretManager.getLatestKeyVersion();
+		if (!enableSharedKeyAccess && !enablePrivateKeyAccess) {
+			Lumberjack.error(
+				"Cannot create a tenant with both shared and private key access disabled",
+				{
+					[BaseTelemetryProperties.tenantId]: tenantId,
+				},
+			);
+			throw new NetworkError(
+				400,
+				"Cannot create a tenant with both shared and private key access disabled",
+			);
 		}
 
-		const tenantKey2 = this.generateTenantKey();
-		const encryptedTenantKey2 = this.secretManager.encryptSecret(tenantKey2);
-		if (encryptedTenantKey2 == null) {
-			winston.error("Tenant key2 encryption failed.");
-			Lumberjack.error("Tenant key2 encryption failed.", {
-				[BaseTelemetryProperties.tenantId]: tenantId,
-			});
-			throw new NetworkError(500, "Tenant key2 encryption failed.");
+		let tenantKeys: IPlainTextAndEncryptedTenantKeys | undefined;
+		if (enableSharedKeyAccess) {
+			tenantKeys = (await this.createTenantKeys(
+				tenantId,
+				latestKeyVersion,
+			)) as IPlainTextAndEncryptedTenantKeys;
+		}
+		let privateKeys: ITenantPrivateKeys | undefined;
+		if (enablePrivateKeyAccess) {
+			privateKeys = (await this.createTenantKeys(
+				tenantId,
+				latestKeyVersion,
+				true /* createPrivateKeys */,
+			)) as ITenantPrivateKeys;
 		}
 
-		const id = await collection.insertOne({
-			_id: tenantId,
-			key: encryptedTenantKey1,
-			secondaryKey: encryptedTenantKey2,
-			orderer,
-			storage,
-			customData,
-			disabled: false,
-		});
+		// New tenant keys will be encrypted with incoming key version.
+		if (latestKeyVersion) {
+			customData.encryptionKeyVersion = latestKeyVersion;
+		}
+
+		const id = await this.runWithDatabaseRequestCounter(async () =>
+			this.tenantRepository.insertOne({
+				_id: tenantId,
+				key: tenantKeys?.encryptedTenantKey1,
+				secondaryKey: tenantKeys?.encryptedTenantKey2,
+				orderer,
+				storage,
+				customData,
+				disabled: false,
+				privateKeys,
+			}),
+		);
 
 		const tenant = await this.getTenant(id);
-		return _.extend(tenant, { key: tenantKey1, secondaryKey: tenantKey2 });
+		return _.extend(tenant, {
+			key: tenantKeys?.key1,
+			secondaryKey: tenantKeys?.key2,
+		});
 	}
 
 	/**
 	 * Updates the tenant configured storage provider
 	 */
 	public async updateStorage(tenantId: string, storage: ITenantStorage): Promise<ITenantStorage> {
-		const db = await this.mongoManager.getDatabase();
-		const collection = db.collection<ITenantDocument>(this.collectionName);
+		await this.runWithDatabaseRequestCounter(async () =>
+			this.tenantRepository.update({ _id: tenantId }, { storage }, null),
+		);
 
-		await collection.update({ _id: tenantId }, { storage }, null);
+		const tenantDocument = await this.getTenantDocument(tenantId);
 
-		return (await this.getTenantDocument(tenantId)).storage;
+		if (tenantDocument === undefined) {
+			Lumberjack.error("Could not find tenantId after updating storage.", {
+				[BaseTelemetryProperties.tenantId]: tenantId,
+			});
+			throw new NetworkError(404, `Could not find updated tenant: ${tenantId}`);
+		}
+
+		return tenantDocument.storage;
+	}
+
+	private buildTenantConfig(tenantDocument: ITenantDocument): ITenantConfig {
+		return {
+			id: tenantDocument._id,
+			orderer: tenantDocument.orderer,
+			storage: tenantDocument.storage,
+			customData: tenantDocument.customData,
+			scheduledDeletionTime: tenantDocument.scheduledDeletionTime,
+			enablePrivateKeyAccess: this.isTenantPrivateKeyAccessEnabled(tenantDocument),
+			enableSharedKeyAccess: this.isTenantSharedKeyAccessEnabled(tenantDocument),
+		};
+	}
+
+	public async updateKeyAccessPolicy(
+		tenantId: string,
+		enablePrivateKeyAccess: boolean,
+		enableSharedKeyAccess: boolean,
+	): Promise<ITenantConfig> {
+		if (!enableSharedKeyAccess && !enablePrivateKeyAccess) {
+			Lumberjack.error(
+				"Cannot update a tenant with both shared and private key access disabled",
+				{
+					[BaseTelemetryProperties.tenantId]: tenantId,
+				},
+			);
+			throw new NetworkError(
+				400,
+				"Cannot update a tenant with both shared and private key access disabled",
+			);
+		}
+		const latestKeyVersion = this.secretManager.getLatestKeyVersion();
+		const tenantDocument = await this.getTenantDocument(tenantId);
+		if (tenantDocument === undefined) {
+			Lumberjack.error("Could not find tenantId.", {
+				[BaseTelemetryProperties.tenantId]: tenantId,
+			});
+			throw new NetworkError(404, `Could not find tenant: ${tenantId}`);
+		}
+
+		let privateKeys: ITenantPrivateKeys | undefined;
+		let sharedKeys: IPlainTextAndEncryptedTenantKeys | undefined;
+		const updates: Partial<ITenantDocument> = {};
+		const isTenantPrivateKeyAccessEnabled =
+			this.isTenantPrivateKeyAccessEnabled(tenantDocument);
+		const isTenantSharedKeyAccessEnabled = this.isTenantSharedKeyAccessEnabled(tenantDocument);
+		if (enablePrivateKeyAccess) {
+			// If the tenant is being converted to a keyless tenant, generate new private keys, otherwise update them to be undefined
+			if (!isTenantPrivateKeyAccessEnabled) {
+				privateKeys = (await this.createTenantKeys(
+					tenantId,
+					latestKeyVersion,
+					true /* createPrivateKeys */,
+				)) as ITenantPrivateKeys;
+				updates.privateKeys = privateKeys;
+			}
+		} else {
+			if (isTenantPrivateKeyAccessEnabled) {
+				updates.privateKeys = undefined;
+				await this.deleteKeyFromCache(tenantId, true /* deletePrivateKeys */);
+			}
+		}
+
+		if (enableSharedKeyAccess) {
+			if (!isTenantSharedKeyAccessEnabled) {
+				sharedKeys = (await this.createTenantKeys(
+					tenantId,
+					latestKeyVersion,
+				)) as IPlainTextAndEncryptedTenantKeys;
+				updates.key = sharedKeys.encryptedTenantKey1;
+				updates.secondaryKey = sharedKeys.encryptedTenantKey2;
+			}
+		} else {
+			if (isTenantSharedKeyAccessEnabled) {
+				updates.key = undefined;
+				updates.secondaryKey = undefined;
+				await this.deleteKeyFromCache(tenantId, false /* deleteSharedKeys */);
+			}
+		}
+
+		// Only update the tenant in the DB if there are changes to be made
+		if (Object.keys(updates).length > 0) {
+			await this.runWithDatabaseRequestCounter(async () =>
+				this.tenantRepository.update({ _id: tenantId }, updates, null),
+			);
+		} else {
+			return this.buildTenantConfig(tenantDocument);
+		}
+
+		const updatedtenantDocument = await this.getTenantDocument(tenantId);
+		if (updatedtenantDocument === undefined) {
+			Lumberjack.error("Could not find tenantId after updating private key access policy.", {
+				[BaseTelemetryProperties.tenantId]: tenantId,
+			});
+			throw new NetworkError(404, `Could not find updated tenant: ${tenantId}`);
+		}
+		return this.buildTenantConfig(updatedtenantDocument);
 	}
 
 	/**
 	 * Updates the tenant configured orderer
 	 */
 	public async updateOrderer(tenantId: string, orderer: ITenantOrderer): Promise<ITenantOrderer> {
-		const db = await this.mongoManager.getDatabase();
-		const collection = db.collection<ITenantDocument>(this.collectionName);
+		await this.tenantRepository.update({ _id: tenantId }, { orderer }, null);
 
-		await collection.update({ _id: tenantId }, { orderer }, null);
+		const tenantDocument = await this.getTenantDocument(tenantId);
 
-		return (await this.getTenantDocument(tenantId)).orderer;
+		if (tenantDocument === undefined) {
+			Lumberjack.error("Could not find tenantId after updating orderer.", {
+				[BaseTelemetryProperties.tenantId]: tenantId,
+			});
+			throw new NetworkError(404, `Could not find updated tenant: ${tenantId}`);
+		}
+
+		return tenantDocument.orderer;
 	}
 
 	/**
@@ -304,15 +649,21 @@ export class TenantManager {
 		tenantId: string,
 		customData: ITenantCustomData,
 	): Promise<ITenantCustomData> {
-		const db = await this.mongoManager.getDatabase();
-		const collection = db.collection<ITenantDocument>(this.collectionName);
 		const accessInfo = customData.externalStorageData?.accessInfo;
 		if (accessInfo) {
 			customData.externalStorageData.accessInfo = this.encryptAccessInfo(accessInfo);
 		}
-		await collection.update({ _id: tenantId }, { customData }, null);
+		await this.runWithDatabaseRequestCounter(async () =>
+			this.tenantRepository.update({ _id: tenantId }, { customData }, null),
+		);
 		const tenantDocument = await this.getTenantDocument(tenantId, true);
-		if (tenantDocument.disabled) {
+		if (tenantDocument === undefined) {
+			Lumberjack.error("Could not find tenantId after updating custom data.", {
+				[BaseTelemetryProperties.tenantId]: tenantId,
+			});
+			throw new NetworkError(404, `Could not find updated tenant: ${tenantId}`);
+		}
+		if (tenantDocument.disabled === true) {
 			Lumberjack.info("Updated custom data of a disabled tenant", {
 				[BaseTelemetryProperties.tenantId]: tenantId,
 			});
@@ -320,33 +671,176 @@ export class TenantManager {
 		return tenantDocument.customData;
 	}
 
-	/**
-	 * Retrieves the secret for the given tenant
-	 */
-	public async getTenantKeys(
+	// This method returns the private keys in the order they should be used to validate/sign tokens
+	private async returnPrivateKeysInOrder(
+		tenantId: string,
+		privateKeys: ITenantPrivateKeys,
+		lumberProperties: any,
+	): Promise<ITenantKeys> {
+		const currKeyInUse = await this.cache?.get(
+			`${this.getRedisKeyPrefix(tenantId, true)}:keyToUse`,
+		);
+		// If the key to use is not found in the cache, return the keys in the order they are stored in the database
+		if (!currKeyInUse) {
+			Lumberjack.error("Could not find the current key to use in cache", lumberProperties);
+			await this.cache?.set(`${this.getRedisKeyPrefix(tenantId, true)}:keyToUse`, "primary");
+			return {
+				key1: privateKeys.key,
+				key2: privateKeys.secondaryKey,
+			};
+		}
+		const now = Math.round(new Date().getTime() / 1000);
+
+		// Determine which key to use as "key1" based on rotation time
+		// If the key being used as key1 is the primary key and it is due to be rotated in the next hour, use the secondary key as key1
+		if (
+			currKeyInUse === "primary" &&
+			Math.abs(now - privateKeys.keyNextRotationTime) <= 60 * 60
+		) {
+			Lumberjack.info(
+				`Primary private key is due to be rotated in the next hour for tenant id ${tenantId}, using the secondary key as key1`,
+				lumberProperties,
+			);
+			await this.cache?.set(
+				`${this.getRedisKeyPrefix(tenantId, true)}:keyToUse`,
+				"secondary",
+			);
+			return {
+				key1: privateKeys.secondaryKey,
+				key2: privateKeys.key,
+			};
+		}
+
+		// If the key being used as key1 is the secondary key and it is due to be rotated in the next hour, use the primary key as key1
+		if (
+			currKeyInUse === "secondary" &&
+			Math.abs(now - privateKeys.secondaryKeyNextRotationTime) <= 60 * 60
+		) {
+			Lumberjack.info(
+				`Secondary private key is due to be rotated in the next hour for tenant id ${tenantId}, using the primary key as key1`,
+				lumberProperties,
+			);
+			await this.cache?.set(`${this.getRedisKeyPrefix(tenantId, true)}:keyToUse`, "primary");
+			return {
+				key1: privateKeys.key,
+				key2: privateKeys.secondaryKey,
+			};
+		}
+
+		// If none of the keys are due to be rotated in the next hour, use the key that is currently being used as key1
+		Lumberjack.info(`Using the ${currKeyInUse} key to use as key1`, lumberProperties);
+		const keys: ITenantKeys = {
+			key1: currKeyInUse === "primary" ? privateKeys.key : privateKeys.secondaryKey,
+			key2: currKeyInUse === "primary" ? privateKeys.secondaryKey : privateKeys.key,
+		};
+		return keys;
+	}
+
+	private decryptKeys(
+		tenantDocument: ITenantDocument,
+		lumberProperties: Record<string, any>,
+		usePrivateKeys = false,
+	): IPlainTextAndEncryptedTenantKeys & {
+		encryptionKeyVersion: EncryptionKeyVersion | undefined;
+	} {
+		const encryptedTenantKey1 =
+			usePrivateKeys && tenantDocument.privateKeys
+				? tenantDocument.privateKeys.key
+				: (tenantDocument.key as string);
+
+		const encryptionKeyVersion = tenantDocument.customData?.encryptionKeyVersion;
+		const tenantKey1 = this.secretManager.decryptSecret(
+			encryptedTenantKey1,
+			encryptionKeyVersion,
+		);
+
+		if (tenantKey1 == null) {
+			winston.error("Tenant key1 decryption failed.");
+			Lumberjack.error("Tenant key1 decryption failed.", lumberProperties);
+			throw new NetworkError(500, "Tenant key1 decryption failed.");
+		}
+
+		const encryptedTenantKey2 =
+			usePrivateKeys && tenantDocument.privateKeys
+				? tenantDocument.privateKeys.secondaryKey
+				: tenantDocument.secondaryKey ?? "";
+
+		const tenantKey2 = encryptedTenantKey2
+			? this.secretManager.decryptSecret(encryptedTenantKey2, encryptionKeyVersion)
+			: "";
+
+		// Tenant key 2 decryption returns null
+		if (tenantKey2 == null) {
+			winston.error("Tenant key2 decryption failed");
+			Lumberjack.error("Tenant key2 decryption failed.", lumberProperties);
+			throw new NetworkError(500, "Tenant key2 decryption failed.");
+		}
+
+		// If it looks like there is key2, but decrypted key == ""
+		if (!encryptedTenantKey2 || tenantKey2 === "") {
+			winston.info("Tenant key2 doesn't exist.");
+			Lumberjack.info("Tenant key2 doesn't exist.", lumberProperties);
+		}
+
+		return {
+			key1: tenantKey1,
+			key2: tenantKey2,
+			encryptedTenantKey1,
+			encryptedTenantKey2,
+			encryptionKeyVersion,
+		};
+	}
+
+	private async getTenantKeysHelper(
 		tenantId: string,
 		includeDisabledTenant = false,
 		bypassCache = false,
+		usePrivateKeys = false,
 	): Promise<ITenantKeys> {
 		const lumberProperties = {
 			[BaseTelemetryProperties.tenantId]: tenantId,
 			includeDisabledTenant,
 			bypassCache,
+			usePrivateKeys,
 		};
-		const fetchTenantKeyMetric = Lumberjack.newLumberMetric(
-			LumberEventName.RiddlerFetchTenantKey,
-		);
-		let uncaughtException;
-		let retrievedFromCache = false;
-
 		try {
 			if (!bypassCache && this.isCacheEnabled) {
 				// Read from cache first
-				const cachedKey = await this.getKeyFromCache(tenantId);
-
-				if (cachedKey) {
-					retrievedFromCache = true;
-					return this.decryptCachedKeys(cachedKey);
+				try {
+					const cachedKey = await this.getKeyFromCache(tenantId, usePrivateKeys);
+					if (cachedKey) {
+						let tenantKeys = this.decryptCachedKeys(cachedKey, usePrivateKeys);
+						// This is an edge case where the used encryption key is not valid.
+						// If both decrypted tenant keys are null, it means it hits this case,
+						// then we should read from database and set new values in cache.
+						if (usePrivateKeys) {
+							tenantKeys = tenantKeys as ITenantPrivateKeys;
+							if (tenantKeys.key || tenantKeys.secondaryKey) {
+								const privateKeysInOrder = await this.returnPrivateKeysInOrder(
+									tenantId,
+									tenantKeys,
+									lumberProperties,
+								);
+								return privateKeysInOrder;
+							}
+						} else {
+							tenantKeys = tenantKeys as ITenantKeys;
+							if (tenantKeys.key1 || tenantKeys.key2) {
+								return tenantKeys;
+							}
+						}
+						Lumberjack.info(
+							"Retrieved from cache but both decrypted tenant keys are null.",
+							lumberProperties,
+						);
+					}
+				} catch (error) {
+					// Catch if there is an error reading from redis so we can continue to use the database
+					Lumberjack.error(
+						`Error getting tenant keys from cache. Falling back to database.`,
+						{ [BaseTelemetryProperties.tenantId]: tenantId },
+						error,
+					);
 				}
 			}
 
@@ -361,77 +855,132 @@ export class TenantManager {
 				throw new NetworkError(403, `Tenant, ${tenantId}, does not exist.`);
 			}
 
-			const encryptedTenantKey1 = tenantDocument.key;
-			const tenantKey1 = this.secretManager.decryptSecret(encryptedTenantKey1);
-
-			if (tenantKey1 == null) {
-				winston.error("Tenant key1 decryption failed.");
-				Lumberjack.error("Tenant key1 decryption failed.", lumberProperties);
-				throw new NetworkError(500, "Tenant key1 decryption failed.");
+			// If shared keys are disabled, return empty values for key1 and key2
+			if (!this.isTenantSharedKeyAccessEnabled(tenantDocument) && !usePrivateKeys) {
+				Lumberjack.error(
+					`Shared keys are disabled for tenant id ${tenantId}, returning empty values for key1 and key2`,
+					{
+						[BaseTelemetryProperties.tenantId]: tenantId,
+					},
+				);
+				return {
+					key1: "",
+					key2: "",
+				};
 			}
 
-			const encryptedTenantKey2 = tenantDocument.secondaryKey;
-			const tenantKey2 = encryptedTenantKey2
-				? this.secretManager.decryptSecret(encryptedTenantKey2)
-				: "";
-
-			// Tenant key 2 decryption returns null
-			if (tenantKey2 == null) {
-				winston.error("Tenant key2 decryption failed");
-				Lumberjack.error("Tenant key2 decryption failed.", lumberProperties);
-				throw new NetworkError(500, "Tenant key2 decryption failed.");
+			if (usePrivateKeys && !tenantDocument.privateKeys) {
+				Lumberjack.error(`Private keys are missing for tenant id ${tenantId}`, {
+					[BaseTelemetryProperties.tenantId]: tenantId,
+				});
+				throw new NetworkError(404, `Private keys are missing for tenant id ${tenantId}`);
 			}
 
-			// If it looks like there is key2, but decrypted key == ""
-			if (!encryptedTenantKey2 || tenantKey2 === "") {
-				winston.info("Tenant key2 doesn't exist.");
-				Lumberjack.info("Tenant key2 doesn't exist.", lumberProperties);
-			}
+			const {
+				key1: tenantKey1,
+				key2: tenantKey2,
+				encryptedTenantKey1,
+				encryptedTenantKey2,
+				encryptionKeyVersion,
+			} = this.decryptKeys(tenantDocument, lumberProperties, usePrivateKeys);
 
 			if (!bypassCache && this.isCacheEnabled) {
-				const cacheKeys = {
-					key1: encryptedTenantKey1,
-					key2: encryptedTenantKey2,
-				};
-				const setKeyInCacheSucceeded = await this.setKeyInCache(tenantId, cacheKeys);
-				fetchTenantKeyMetric.setProperty(
-					"settingKeyInCacheSucceeded",
-					setKeyInCacheSucceeded,
-				);
+				const cacheKeys: IEncryptedTenantKeys | IEncryptedPrivateTenantKeys =
+					usePrivateKeys && tenantDocument.privateKeys
+						? {
+								key: encryptedTenantKey1,
+								keyNextRotationTime: tenantDocument.privateKeys.keyNextRotationTime,
+								secondaryKey: encryptedTenantKey2,
+								secondaryKeyNextRotationTime:
+									tenantDocument.privateKeys.secondaryKeyNextRotationTime,
+						  }
+						: {
+								key1: encryptedTenantKey1,
+								key2: encryptedTenantKey2,
+						  };
+				if (encryptionKeyVersion) {
+					cacheKeys.encryptionKeyVersion = encryptionKeyVersion;
+				}
+				await this.setKeyInCache(tenantId, cacheKeys, usePrivateKeys);
 			}
 
+			if (usePrivateKeys && tenantDocument.privateKeys) {
+				// Return the decrypted private keys in the order they should be used to validate/sign tokens
+				const privateTenantKeys: ITenantPrivateKeys = {
+					key: tenantKey1,
+					keyNextRotationTime: tenantDocument.privateKeys.keyNextRotationTime,
+					secondaryKey: tenantKey2,
+					secondaryKeyNextRotationTime:
+						tenantDocument.privateKeys.secondaryKeyNextRotationTime,
+				};
+				const privateKeysInOrder = await this.returnPrivateKeysInOrder(
+					tenantId,
+					privateTenantKeys,
+					lumberProperties,
+				);
+				return privateKeysInOrder;
+			}
 			return {
 				key1: tenantKey1,
 				key2: tenantKey2,
 			};
 		} catch (error) {
-			uncaughtException = error;
+			Lumberjack.error(`Error getting tenant keys.`, lumberProperties, error);
 			throw error;
-		} finally {
-			fetchTenantKeyMetric.setProperty("retrievedFromCache", retrievedFromCache);
-			if (!uncaughtException) {
-				fetchTenantKeyMetric.success(`Successfully retrieved tenant keys.`);
-			} else {
-				fetchTenantKeyMetric.error(
-					`Error trying to retrieve tenant keys.`,
-					uncaughtException,
-				);
-			}
 		}
+	}
+
+	/**
+	 * Retrieves the secret for the given tenant
+	 */
+	public async getTenantKeys(
+		tenantId: string,
+		includeDisabledTenant = false,
+		bypassCache = false,
+		usePrivateKeys = false,
+	): Promise<ITenantKeys> {
+		const keys = await this.getTenantKeysHelper(
+			tenantId,
+			includeDisabledTenant,
+			bypassCache,
+			usePrivateKeys,
+		);
+		return keys;
 	}
 
 	/**
 	 * Generates a new key for a tenant
 	 */
-	public async refreshTenantKey(tenantId: string, keyName: string): Promise<ITenantKeys> {
+	public async refreshTenantKey(
+		tenantId: string,
+		keyName: string,
+		refreshPrivateKey = false,
+	): Promise<ITenantKeys> {
 		if (keyName !== KeyName.key1 && keyName !== KeyName.key2) {
 			throw new NetworkError(400, "Key name must be either key1 or key2.");
 		}
 
 		const tenantDocument = await this.getTenantDocument(tenantId, false);
+		if (tenantDocument === undefined) {
+			Lumberjack.error(`Could not find tenantId when refreshing tenant key.`, {
+				[BaseTelemetryProperties.tenantId]: tenantId,
+			});
+			throw new NetworkError(404, `Could not find tenantId: ${tenantId}`);
+		}
 
-		const newTenantKey = this.generateTenantKey();
-		const encryptedNewTenantKey = this.secretManager.encryptSecret(newTenantKey);
+		if (!this.isTenantSharedKeyAccessEnabled(tenantDocument) && !refreshPrivateKey) {
+			Lumberjack.error(`Shared keys are disabled for tenant id ${tenantId}`, {
+				[BaseTelemetryProperties.tenantId]: tenantId,
+			});
+			throw new NetworkError(403, `Shared keys are disabled for tenant id ${tenantId}`);
+		}
+
+		const newTenantKey = this.tenantKeyGenerator.generateTenantKey();
+		const encryptionKeyVersion = tenantDocument.customData?.encryptionKeyVersion;
+		const encryptedNewTenantKey = this.secretManager.encryptSecret(
+			newTenantKey,
+			encryptionKeyVersion,
+		);
 		if (encryptedNewTenantKey == null) {
 			winston.error("Tenant key encryption failed.");
 			Lumberjack.error("Tenant key encryption failed.", {
@@ -445,24 +994,69 @@ export class TenantManager {
 			Lumberjack.info(`Deleting old key from cache`, {
 				[BaseTelemetryProperties.tenantId]: tenantId,
 			});
-			await this.deleteKeyFromCache(tenantId);
+			await this.deleteKeyFromCache(tenantId, refreshPrivateKey);
+		}
+
+		if (refreshPrivateKey) {
+			const newKeyNextRotationTime = Math.round(new Date().getTime() / 1000) + 24 * 60 * 60;
+			const existingPrivateKeys = tenantDocument.privateKeys;
+			if (!existingPrivateKeys) {
+				Lumberjack.error(`Private keys are missing for tenant id ${tenantId}`, {
+					[BaseTelemetryProperties.tenantId]: tenantId,
+				});
+				throw new NetworkError(404, `Private keys are missing for tenant id ${tenantId}`);
+			}
+			const privateKeys: ITenantPrivateKeys =
+				keyName === KeyName.key2
+					? {
+							key: existingPrivateKeys.key,
+							keyNextRotationTime: existingPrivateKeys.keyNextRotationTime,
+							secondaryKey: encryptedNewTenantKey,
+							secondaryKeyNextRotationTime: newKeyNextRotationTime,
+					  }
+					: {
+							key: encryptedNewTenantKey,
+							keyNextRotationTime: newKeyNextRotationTime,
+							secondaryKey: existingPrivateKeys.secondaryKey,
+							secondaryKeyNextRotationTime:
+								existingPrivateKeys.secondaryKeyNextRotationTime,
+					  };
+			await this.runWithDatabaseRequestCounter(async () =>
+				this.tenantRepository.update({ _id: tenantId }, { privateKeys }, null),
+			);
+			const cacheKeys: IEncryptedPrivateTenantKeys = {
+				key: privateKeys.key,
+				keyNextRotationTime: privateKeys.keyNextRotationTime,
+				secondaryKey: privateKeys.secondaryKey,
+				secondaryKeyNextRotationTime: privateKeys.secondaryKeyNextRotationTime,
+			};
+			if (encryptionKeyVersion) {
+				cacheKeys.encryptionKeyVersion = encryptionKeyVersion;
+			}
+			await this.setKeyInCache(tenantId, cacheKeys, true /* setPrivateKeys */);
+			// Do not return private keys, instead just update the DB and return empty keys
+			return {
+				key1: "",
+				key2: "",
+			};
 		}
 
 		const tenantKeys = await this.getUpdatedTenantKeys(
-			tenantDocument.key,
-			tenantDocument.secondaryKey,
+			tenantDocument.key as string,
+			tenantDocument.secondaryKey as string,
 			keyName,
 			newTenantKey,
 			tenantId,
+			encryptionKeyVersion,
 		);
 
 		const updateKey =
 			keyName === KeyName.key2
 				? { secondaryKey: encryptedNewTenantKey }
 				: { key: encryptedNewTenantKey };
-		const db = await this.mongoManager.getDatabase();
-		const collection = db.collection<ITenantDocument>(this.collectionName);
-		await collection.update({ _id: tenantId }, updateKey, null);
+		await this.runWithDatabaseRequestCounter(async () =>
+			this.tenantRepository.update({ _id: tenantId }, updateKey, null),
+		);
 
 		return tenantKeys;
 	}
@@ -476,11 +1070,15 @@ export class TenantManager {
 		keyName: string,
 		newTenantKey: string,
 		tenantId: string,
+		encryptionKeyVersion?: EncryptionKeyVersion,
 	): Promise<ITenantKeys> {
 		const lumberProperties = { [BaseTelemetryProperties.tenantId]: tenantId };
 		// if key2 is to be refreshed
 		if (keyName === KeyName.key2) {
-			const decryptedTenantKey1 = this.secretManager.decryptSecret(key1);
+			const decryptedTenantKey1 = this.secretManager.decryptSecret(
+				key1,
+				encryptionKeyVersion,
+			);
 			if (decryptedTenantKey1 == null) {
 				winston.error("Tenant key1 decryption failed.");
 				Lumberjack.error("Tenant key1 decryption failed.", lumberProperties);
@@ -489,10 +1087,13 @@ export class TenantManager {
 
 			// Only create and set keys in cache if it is enabled
 			if (this.isCacheEnabled) {
-				const cacheKeys = {
+				const cacheKeys: IEncryptedTenantKeys = {
 					key1,
-					key2: this.secretManager.encryptSecret(newTenantKey),
+					key2: this.secretManager.encryptSecret(newTenantKey, encryptionKeyVersion),
 				};
+				if (encryptionKeyVersion) {
+					cacheKeys.encryptionKeyVersion = encryptionKeyVersion;
+				}
 				await this.setKeyInCache(tenantId, cacheKeys);
 			}
 
@@ -512,10 +1113,13 @@ export class TenantManager {
 
 			// Only create and set keys in cache if it is enabled
 			if (this.isCacheEnabled) {
-				const cacheKey1 = {
+				const cacheKey1: IEncryptedTenantKeys = {
 					key1: this.secretManager.encryptSecret(newTenantKey),
 					key2: "",
 				};
+				if (encryptionKeyVersion) {
+					cacheKey1.encryptionKeyVersion = encryptionKeyVersion;
+				}
 				await this.setKeyInCache(tenantId, cacheKey1);
 				Lumberjack.info(`Added new key to cache.`, lumberProperties);
 			}
@@ -527,7 +1131,7 @@ export class TenantManager {
 		}
 
 		// if key2 exists, refresh key1 and return
-		const decryptedTenantKey2 = this.secretManager.decryptSecret(key2);
+		const decryptedTenantKey2 = this.secretManager.decryptSecret(key2, encryptionKeyVersion);
 		if (decryptedTenantKey2 == null) {
 			winston.error("Tenant key2 decryption failed.");
 			Lumberjack.error("Tenant key2 decryption failed.", {
@@ -575,13 +1179,12 @@ export class TenantManager {
 	private async getTenantDocument(
 		tenantId: string,
 		includeDisabledTenant = false,
-	): Promise<ITenantDocument> {
-		const db = await this.mongoManager.getDatabase();
-		const collection = db.collection<ITenantDocument>(this.collectionName);
-
-		const found = await collection.findOne({ _id: tenantId });
+	): Promise<ITenantDocument | undefined> {
+		const found = await this.runWithDatabaseRequestCounter(async () =>
+			this.tenantRepository.findOne({ _id: tenantId }),
+		);
 		if (!found || (found.disabled && !includeDisabledTenant)) {
-			return null;
+			return undefined;
 		}
 
 		this.attachDefaultsToTenantDocument(found);
@@ -593,10 +1196,32 @@ export class TenantManager {
 	 * Retrieves all the raw database tenant documents
 	 */
 	private async getAllTenantDocuments(includeDisabledTenant = false): Promise<ITenantDocument[]> {
-		const db = await this.mongoManager.getDatabase();
-		const collection = db.collection<ITenantDocument>(this.collectionName);
-
-		const allFound = await collection.findAll();
+		const allFound: ITenantDocument[] = [];
+		let batchOffsetId = "";
+		const batchFetchSize = 2000;
+		try {
+			// eslint-disable-next-line no-constant-condition
+			while (true) {
+				// Avoid using findAll(), it will read all records from database and load in client side memory,
+				// which will be a concern for timing, networkIO, and client memory in the future
+				// Also we have a limit of 2000 records when using find() implicitly, we should use this mechanism to
+				// work around it to get the full results.
+				const tenantDocumentBatch = await this.getTenantDocumentsByBatch(
+					batchOffsetId,
+					batchFetchSize,
+				);
+				allFound.push(...tenantDocumentBatch);
+				const batchSize = tenantDocumentBatch.length;
+				if (batchSize < batchFetchSize) {
+					// last batch, no need further.
+					break;
+				}
+				batchOffsetId = tenantDocumentBatch[batchSize - 1]._id;
+			}
+		} catch (err) {
+			Lumberjack.error(`Database failed to find all tenants.`, undefined, err);
+			return Promise.reject(new Error("Failed to retrieve all tenants from Database."));
+		}
 
 		allFound.forEach((found) => {
 			this.attachDefaultsToTenantDocument(found);
@@ -606,33 +1231,52 @@ export class TenantManager {
 	}
 
 	/**
+	 * Retrieves raw database tenant documents by batch
+	 */
+	private async getTenantDocumentsByBatch(
+		batchOffsetId: string,
+		batchSize: number,
+	): Promise<ITenantDocument[]> {
+		const query = {
+			_id: { $gt: batchOffsetId },
+		};
+		const sort = { _id: 1 };
+		return this.tenantRepository.find(query, sort, batchSize);
+	}
+
+	/**
 	 * Deletes a tenant
 	 * @param tenantId - Id of the tenant to delete.
 	 * @param scheduledDeletionTime - If present, indicates when to hard-delete the tenant.
 	 * If no scheduledDeletionTime is provided the tenant is only soft-deleted.
 	 */
 	public async deleteTenant(tenantId: string, scheduledDeletionTime?: Date): Promise<void> {
-		const db = await this.mongoManager.getDatabase();
-		const collection = db.collection<ITenantDocument>(this.collectionName);
 		const softDelete = !scheduledDeletionTime || scheduledDeletionTime.getTime() > Date.now();
 		if (softDelete) {
 			const query = {
 				_id: tenantId,
 				disabled: false,
 			};
-			await collection.update(
-				query,
-				{
-					disabled: true,
-					scheduledDeletionTime: scheduledDeletionTime?.toJSON(),
-				},
-				null,
+
+			await this.runWithDatabaseRequestCounter(async () =>
+				this.tenantRepository.update(
+					query,
+					{
+						disabled: true,
+						scheduledDeletionTime: scheduledDeletionTime?.toJSON(),
+					},
+					null,
+				),
 			);
 		} else {
-			await collection.deleteOne({ _id: tenantId });
+			await this.runWithDatabaseRequestCounter(async () =>
+				this.tenantRepository.deleteOne({ _id: tenantId }),
+			);
 		}
 		// invalidate cache
 		await this.deleteKeyFromCache(tenantId);
+		// invalidate private keys cache
+		await this.deleteKeyFromCache(tenantId, true /* deletePrivateKeys */);
 	}
 
 	private encryptAccessInfo(accessInfo: any): string {
@@ -645,35 +1289,137 @@ export class TenantManager {
 		return accessInfo;
 	}
 
-	private decryptCachedKeys(cachedKey: string) {
+	private decryptCachedKeys(
+		cachedKey: string,
+		decryptPrivateKeys = false,
+	): ITenantKeys | ITenantPrivateKeys {
 		const keys = JSON.parse(cachedKey);
+		const encryptionKeyVersion = keys.encryptionKeyVersion ?? undefined;
+		if (decryptPrivateKeys) {
+			const decryptedPrivateKeys: ITenantPrivateKeys = {
+				key: this.secretManager.decryptSecret(keys.key, encryptionKeyVersion),
+				keyNextRotationTime: keys.keyNextRotationTime,
+				secondaryKey: this.secretManager.decryptSecret(
+					keys.secondaryKey,
+					encryptionKeyVersion,
+				),
+				secondaryKeyNextRotationTime: keys.secondaryKeyNextRotationTime,
+			};
+			return decryptedPrivateKeys;
+		}
 		return keys.key2 === ""
 			? {
-					key1: this.secretManager.decryptSecret(keys.key1),
+					key1: this.secretManager.decryptSecret(keys.key1, encryptionKeyVersion),
 					key2: "",
 			  }
 			: {
-					key1: this.secretManager.decryptSecret(keys.key1),
-					key2: this.secretManager.decryptSecret(keys.key2),
+					key1: this.secretManager.decryptSecret(keys.key1, encryptionKeyVersion),
+					key2: this.secretManager.decryptSecret(keys.key2, encryptionKeyVersion),
 			  };
 	}
 
-	private async getKeyFromCache(tenantId: string): Promise<string> {
-		return this.cache?.get(`tenantKeys:${tenantId}`);
+	private async runWithCacheRequestCounter<T>(api: () => Promise<T>) {
+		this.storageRequestApiCounter.incrementCounter(StorageRequestMetric.CacheRequestStarted);
+		try {
+			const result = await api();
+			this.storageRequestApiCounter.incrementCounter(
+				StorageRequestMetric.CacheRequestCompleted,
+			);
+			return result;
+		} catch (error) {
+			this.storageRequestApiCounter.incrementCounter(StorageRequestMetric.CacheError);
+			throw error;
+		}
 	}
 
-	private async deleteKeyFromCache(tenantId: string): Promise<boolean> {
-		return this.cache?.delete(`tenantKeys:${tenantId}`);
+	private async runWithDatabaseRequestCounter<T>(api: () => Promise<T>) {
+		this.storageRequestApiCounter.incrementCounter(StorageRequestMetric.DatabaseRequestStarted);
+		try {
+			const result = await api();
+			this.storageRequestApiCounter.incrementCounter(
+				StorageRequestMetric.DatabaseRequestCompleted,
+			);
+			return result;
+		} catch (error) {
+			this.storageRequestApiCounter.incrementCounter(StorageRequestMetric.DatabaseError);
+			throw error;
+		}
 	}
 
-	private async setKeyInCache(tenantId: string, value: ITenantKeys): Promise<boolean> {
+	private getRedisKeyPrefix(tenantId: string, arePrivateKeys = false): string {
+		return arePrivateKeys ? `privateTenantKeys:${tenantId}` : `tenantKeys:${tenantId}`;
+	}
+
+	private async getKeyFromCache(
+		tenantId: string,
+		usePrivateKeys = false,
+	): Promise<string | undefined> {
+		try {
+			const cachedKey = await this.runWithCacheRequestCounter(
+				async () => this.cache?.get(this.getRedisKeyPrefix(tenantId, usePrivateKeys)),
+			);
+
+			if (cachedKey == null) {
+				this.fetchTenantKeyApiCounter.incrementCounter(
+					FetchTenantKeyMetric.NotFoundInCache,
+				);
+			} else {
+				this.fetchTenantKeyApiCounter.incrementCounter(
+					FetchTenantKeyMetric.RetrieveFromCacheSucess,
+				);
+			}
+			return cachedKey ?? undefined;
+		} catch (error) {
+			Lumberjack.error(
+				`Error trying to retreive tenant keys from the cache.`,
+				{ [BaseTelemetryProperties.tenantId]: tenantId },
+				error,
+			);
+			this.fetchTenantKeyApiCounter.incrementCounter(
+				FetchTenantKeyMetric.RetrieveFromCacheError,
+			);
+			throw error;
+		}
+	}
+
+	private async deleteKeyFromCache(
+		tenantId: string,
+		deletePrivateKeys = false,
+	): Promise<boolean> {
+		return this.runWithCacheRequestCounter(async () => {
+			if (this.cache?.delete === undefined) {
+				Lumberjack.warning("Cache delete method is not implemented.", {
+					[BaseTelemetryProperties.tenantId]: tenantId,
+				});
+				return false;
+			}
+			return this.cache.delete(this.getRedisKeyPrefix(tenantId, deletePrivateKeys));
+		});
+	}
+
+	private async setKeyInCache(
+		tenantId: string,
+		value: IEncryptedTenantKeys | IEncryptedPrivateTenantKeys,
+		setPrivateTenantKeys = false,
+	): Promise<boolean> {
 		const lumberProperties = { [BaseTelemetryProperties.tenantId]: tenantId };
 		try {
-			await this.cache?.set(`tenantKeys:${tenantId}`, JSON.stringify(value));
-			Lumberjack.info(`Added tenant keys to cache.`, lumberProperties);
+			await this.runWithCacheRequestCounter(
+				async () =>
+					this.cache?.set(
+						this.getRedisKeyPrefix(tenantId, setPrivateTenantKeys),
+						JSON.stringify(value),
+					),
+			);
+			this.fetchTenantKeyApiCounter.incrementCounter(
+				FetchTenantKeyMetric.SetKeyInCacheSuccess,
+			);
 			return true;
 		} catch (error) {
 			Lumberjack.error(`Setting tenant key in the cache failed`, lumberProperties, error);
+			this.fetchTenantKeyApiCounter.incrementCounter(
+				FetchTenantKeyMetric.SetKeyInCacheFailure,
+			);
 			return false;
 		}
 	}

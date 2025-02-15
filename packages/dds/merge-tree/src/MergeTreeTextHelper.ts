@@ -3,10 +3,10 @@
  * Licensed under the MIT License.
  */
 
-import { IIntegerRange } from "./base";
-import { ISegment } from "./mergeTreeNodes";
-import { MergeTree } from "./mergeTree";
-import { IMergeTreeTextHelper, TextSegment } from "./textSegment";
+import { IIntegerRange } from "./client.js";
+import { MergeTree } from "./mergeTree.js";
+import { ISegmentPrivate } from "./mergeTreeNodes.js";
+import { IMergeTreeTextHelper, TextSegment } from "./textSegment.js";
 
 interface ITextAccumulator {
 	textSegment: TextSegment;
@@ -23,7 +23,7 @@ export class MergeTreeTextHelper implements IMergeTreeTextHelper {
 		placeholder = "",
 		start?: number,
 		end?: number,
-	) {
+	): string {
 		const range = this.getValidRange(start, end, refSeq, clientId);
 
 		const accum: ITextAccumulator = { textSegment: new TextSegment(""), placeholder };
@@ -54,7 +54,7 @@ export class MergeTreeTextHelper implements IMergeTreeTextHelper {
 }
 
 function gatherText(
-	segment: ISegment,
+	segment: ISegmentPrivate,
 	pos: number,
 	refSeq: number,
 	clientId: number,
@@ -69,10 +69,11 @@ function gatherText(
 			const seglen = segment.text.length;
 			const _start = start < 0 ? 0 : start;
 			const _end = end >= seglen ? undefined : end;
-			textSegment.text += segment.text.substring(_start, _end);
+			textSegment.text += segment.text.slice(_start, _end);
 		}
 	} else if (placeholder && placeholder.length > 0) {
 		const placeholderText =
+			// eslint-disable-next-line @typescript-eslint/no-base-to-string
 			placeholder === "*" ? `\n${segment}` : placeholder.repeat(segment.cachedLength);
 		textSegment.text += placeholderText;
 	}

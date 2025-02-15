@@ -9,9 +9,12 @@ import { IConcreteNode, IConcreteNodeFactory, IReservationManager } from "./inte
 
 // The LocalOrderManager maintains a set of nodes and their set of ownerships of documents
 // It then provides caches of orderers
+/**
+ * @internal
+ */
 export class LocalOrderManager {
 	private readonly localOrderers = new Map<string, Promise<IOrderer>>();
-	private localNodeP: Promise<IConcreteNode>;
+	private localNodeP!: Promise<IConcreteNode>;
 
 	constructor(
 		private readonly nodeFactory: IConcreteNodeFactory,
@@ -62,16 +65,15 @@ export class LocalOrderManager {
 
 	private createLocalNode() {
 		this.localNodeP = this.nodeFactory.create();
-		this.localNodeP.then(
-			(localNode) => {
+		this.localNodeP
+			.then((localNode) => {
 				localNode.on("error", (error) => {
 					// Handle disconnects, error, etc... and create a new node
 				});
-			},
-			(error) => {
+			})
+			.catch((error) => {
 				// Reconnect the node
-			},
-		);
+			});
 	}
 
 	private getKey(tenantId: string, documentId: string) {

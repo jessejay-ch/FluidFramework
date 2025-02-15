@@ -3,11 +3,16 @@
  * Licensed under the MIT License.
  */
 
-import { ITelemetryLogger } from "@fluidframework/common-definitions";
-import { delay, performance } from "@fluidframework/common-utils";
-import { canRetryOnError, getRetryDelayFromError } from "@fluidframework/driver-utils";
-import { OdspErrorType } from "@fluidframework/odsp-driver-definitions";
-import { Odsp409Error } from "./epochTracker";
+import { performanceNow } from "@fluid-internal/client-utils";
+import { delay } from "@fluidframework/core-utils/internal";
+import {
+	canRetryOnError,
+	getRetryDelayFromError,
+} from "@fluidframework/driver-utils/internal";
+import { OdspErrorTypes } from "@fluidframework/odsp-driver-definitions/internal";
+import { ITelemetryLoggerExt } from "@fluidframework/telemetry-utils/internal";
+
+import { Odsp409Error } from "./epochTracker.js";
 
 /**
  * This method retries only for retriable coherency and service read only errors.
@@ -15,12 +20,12 @@ import { Odsp409Error } from "./epochTracker";
 export async function runWithRetry<T>(
 	api: () => Promise<T>,
 	callName: string,
-	logger: ITelemetryLogger,
+	logger: ITelemetryLoggerExt,
 	checkDisposed?: () => void,
 ): Promise<T> {
 	let retryAfter = 1000;
-	const start = performance.now();
-	let lastError: any;
+	const start = performanceNow();
+	let lastError: unknown;
 	for (let attempts = 1; ; attempts++) {
 		if (checkDisposed !== undefined) {
 			checkDisposed();
@@ -33,17 +38,20 @@ export async function runWithRetry<T>(
 						eventName: "MultipleRetries",
 						callName,
 						attempts,
-						duration: performance.now() - start,
+						duration: performanceNow() - start,
 					},
 					lastError,
 				);
 			}
 			return result;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		} catch (error: any) {
 			const canRetry = canRetryOnError(error);
 
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
 			const coherencyError = error?.[Odsp409Error] === true;
-			const serviceReadonlyError = error?.errorType === OdspErrorType.serviceReadOnly;
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+			const serviceReadonlyError = error?.errorType === OdspErrorTypes.serviceReadOnly;
 
 			// logging the first failed retry instead of every attempt. We want to avoid filling telemetry
 			// when we have tight loop of retrying in offline mode, but we also want to know what caused
@@ -54,7 +62,7 @@ export async function runWithRetry<T>(
 						eventName: `${callName}_firstFailed`,
 						callName,
 						attempts,
-						duration: performance.now() - start, // record total wait time.
+						duration: performanceNow() - start, // record total wait time.
 					},
 					error,
 				);
@@ -78,11 +86,12 @@ export async function runWithRetry<T>(
 							: "ServiceReadonlyErrorTooManyRetries",
 						callName,
 						attempts,
-						duration: performance.now() - start, // record total wait time.
+						duration: performanceNow() - start, // record total wait time.
 					},
 					error,
 				);
 				// Fail hard.
+				// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
 				error.canRetry = false;
 				throw error;
 			}

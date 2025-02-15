@@ -5,23 +5,27 @@
 
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
 
-import { ITelemetryLogger } from "@fluidframework/common-definitions";
-import { assert } from "@fluidframework/common-utils";
 import { IFluidHandle } from "@fluidframework/core-interfaces";
-import { IFluidSerializer } from "@fluidframework/shared-object-base";
-import { ISummaryTreeWithStats } from "@fluidframework/runtime-definitions";
-import { ChildLogger } from "@fluidframework/telemetry-utils";
-import { ISequencedDocumentMessage } from "@fluidframework/protocol-definitions";
-import { SummaryTreeBuilder } from "@fluidframework/runtime-utils";
-import { NonCollabClient, UnassignedSequenceNumber } from "./constants";
-import { ISegment } from "./mergeTreeNodes";
-import { matchProperties } from "./properties";
+import { assert } from "@fluidframework/core-utils/internal";
+import { ISequencedDocumentMessage } from "@fluidframework/driver-definitions/internal";
+import { ISummaryTreeWithStats } from "@fluidframework/runtime-definitions/internal";
+import { SummaryTreeBuilder } from "@fluidframework/runtime-utils/internal";
+import { IFluidSerializer } from "@fluidframework/shared-object-base/internal";
+import {
+	ITelemetryLoggerExt,
+	createChildLogger,
+} from "@fluidframework/telemetry-utils/internal";
+
+import { NonCollabClient, UnassignedSequenceNumber } from "./constants.js";
+import { MergeTree } from "./mergeTree.js";
+import { type ISegmentPrivate } from "./mergeTreeNodes.js";
+import { matchProperties } from "./properties.js";
+import { isInserted, isRemoved } from "./segmentInfos.js";
 import {
 	JsonSegmentSpecs,
 	MergeTreeChunkLegacy,
 	serializeAsMinSupportedVersion,
-} from "./snapshotChunks";
-import { MergeTree } from "./mergeTree";
+} from "./snapshotChunks.js";
 
 interface SnapshotHeader {
 	chunkCount?: number;
@@ -52,27 +56,27 @@ export class SnapshotLegacy {
 
 	private header: SnapshotHeader | undefined;
 	private seq: number | undefined;
-	private segments: ISegment[] | undefined;
-	private readonly logger: ITelemetryLogger;
+	private segments: ISegmentPrivate[] | undefined;
+	private readonly logger: ITelemetryLoggerExt;
 	private readonly chunkSize: number;
 
 	constructor(
 		public mergeTree: MergeTree,
-		logger: ITelemetryLogger,
+		logger: ITelemetryLoggerExt,
 		public filename?: string,
 		public onCompletion?: () => void,
 	) {
-		this.logger = ChildLogger.create(logger, "Snapshot");
+		this.logger = createChildLogger({ logger, namespace: "Snapshot" });
 		this.chunkSize =
 			mergeTree?.options?.mergeTreeSnapshotChunkSize ?? SnapshotLegacy.sizeOfFirstChunk;
 	}
 
 	private getSeqLengthSegs(
-		allSegments: ISegment[],
+		allSegments: ISegmentPrivate[],
 		approxSequenceLength: number,
 		startIndex = 0,
 	): MergeTreeChunkLegacy {
-		const segs: ISegment[] = [];
+		const segs: ISegmentPrivate[] = [];
 		let sequenceLength = 0;
 		let segCount = 0;
 		let segsWithAttribution = 0;
@@ -109,7 +113,7 @@ export class SnapshotLegacy {
 			chunkSequenceNumber: this.header!.seq,
 			segmentTexts: segs.map((seg) => seg.toJSONObject() as JsonSegmentSpecs),
 			attribution:
-				segsWithAttribution > 0
+				segsWithAttribution > 0 || this.mergeTree.attributionPolicy?.isAttached
 					? attributionSerializer?.serializeAttributionCollections(segs)
 					: undefined,
 		};
@@ -172,6 +176,13 @@ export class SnapshotLegacy {
 		);
 
 		if (catchUpMsgs !== undefined && catchUpMsgs.length > 0) {
+			// Messages used to have a "term" property which has since been removed.
+			// It is benign so it doesn't really need to be deleted here, but doing so permits snapshot tests
+			// to pass with an exact match (and matching the updated definition of ISequencedDocumentMessage).
+			for (const message of catchUpMsgs) {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
+				delete (message as any).term;
+			}
 			builder.addBlob(
 				this.mergeTree.options?.catchUpBlobName ?? SnapshotLegacy.catchupOps,
 				serializer ? serializer.stringify(catchUpMsgs, bind) : JSON.stringify(catchUpMsgs),
@@ -181,9 +192,9 @@ export class SnapshotLegacy {
 		return builder.getSummaryTree();
 	}
 
-	extractSync() {
+	extractSync(): ISegmentPrivate[] {
 		const collabWindow = this.mergeTree.collabWindow;
-		this.seq = collabWindow.minSeq;
+		const seq = (this.seq = collabWindow.minSeq);
 		this.header = {
 			segmentsTotalLength: this.mergeTree.getLength(
 				this.mergeTree.collabWindow.minSeq,
@@ -192,43 +203,34 @@ export class SnapshotLegacy {
 			seq: this.mergeTree.collabWindow.minSeq,
 		};
 
-		const segs: ISegment[] = [];
-		let prev: ISegment | undefined;
-		const extractSegment = (
-			segment: ISegment,
-			pos: number,
-			refSeq: number,
-			clientId: number,
-			start: number | undefined,
-			end: number | undefined,
-		) => {
+		let originalSegments = 0;
+
+		const segs: ISegmentPrivate[] = [];
+		let prev: ISegmentPrivate | undefined;
+		const extractSegment = (segment: ISegmentPrivate): boolean => {
 			if (
+				isInserted(segment) &&
 				segment.seq !== UnassignedSequenceNumber &&
-				segment.seq! <= this.seq! &&
-				(segment.removedSeq === undefined ||
+				segment.seq <= seq &&
+				(!isRemoved(segment) ||
 					segment.removedSeq === UnassignedSequenceNumber ||
-					segment.removedSeq > this.seq!)
+					segment.removedSeq > seq)
 			) {
-				if (
-					prev?.canAppend(segment) &&
-					matchProperties(prev.properties, segment.properties)
-				) {
-					prev = prev.clone();
+				originalSegments += 1;
+				const properties =
+					segment.propertyManager?.getAtSeq(segment.properties, seq) ?? segment.properties;
+				if (prev?.canAppend(segment) && matchProperties(prev.properties, properties)) {
 					prev.append(segment.clone());
 				} else {
-					if (prev) {
-						segs.push(prev);
-					}
-					prev = segment;
+					prev = segment.clone();
+					prev.properties = properties;
+					segs.push(prev);
 				}
 			}
 			return true;
 		};
 
 		this.mergeTree.mapRange(extractSegment, this.seq, NonCollabClient, undefined);
-		if (prev) {
-			segs.push(prev);
-		}
 
 		this.segments = [];
 		let totalLength: number = 0;
@@ -236,10 +238,20 @@ export class SnapshotLegacy {
 			totalLength += segment.cachedLength;
 			if (segment.properties !== undefined && Object.keys(segment.properties).length === 0) {
 				segment.properties = undefined;
-				segment.propertyManager = undefined;
 			}
 			this.segments!.push(segment);
 		});
+
+		// To reduce potential spam from this telemetry, we sample only a small
+		// percentage of summaries
+		if (Math.abs(originalSegments - segs.length) > 500 && Math.random() < 0.005) {
+			this.logger.sendTelemetryEvent({
+				eventName: "MergeTreeLegacySummarizeSegmentCount",
+				originalSegments,
+				segmentsAfterCombine: segs.length,
+				segmentsLen: this.segments.length,
+			});
+		}
 
 		// We observed this.header.segmentsTotalLength < totalLength to happen in some cases
 		// When this condition happens, we might not write out all segments in getSeqLengthSegs()

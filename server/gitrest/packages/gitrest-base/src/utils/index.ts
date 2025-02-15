@@ -4,12 +4,15 @@
  */
 
 export {
+	isIStorageRoutingId,
 	Constants,
 	GitObjectType,
 	IExternalWriterConfig,
 	IFileSystemManager,
+	IFileSystemManagerFactories,
 	IFileSystemManagerFactory,
 	IFileSystemManagerParams,
+	IFileSystemMakeDirectoryOptions,
 	IFileSystemPromises,
 	IRepoManagerParams,
 	IRepositoryManager,
@@ -17,6 +20,14 @@ export {
 	IStorageDirectoryConfig,
 	IStorageRoutingId,
 } from "./definitions";
+export { FsPromisesBase } from "./fileSystemBase";
+export {
+	SystemErrors,
+	isFilesystemError,
+	throwFileSystemErrorAsNetworkError,
+	filepathToString,
+} from "./fileSystemHelper";
+export { MemFsManagerFactory, NodeFsManagerFactory, RedisFsManagerFactory } from "./filesystems";
 export {
 	BaseGitRestTelemetryProperties,
 	GitRestLumberEventName,
@@ -31,6 +42,7 @@ export {
 	checkSoftDeleted,
 	exists,
 	getExternalWriterParams,
+	getFilesystemManagerFactory,
 	getGitDirectory,
 	getLumberjackBasePropertiesFromRepoManagerParams,
 	getRepoManagerFromWriteAPI,
@@ -44,11 +56,9 @@ export {
 	retrieveLatestFullSummaryFromStorage,
 	validateBlobContent,
 	validateBlobEncoding,
-	executeApiWithMetric,
 } from "./helpers";
 export {
 	IsomorphicGitManagerFactory,
 	IsomorphicGitRepositoryManager,
 } from "./isomorphicgitManager";
-export { NodeFsManagerFactory, MemFsManagerFactory } from "./filesystems";
-export { NodegitRepositoryManager, NodegitRepositoryManagerFactory } from "./nodegitManager";
+export { RedisFsConfig, RedisFsManager } from "./redisFs";

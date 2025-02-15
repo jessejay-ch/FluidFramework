@@ -3,11 +3,9 @@
  * Licensed under the MIT License.
  */
 
-// This directory strictly contains utilities for use elsewhere in the package.
-// We want to export everything.
+// All of the utilities here are meant to be used outside of this directory.
 /* eslint-disable no-restricted-syntax */
 
-export * from "./ApiItemUtilities";
-export * from "./ArrayUtilities";
-
-/* eslint-enable no-restricted-syntax */
+export * from "./ApiItemUtilities.js";
+export * from "./ArrayUtilities.js";
+export * from "./TypeUtilities.js";

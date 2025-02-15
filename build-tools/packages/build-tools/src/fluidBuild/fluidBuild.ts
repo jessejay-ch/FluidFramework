@@ -2,39 +2,41 @@
  * Copyright (c) Microsoft Corporation and contributors. All rights reserved.
  * Licensed under the MIT License.
  */
-import chalk from "chalk";
-import * as path from "path";
 
-import { commonOptions } from "../common/commonOptions";
-import { getResolvedFluidRoot } from "../common/fluidUtils";
+import chalk from "picocolors";
+import { Spinner } from "picospinner";
+
+import { GitRepo } from "../common/gitRepo";
 import { defaultLogger } from "../common/logging";
 import { Timer } from "../common/timer";
-import { existsSync } from "../common/utils";
-import { BuildResult } from "./buildGraph";
+import { BuildGraph, BuildResult } from "./buildGraph";
+import { commonOptions } from "./commonOptions";
+import { DEFAULT_FLUIDBUILD_CONFIG } from "./fluidBuildConfig";
 import { FluidRepoBuild } from "./fluidRepoBuild";
+import { getFluidBuildConfig, getResolvedFluidRoot } from "./fluidUtils";
 import { options, parseOptions } from "./options";
 
-const { info, errorLog: error, warning: warn } = defaultLogger;
+const { log, errorLog: error, warning: warn } = defaultLogger;
 
 parseOptions(process.argv);
 
 async function main() {
 	const timer = new Timer(commonOptions.timer);
-	const resolvedRoot = await getResolvedFluidRoot();
+	const resolvedRoot = await getResolvedFluidRoot(true);
+	const fluidConfig = getFluidBuildConfig(resolvedRoot, false);
+	const isDefaultConfig = fluidConfig === DEFAULT_FLUIDBUILD_CONFIG;
+	const suffix = isDefaultConfig
+		? ` (${chalk.yellowBright("inferred packages and tasks")})`
+		: "";
+	log(`Build Root: ${resolvedRoot}${suffix}`);
 
-	info(`Fluid Repo Root: ${resolvedRoot}`);
+	// Load the packages
+	const repo = new FluidRepoBuild({
+		repoRoot: resolvedRoot,
+		gitRepo: new GitRepo(resolvedRoot),
+		fluidBuildConfig: fluidConfig,
+	});
 
-	// Detect nohoist state mismatch and infer uninstall switch
-	if (options.install) {
-		const hasRootNodeModules = existsSync(path.join(resolvedRoot, "node_modules"));
-		if (hasRootNodeModules === options.nohoist) {
-			// We need to uninstall if nohoist doesn't match the current state of installation
-			options.uninstall = true;
-		}
-	}
-
-	// Load the package
-	const repo = new FluidRepoBuild(resolvedRoot, options.services);
 	timer.time("Package scan completed");
 
 	// Set matched package based on options filter
@@ -42,12 +44,6 @@ async function main() {
 	if (!matched) {
 		error("No package matched");
 		process.exit(-4);
-	}
-
-	// Dependency checks
-	if (options.depcheck) {
-		repo.depcheck();
-		timer.time("Dependencies check completed", true);
 	}
 
 	// Uninstall
@@ -60,9 +56,7 @@ async function main() {
 
 		if (!options.install) {
 			let errorStep: string | undefined = undefined;
-			if (options.symlink) {
-				errorStep = "symlink";
-			} else if (options.clean) {
+			if (options.clean) {
 				errorStep = "clean";
 			} else if (options.build) {
 				errorStep = "build";
@@ -76,37 +70,28 @@ async function main() {
 
 	// Install or check install
 	if (options.install) {
-		info("Installing packages");
-		if (!(await repo.install(options.nohoist))) {
+		log("Installing packages");
+		if (!(await repo.install())) {
 			error(`Install failed`);
 			process.exit(-5);
 		}
 		timer.time("Install completed", true);
 	}
 
-	// Symlink check
-	const symlinkTaskName = options.symlink ? "Symlink" : "Symlink check";
-	await repo.symlink(options);
-	timer.time(`${symlinkTaskName} completed`, options.symlink);
-
-	// Check scripts
-	await repo.checkPackages(options.fix);
-	timer.time("Check scripts completed");
-
 	let failureSummary = "";
-	if (options.clean || options.build !== false) {
-		info(
-			`Symlink in ${
-				options.fullSymlink
-					? "full"
-					: options.fullSymlink === false
-					? "isolated"
-					: "non-dependent"
-			} mode`,
-		);
-
+	let exitCode = 0;
+	if (options.buildTaskNames.length !== 0) {
 		// build the graph
-		const buildGraph = repo.createBuildGraph(options, options.buildScriptNames);
+		let buildGraph: BuildGraph;
+		const spinner = new Spinner("Creating build graph...");
+		try {
+			spinner.start();
+			buildGraph = repo.createBuildGraph(options.buildTaskNames);
+		} catch (e: unknown) {
+			error((e as Error).message);
+			process.exit(-11);
+		}
+		spinner.succeed("Build graph created.");
 		timer.time("Build graph creation completed");
 
 		// Check install
@@ -116,44 +101,42 @@ async function main() {
 		}
 		timer.time("Check install completed");
 
-		if (options.clean) {
-			if (!(await buildGraph.clean())) {
-				error(`Clean failed`);
-				process.exit(-9);
-			}
-			timer.time("Clean completed");
+		// Run the build
+		const buildResult = await buildGraph.build(timer);
+		const buildStatus = buildResultString(buildResult);
+		const elapsedTime = timer.time();
+		if (commonOptions.timer) {
+			const totalElapsedTime = buildGraph.totalElapsedTime;
+			const concurrency = buildGraph.totalElapsedTime / elapsedTime;
+			log(
+				`Execution time: ${totalElapsedTime.toFixed(3)}s, Concurrency: ${concurrency.toFixed(
+					3,
+				)}, Queue Wait time: ${buildGraph.totalQueueWaitTime.toFixed(3)}s`,
+			);
+			log(`Build ${buildStatus} - ${elapsedTime.toFixed(3)}s`);
+		} else {
+			log(`Build ${buildStatus}`);
 		}
+		failureSummary = buildGraph.taskFailureSummary;
 
-		if (options.build !== false) {
-			// Run the build
-			const buildResult = await buildGraph.build(timer);
-			const buildStatus = buildResultString(buildResult);
-			const elapsedTime = timer.time();
-			if (commonOptions.timer) {
-				const totalElapsedTime = buildGraph.totalElapsedTime;
-				const concurrency = buildGraph.totalElapsedTime / elapsedTime;
-				info(
-					`Execution time: ${totalElapsedTime.toFixed(
-						3,
-					)}s, Concurrency: ${concurrency.toFixed(3)}`,
-				);
-				info(`Build ${buildStatus} - ${elapsedTime.toFixed(3)}s`);
-			} else {
-				info(`Build ${buildStatus}`);
-			}
-			failureSummary = buildGraph.taskFailureSummary;
-		}
+		exitCode = buildResult === BuildResult.Failed ? -1 : 0;
 	}
 
 	if (options.build === false) {
-		info(`Other switches with no explicit build script, not building.`);
+		log(`Other switches with no explicit build script, not building.`);
 	}
 
-	info(`Total time: ${(timer.getTotalTime() / 1000).toFixed(3)}s`);
+	const totalTime = timer.getTotalTime();
+	const timeInMinutes =
+		totalTime > 60000
+			? ` (${Math.floor(totalTime / 60000)}m ${((totalTime % 60000) / 1000).toFixed(3)}s)`
+			: "";
+	log(`Total time: ${(totalTime / 1000).toFixed(3)}s${timeInMinutes}`);
 
 	if (failureSummary !== "") {
-		info(`\n${failureSummary}`);
+		log(`\n${failureSummary}`);
 	}
+	process.exit(exitCode);
 }
 
 function buildResultString(buildResult: BuildResult) {
@@ -167,7 +150,7 @@ function buildResultString(buildResult: BuildResult) {
 	}
 }
 
-main().catch((error) => {
-	info(`ERROR: Unexpected error. ${error.message}`);
-	info(error.stack);
+main().catch((e) => {
+	error(`Unexpected error. ${e.message}`);
+	error(e.stack);
 });

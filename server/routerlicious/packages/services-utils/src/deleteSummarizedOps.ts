@@ -3,39 +3,57 @@
  * Licensed under the MIT License.
  */
 
-import { ICollection, IDocument } from "@fluidframework/server-services-core";
+import { CheckpointService, ICollection } from "@fluidframework/server-services-core";
 import { Lumberjack, getLumberBaseProperties } from "@fluidframework/server-services-telemetry";
 import { FluidServiceError, FluidServiceErrorCode } from "./errorUtils";
 
+/**
+ * @internal
+ */
 export async function deleteSummarizedOps(
 	opCollection: ICollection<unknown>,
-	documentsCollection: ICollection<IDocument>,
 	softDeleteRetentionPeriodMs: number,
 	offlineWindowMs: number,
 	softDeletionEnabled: boolean,
 	permanentOpsDeletionEnabled: boolean,
+	checkpointService: CheckpointService,
 ): Promise<void> {
 	if (!softDeletionEnabled) {
 		const error = new FluidServiceError(
 			`Operation deletion is not enabled`,
 			FluidServiceErrorCode.FeatureDisabled,
 		);
-		return Promise.reject(error);
+		throw error;
 	}
 
-	const uniqueDocumentsCursor = await documentsCollection.aggregate([
+	// Following code would nv
+	const uniqueDocumentsCursorFromOps = await opCollection.aggregate([
 		{ $group: { _id: { documentId: "$documentId", tenantId: "$tenantId" } } },
 	]);
-	const uniqueDocuments = await uniqueDocumentsCursor.toArray();
+	const uniqueDocumentsFromOps: { tenantId: string; documentId: string }[] =
+		await uniqueDocumentsCursorFromOps.toArray();
 
 	const currentEpochTime = new Date().getTime();
 	const epochTimeBeforeOfflineWindow = currentEpochTime - offlineWindowMs;
 	const scheduledDeletionEpochTime = currentEpochTime + softDeleteRetentionPeriodMs;
 
-	for (const doc of uniqueDocuments) {
+	for (const doc of uniqueDocumentsFromOps) {
 		const lumberjackProperties = getLumberBaseProperties(doc.documentId, doc.tenantId);
 		try {
-			const lastSummarySequenceNumber = JSON.parse(doc.scribe).lastSummarySequenceNumber;
+			const realDoc = await checkpointService.getLatestCheckpoint(
+				doc.tenantId,
+				doc.documentId,
+			);
+
+			if (realDoc === null) {
+				Lumberjack.error(
+					`Unable to delete ops. Reason: Failed to get latest checkpoint`,
+					lumberjackProperties,
+				);
+				continue;
+			}
+
+			const lastSummarySequenceNumber = JSON.parse(realDoc.scribe).lastSummarySequenceNumber;
 
 			// first "soft delete" operations older than the offline window, which have been summarised
 			// soft delete is done by setting a scheduled deletion time
@@ -74,7 +92,6 @@ export async function deleteSummarizedOps(
 			}
 		} catch (error) {
 			Lumberjack.error(`Error while trying to delete ops`, lumberjackProperties, error);
-			throw error;
 		}
 	}
 }

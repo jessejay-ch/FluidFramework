@@ -2,89 +2,161 @@
  * Copyright (c) Microsoft Corporation and contributors. All rights reserved.
  * Licensed under the MIT License.
  */
-import * as assert from "assert";
-import { AsyncPriorityQueue } from "async";
-import chalk from "chalk";
-import crypto from "crypto";
-import registerDebug from "debug";
-import * as path from "path";
 
+import * as assert from "assert";
+import crypto from "crypto";
+import * as path from "path";
+import { AsyncPriorityQueue } from "async";
+import registerDebug from "debug";
+import chalk from "picocolors";
+
+import { existsSync } from "node:fs";
+import { readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { defaultLogger } from "../../../common/logging";
-import { ScriptDependencies } from "../../../common/npmPackage";
-import {
-	ExecAsyncResult,
-	execAsync,
-	existsSync,
-	getExecutableFromCommand,
-	readFileAsync,
-	unlinkAsync,
-	writeFileAsync,
-} from "../../../common/utils";
+import { ExecAsyncResult, execAsync, getExecutableFromCommand } from "../../../common/utils";
+import type { BuildContext } from "../../buildContext";
 import { BuildPackage, BuildResult, summarizeBuildResult } from "../../buildGraph";
 import { options } from "../../options";
 import { Task, TaskExec } from "../task";
 
-const { info, verbose, warning } = defaultLogger;
+const { log } = defaultLogger;
 const traceTaskTrigger = registerDebug("fluid-build:task:trigger");
-const traceTaskDep = registerDebug("fluid-build:task:dep");
+const traceTaskCheck = registerDebug("fluid-build:task:check");
+const traceTaskInitDep = registerDebug("fluid-build:task:init:dep");
+const traceTaskInitWeight = registerDebug("fluid-build:task:init:weight");
+const traceTaskQueue = registerDebug("fluid-build:task:exec:queue");
+const traceError = registerDebug("fluid-build:task:error");
+
 interface TaskExecResult extends ExecAsyncResult {
 	worker?: boolean;
 }
 
 export abstract class LeafTask extends Task {
-	private dependentTasks?: LeafTask[];
-	private parentCount: number = 0;
+	// initialize during initializeDependentLeafTasks
+	private dependentLeafTasks?: Set<LeafTask>;
 
-	constructor(node: BuildPackage, command: string, private scriptDeps: ScriptDependencies) {
-		super(node, command);
+	// set of direct parent that this task will unblock
+	private directParentLeafTasks: LeafTask[] = [];
+	private _parentLeafTasks: Set<LeafTask> | undefined | null;
+	private parentWeight = -1;
+
+	// For task that needs to override the actual command to execute
+	protected get executionCommand() {
+		return this.command;
+	}
+
+	constructor(
+		node: BuildPackage,
+		command: string,
+		context: BuildContext,
+		taskName: string | undefined,
+		private readonly isTemp: boolean = false, // indicate if the task is for temporary and not for execution.
+	) {
+		super(node, command, context, taskName);
 		if (!this.isDisabled) {
-			this.node.buildContext.taskStats.leafTotalCount++;
+			this.node.context.taskStats.leafTotalCount++;
 		}
 	}
 
-	public get isLeaf(): boolean {
-		return true;
+	public initializeDependentLeafTasks() {
+		this.ensureDependentLeafTasks();
+	}
+
+	private ensureDependentLeafTasks() {
+		if (this.dependentLeafTasks === undefined) {
+			this.dependentLeafTasks = new Set();
+			this.addDependentLeafTasks(this.transitiveDependentLeafTask);
+		}
+		return this.dependentLeafTasks;
+	}
+
+	public addDependentLeafTasks(dependentLeafTasks: Iterable<LeafTask>): void {
+		const dependentLeafTaskSet = this.ensureDependentLeafTasks();
+		for (const task of dependentLeafTasks) {
+			if (!dependentLeafTaskSet.has(task)) {
+				dependentLeafTaskSet.add(task);
+				task.directParentLeafTasks.push(this);
+				traceTaskInitDep(`${this.nameColored} -> ${task.nameColored}`);
+			}
+		}
+	}
+
+	public collectLeafTasks(leafTasks: Set<LeafTask>) {
+		leafTasks.add(this);
+	}
+
+	public initializeWeight() {
+		if (this.parentWeight === -1) {
+			this.parentWeight = this.computeParentWeight() + this.taskWeight;
+			traceTaskInitWeight(`${this.nameColored}: ${this.parentWeight}`);
+		}
+		return this.parentWeight;
+	}
+
+	private computeParentWeight() {
+		let sum = 0;
+		for (const t of this.parentLeafTasks.values()) {
+			sum += t.taskWeight;
+		}
+		return sum;
+	}
+
+	// Gather all tasks that depending on this task, so we can use it compute the weight.
+	// Collecting  to make sure we don't double count the weight of the same task
+	private get parentLeafTasks(): Set<LeafTask> {
+		if (this._parentLeafTasks === null) {
+			// Circular dependency, start unrolling
+			throw [this];
+		}
+		try {
+			if (this._parentLeafTasks === undefined) {
+				const parentLeafTasks = new Set<LeafTask>(this.directParentLeafTasks);
+				this._parentLeafTasks = null;
+				this.directParentLeafTasks
+					.map((task) => task.parentLeafTasks)
+					.forEach((p) => p.forEach((t) => parentLeafTasks.add(t)));
+				this._parentLeafTasks = parentLeafTasks;
+			}
+			return this._parentLeafTasks;
+		} catch (e) {
+			if (Array.isArray(e)) {
+				// Add to the dependency chain
+				e.push(this);
+				if (e[0] === this) {
+					// detected a cycle, convert into a message
+					throw new Error(
+						`Circular dependency in parent leaf tasks: ${e
+							.map((v) => v.nameColored)
+							.join("->")}`,
+					);
+				}
+			}
+			throw e;
+		}
+	}
+
+	protected get taskWeight() {
+		return 1;
+	}
+
+	public get weight() {
+		assert.notStrictEqual(this.parentWeight, -1);
+		return this.parentWeight;
 	}
 
 	public get isDisabled() {
-		const isLintTask = this.executable === "eslint" || this.executable === "tsfmt";
+		if (this.isTemp) {
+			return true;
+		}
+		const isLintTask = this.executable === "eslint" || this.executable === "prettier";
 		return (options.nolint && isLintTask) || (options.lintonly && !isLintTask);
 	}
 
 	public get executable() {
-		return getExecutableFromCommand(this.command);
-	}
-
-	public initializeDependentTask() {
-		this.dependentTasks = new Array<LeafTask>();
-		if (Object.keys(this.scriptDeps).length) {
-			for (const depPackage of this.node.dependentPackages) {
-				const depScripts = this.scriptDeps[depPackage.pkg.name];
-				if (depScripts) {
-					for (const depScript of depScripts) {
-						if (
-							this.addChildTask(
-								this.dependentTasks,
-								depPackage,
-								`npm run ${depScript}`,
-							)
-						) {
-							this.logVerboseDependency(depPackage, depScript);
-						}
-					}
-				}
-			}
-		}
-		this.addDependentTasks(this.dependentTasks);
-	}
-
-	public matchTask(command: string, options?: any): LeafTask | undefined {
-		return this.command === command ? this : undefined;
-	}
-
-	public collectLeafTasks(leafTasks: LeafTask[]) {
-		leafTasks.push(this);
-		this.parentCount++;
+		return getExecutableFromCommand(
+			this.command,
+			this.context.fluidBuildConfig?.multiCommandExecutables ?? [],
+		);
 	}
 
 	protected get useWorker() {
@@ -95,14 +167,14 @@ export abstract class LeafTask extends Task {
 			return BuildResult.UpToDate;
 		}
 		if (options.showExec) {
-			this.node.buildContext.taskStats.leafBuiltCount++;
-			const taskNum = this.node.buildContext.taskStats.leafBuiltCount
-				.toString()
-				.padStart(3, " ");
+			this.node.context.taskStats.leafBuiltCount++;
 			const totalTask =
-				this.node.buildContext.taskStats.leafTotalCount -
-				this.node.buildContext.taskStats.leafUpToDateCount;
-			info(`[${taskNum}/${totalTask}] ${this.node.pkg.nameColored}: ${this.command}`);
+				this.node.context.taskStats.leafTotalCount -
+				this.node.context.taskStats.leafUpToDateCount;
+			const taskNum = this.node.context.taskStats.leafBuiltCount
+				.toString()
+				.padStart(totalTask.toString().length, " ");
+			log(`[${taskNum}/${totalTask}] ${this.node.pkg.nameColored}: ${this.command}`);
 		}
 		const startTime = Date.now();
 		if (this.recheckLeafIsUpToDate && !this.forced && (await this.checkLeafIsUpToDate())) {
@@ -129,11 +201,11 @@ export abstract class LeafTask extends Task {
 	}
 
 	private async execCore(): Promise<TaskExecResult> {
-		const workerPool = this.node.buildContext.workerPool;
+		const workerPool = this.node.context.workerPool;
 		if (workerPool && this.useWorker) {
 			const workerResult = await workerPool.runOnWorker(
 				this.executable,
-				this.command,
+				this.executionCommand,
 				this.node.pkg.directory,
 			);
 			if (workerResult.code === 0 || !workerResult.error) {
@@ -144,9 +216,9 @@ export abstract class LeafTask extends Task {
 							: {
 									name: "Worker error",
 									message: "Worker error",
-									cmd: this.command,
+									cmd: this.executionCommand,
 									code: workerResult.code,
-							  },
+								},
 					stdout: workerResult.stdout ?? "",
 					stderr: workerResult.stderr ?? "",
 					worker: true,
@@ -172,12 +244,16 @@ export abstract class LeafTask extends Task {
 	}
 
 	private async execCommand(): Promise<ExecAsyncResult> {
-		return execAsync(this.command, {
+		if (this.executionCommand === "") {
+			return { error: null, stdout: "", stderr: "" };
+		}
+		return execAsync(this.executionCommand, {
 			cwd: this.node.pkg.directory,
 			env: {
-				PATH: `${path.join(this.node.pkg.directory, "node_modules", ".bin")}${
-					path.delimiter
-				}${process.env["PATH"]}`,
+				...process.env,
+				PATH: `${path.join(this.node.pkg.directory, "node_modules", ".bin")}${path.delimiter}${
+					process.env["PATH"]
+				}`,
 			},
 		});
 	}
@@ -212,131 +288,125 @@ export abstract class LeafTask extends Task {
 					break;
 			}
 
-			this.node.buildContext.taskStats.leafBuiltCount++;
-			const taskNum = this.node.buildContext.taskStats.leafBuiltCount
-				.toString()
-				.padStart(3, " ");
+			this.node.context.taskStats.leafBuiltCount++;
 			const totalTask =
-				this.node.buildContext.taskStats.leafTotalCount -
-				this.node.buildContext.taskStats.leafUpToDateCount;
+				this.node.context.taskStats.leafTotalCount -
+				this.node.context.taskStats.leafUpToDateCount;
+			const taskNum = this.node.context.taskStats.leafBuiltCount
+				.toString()
+				.padStart(totalTask.toString().length, " ");
 			const elapsedTime = (Date.now() - startTime) / 1000;
 			const workerMsg = worker ? "[worker] " : "";
+			const suffix = this.isIncremental ? "" : " (non-incremental)";
 			const statusString = `[${taskNum}/${totalTask}] ${statusCharacter} ${
 				this.node.pkg.nameColored
-			}: ${workerMsg}${this.command} - ${elapsedTime.toFixed(3)}s`;
-			info(statusString);
+			}: ${workerMsg}${this.command} - ${elapsedTime.toFixed(3)}s${suffix}`;
+			log(statusString);
 			if (status === BuildResult.Failed) {
-				this.node.buildContext.failedTaskLines.push(statusString);
+				this.node.context.failedTaskLines.push(statusString);
 			}
-			this.node.buildContext.taskStats.leafExecTimeTotal += elapsedTime;
+			this.node.context.taskStats.leafExecTimeTotal += elapsedTime;
 		}
 		return status;
 	}
 
 	protected async runTask(q: AsyncPriorityQueue<TaskExec>): Promise<BuildResult> {
-		this.logVerboseTask("Begin Leaf Task");
+		this.traceExec("Begin Leaf Task");
+
+		// Build all the dependent tasks first
 		const result = await this.buildDependentTask(q);
 		if (result === BuildResult.Failed) {
 			return BuildResult.Failed;
 		}
 
-		return new Promise((resolve, reject) => {
-			this.logVerboseTask(`[${this.parentCount}] Queue Leaf Task`);
-			q.push({ task: this, resolve }, -this.parentCount);
+		// Queue this task
+		return new Promise((resolve) => {
+			traceTaskQueue(`${this.nameColored}: queued with weight ${this.weight}`);
+			q.push({ task: this, resolve, queueTime: Date.now() }, -this.weight);
 		});
 	}
 
 	protected async checkIsUpToDate(): Promise<boolean> {
 		if (this.isDisabled) {
+			// disabled task are not included in the leafTotalCount
+			// so we don't need to update the leafUpToDateCount as well. Just return.
 			return true;
 		}
 		if (options.lintonly) {
 			return false;
 		}
 
-		const leafIsUpToDate =
-			(await this.checkDependentTasksIsUpToDate()) && (await this.checkLeafIsUpToDate());
+		if (!(await this.checkDependentLeafTasksIsUpToDate())) {
+			return false;
+		}
+
+		const start = Date.now();
+		const leafIsUpToDate = await this.checkLeafIsUpToDate();
+		traceTaskCheck(`${this.nameColored}: checkLeafIsUpToDate: ${Date.now() - start}ms`);
 		if (leafIsUpToDate) {
-			this.node.buildContext.taskStats.leafUpToDateCount++;
-			this.logVerboseTask(`Skipping Leaf Task`);
+			this.node.context.taskStats.leafUpToDateCount++;
+			this.traceExec(`Skipping Leaf Task`);
 		}
 
 		return leafIsUpToDate;
 	}
 
-	protected addChildTask(
-		dependentTasks: LeafTask[],
-		node: BuildPackage,
-		command: string,
-		options?: any,
-	) {
-		const task = node.findTask(command, options);
-		if (task) {
-			task.collectLeafTasks(dependentTasks);
-			return task;
-		}
-		return undefined;
-	}
-
-	private async checkDependentTasksIsUpToDate(): Promise<boolean> {
-		const dependentTasks = this.getDependentTasks();
-		for (const dependentTask of dependentTasks) {
-			if (!(await dependentTask.isUpToDate())) {
-				this.logVerboseTrigger(`dependent task ${dependentTask.toString()} not up to date`);
+	private async checkDependentLeafTasksIsUpToDate(): Promise<boolean> {
+		const dependentLeafTasks = this.getDependentLeafTasks();
+		for (const dependentLeafTask of dependentLeafTasks) {
+			if (!(await dependentLeafTask.isUpToDate())) {
+				this.traceTrigger(`dependent task ${dependentLeafTask.toString()} not up to date`);
 				return false;
 			}
 		}
 		return true;
 	}
 
-	private getDependentTasks(): LeafTask[] {
-		assert.notStrictEqual(this.dependentTasks, undefined);
-		return this.dependentTasks!;
+	protected getDependentLeafTasks() {
+		assert.notStrictEqual(this.dependentLeafTasks, undefined);
+		// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+		return this.dependentLeafTasks!.values();
 	}
 
 	private async buildDependentTask(q: AsyncPriorityQueue<TaskExec>): Promise<BuildResult> {
 		const p = new Array<Promise<BuildResult>>();
-		for (const dependentTask of this.getDependentTasks()) {
-			p.push(dependentTask.run(q));
+		for (const dependentLeafTask of this.getDependentLeafTasks()) {
+			p.push(dependentLeafTask.run(q));
 		}
 
 		return summarizeBuildResult(await Promise.all(p));
 	}
 
+	/**
+	 * Returns the absolute path to a package-relative path within the repo.
+	 *
+	 * @param filePath - a path relative to the package being processed by this task.
+	 * @returns An absolute path to the file.
+	 */
 	protected getPackageFileFullPath(filePath: string): string {
+		if (path.isAbsolute(filePath)) {
+			return filePath;
+		}
 		return path.join(this.node.pkg.directory, filePath);
-	}
-
-	protected get allDependentTasks() {
-		return (function* (dependentTasks) {
-			const pending: LeafTask[] = [...dependentTasks];
-			const seen = new Set<LeafTask>();
-			while (true) {
-				const leafTask = pending.pop();
-				if (!leafTask) {
-					return;
-				}
-				if (seen.has(leafTask)) {
-					continue;
-				}
-				seen.add(leafTask);
-				yield leafTask;
-				pending.push(...leafTask.getDependentTasks());
-			}
-		})(this.getDependentTasks());
 	}
 
 	/**
 	 * Subclass should override these to configure the leaf task
 	 */
 
-	// collect the dependent task this leaf task has
-	protected abstract addDependentTasks(dependentTasks: LeafTask[]): void;
+	// After the task is done, indicate whether the command can be incremental next time.
+	protected abstract get isIncremental();
 
 	// check if this task is up to date
 	protected abstract checkLeafIsUpToDate(): Promise<boolean>;
 
-	// do this task support recheck when it time to execute (even when the dependent task is out of date)
+	/**
+	 * Return if the task supports recheck when it time to execute.
+	 * Default to false so that the task will execute if any of the dependent task is out of date at the
+	 * beginning of the build.
+	 * Override to true if the task knows all the input dependencies (e.g. tsc) and is able to detect if
+	 * the dependent task's output changes this tasks' input and really need rebuild or not.
+	 */
 	protected get recheckLeafIsUpToDate(): boolean {
 		return false;
 	}
@@ -349,39 +419,29 @@ export abstract class LeafTask extends Task {
 		return errorMessages;
 	}
 
-	protected logVerboseNotUpToDate() {
-		this.logVerboseTrigger("not up to date");
+	protected traceNotUpToDate() {
+		this.traceTrigger("not up to date");
 	}
 
-	protected logVerboseTrigger(reason: string) {
-		const msg = `Triggering Leaf Task: [${reason}] ${this.node.pkg.nameColored} - ${this.command}`;
+	protected traceTrigger(reason: string) {
+		const msg = `${this.nameColored}: [${reason}]`;
 		traceTaskTrigger(msg);
-		verbose(msg);
 	}
 
-	protected logVerboseDependency(child: BuildPackage, dep: string) {
-		const msg = `Task Dependency: ${this.node.pkg.nameColored} ${this.executable} -> ${child.pkg.nameColored} ${dep}`;
-		traceTaskDep(msg);
-		verbose(msg);
-	}
-
-	protected logVerboseTask(msg: string) {
-		verbose(`Task: ${this.node.pkg.nameColored} ${this.executable}: ${msg}`);
-	}
-
-	protected addAllDependentPackageTasks(dependentTasks: LeafTask[]) {
-		for (const child of this.node.dependentPackages) {
-			if (child.task) {
-				child.task.collectLeafTasks(dependentTasks);
-				this.logVerboseDependency(child, "*");
-			}
-		}
-
-		// TODO: we should add all the prefix tasks in the task tree of the current package as well.
+	protected traceError(msg: string) {
+		traceError(`${this.nameColored}: ${msg}`);
 	}
 }
 
+/**
+ * A LeafTask with a "done file" which represents the work this task needs to do.
+ */
 export abstract class LeafWithDoneFileTask extends LeafTask {
+	private _isIncremental: boolean = true;
+
+	protected get isIncremental() {
+		return this._isIncremental;
+	}
 	protected get doneFileFullPath() {
 		return this.getPackageFileFullPath(this.doneFile);
 	}
@@ -395,7 +455,7 @@ export abstract class LeafWithDoneFileTask extends LeafTask {
 			const doneFileFullPath = this.doneFileFullPath;
 			try {
 				if (existsSync(doneFileFullPath)) {
-					await unlinkAsync(doneFileFullPath);
+					await unlink(doneFileFullPath);
 				}
 			} catch {
 				console.warn(
@@ -409,15 +469,18 @@ export abstract class LeafWithDoneFileTask extends LeafTask {
 	protected async markExecDone() {
 		const doneFileFullPath = this.doneFileFullPath;
 		try {
+			// TODO: checkLeafIsUpToDate already called this. Consider reusing its results to save recomputation of them.
 			const content = await this.getDoneFileContent();
 			if (content !== undefined) {
-				await writeFileAsync(doneFileFullPath, content);
+				await writeFile(doneFileFullPath, content);
 			} else {
+				this._isIncremental = false;
 				console.warn(
 					`${this.node.pkg.nameColored}: warning: unable to generate content for ${doneFileFullPath}`,
 				);
 			}
 		} catch (error) {
+			this._isIncremental = false;
 			console.warn(
 				`${this.node.pkg.nameColored}: warning: unable to write ${doneFileFullPath}\n error: ${error}`,
 			);
@@ -425,22 +488,27 @@ export abstract class LeafWithDoneFileTask extends LeafTask {
 	}
 
 	protected async checkLeafIsUpToDate() {
-		const doneFileFullPath = this.doneFileFullPath!;
+		const doneFileFullPath = this.doneFileFullPath;
 		try {
 			const doneFileExpectedContent = await this.getDoneFileContent();
-			if (doneFileExpectedContent) {
-				const doneFileContent = await readFileAsync(doneFileFullPath, "utf8");
+			if (doneFileExpectedContent !== undefined) {
+				const doneFileContent = await readFile(doneFileFullPath, "utf8");
 				if (doneFileContent === doneFileExpectedContent) {
 					return true;
 				}
-				this.logVerboseTrigger("mismatched compare file");
-				traceTaskTrigger(doneFileExpectedContent);
-				traceTaskTrigger(doneFileContent);
+				this.traceTrigger(`mismatched compare file: ${doneFileFullPath}`);
+				// These log statements can be useful for debugging, but they're extremely long and completely
+				// obscure other logs.
+				// In the future we can consider logging just the diff between the input and output.
+				// this.traceTrigger(doneFileExpectedContent);
+				// this.traceTrigger(doneFileContent);
 			} else {
-				this.logVerboseTrigger("unable to generate done file expected content");
+				this.traceTrigger(
+					"unable to generate done file expected content (getDoneFileContent returned undefined)",
+				);
 			}
 		} catch {
-			this.logVerboseTrigger("unable to read compare file");
+			this.traceTrigger(`unable to read compare file: ${doneFileFullPath}`);
 		}
 		return false;
 	}
@@ -449,9 +517,13 @@ export abstract class LeafWithDoneFileTask extends LeafTask {
 	 * Subclass could override this to provide an alternative done file name
 	 */
 	protected get doneFile(): string {
-		const name = path.parse(this.executable).name;
+		const name = path.parse(this.executable).name.replace(/\s/g, "_");
 		// use 8 char of the sha256 hash of the command to distinguish different tasks
-		const hash = crypto.createHash("sha256").update(this.command).digest("hex").substring(0, 8);
+		const hash = crypto
+			.createHash("sha256")
+			.update(this.command)
+			.digest("hex")
+			.substring(0, 8);
 		return `${name}-${hash}.done.build.log`;
 	}
 
@@ -459,18 +531,138 @@ export abstract class LeafWithDoneFileTask extends LeafTask {
 	 * Subclass should override these to configure the leaf with done file task
 	 */
 
-	// The content to be written in the done file.
+	/**
+	 * The content to be written in the "done file".
+	 * @remarks
+	 * This file must have different content if the work needed to be done by this task changes.
+	 * This is typically done by listing and/or hashing the inputs and outputs to this task.
+	 * This is invoked before the task is run to check if an existing done file from a previous run matches: if so, the task can be skipped.
+	 * If not, the task is run, after which this is invoked a second time to produce the contents to write to disk.
+	 */
 	protected abstract getDoneFileContent(): Promise<string | undefined>;
 }
 
 export class UnknownLeafTask extends LeafTask {
-	protected addDependentTasks(dependentTasks: LeafTask[]) {
-		// Because we don't know, we need to depends on all the task in the dependent packages
-		this.addAllDependentPackageTasks(dependentTasks);
+	constructor(
+		node: BuildPackage,
+		command: string,
+		context: BuildContext,
+		taskName: string | undefined,
+	) {
+		super(node, command, context, taskName);
+	}
+
+	protected get isIncremental() {
+		return this.command === "";
 	}
 
 	protected async checkLeafIsUpToDate() {
+		if (this.command === "") {
+			// Empty command is always up to date.
+			return true;
+		}
 		// Because we don't know, it is always out of date and need to rebuild
+		this.traceTrigger("Unknown task");
 		return false;
 	}
+}
+
+export abstract class LeafWithFileStatDoneFileTask extends LeafWithDoneFileTask {
+	/**
+	 * @returns the list of absolute paths to files that this task depends on.
+	 */
+	protected abstract getInputFiles(): Promise<string[]>;
+
+	/**
+	 * @returns the list of absolute paths to files that this task generates.
+	 */
+	protected abstract getOutputFiles(): Promise<string[]>;
+
+	/**
+	 * If this returns true, then the donefile will use the hash of the file contents instead of the last modified time
+	 * and other file stats.
+	 *
+	 * Hashing is roughly 20% slower than the stats-based approach, but is less susceptible to getting invalidated by
+	 * other processes like git touching files but not ultimately changing their contents.
+	 */
+	protected get useHashes(): boolean {
+		return false;
+	}
+
+	protected async getDoneFileContent(): Promise<string | undefined> {
+		if (this.useHashes) {
+			return this.getHashDoneFileContent();
+		}
+
+		// Gather the file information
+		try {
+			const srcFiles = await this.getInputFiles();
+			const dstFiles = await this.getOutputFiles();
+			const srcTimesP = Promise.all(
+				srcFiles
+					.map((match) => this.getPackageFileFullPath(match))
+					.map((match) => stat(match)),
+			);
+			const dstTimesP = Promise.all(
+				dstFiles
+					.map((match) => this.getPackageFileFullPath(match))
+					.map((match) => stat(match)),
+			);
+			const [srcTimes, dstTimes] = await Promise.all([srcTimesP, dstTimesP]);
+
+			const srcInfo = srcTimes.map((srcTime) => {
+				return { mtimeMs: srcTime.mtimeMs, size: srcTime.size };
+			});
+			const dstInfo = dstTimes.map((dstTime) => {
+				return { mtimeMs: dstTime.mtimeMs, size: dstTime.size };
+			});
+			return JSON.stringify({ srcFiles, dstFiles, srcInfo, dstInfo });
+		} catch (e: any) {
+			this.traceError(`error comparing file times: ${e.message}`);
+			this.traceTrigger("failed to get file stats");
+			return undefined;
+		}
+	}
+
+	private async getHashDoneFileContent(): Promise<string | undefined> {
+		const mapHash = async (name: string) => {
+			const hash = await this.node.context.fileHashCache.getFileHash(
+				this.getPackageFileFullPath(name),
+			);
+			return { name, hash };
+		};
+
+		try {
+			const srcFiles = await this.getInputFiles();
+			const dstFiles = await this.getOutputFiles();
+			const srcHashesP = Promise.all(srcFiles.map(mapHash));
+			const dstHashesP = Promise.all(dstFiles.map(mapHash));
+
+			const [srcHashes, dstHashes] = await Promise.all([srcHashesP, dstHashesP]);
+
+			// sort by name for determinism
+			srcHashes.sort(sortByName);
+			dstHashes.sort(sortByName);
+
+			const output = JSON.stringify({
+				srcHashes,
+				dstHashes,
+			});
+			return output;
+		} catch (e: any) {
+			this.traceError(`error calculating file hashes: ${e.message}`);
+			this.traceTrigger("failed to get file hash");
+			return undefined;
+		}
+	}
+}
+
+function sortByName(a: { name: string }, b: { name: string }): number {
+	if (a.name < b.name) {
+		return -1;
+	}
+	if (a.name > b.name) {
+		return 1;
+	}
+	return 0;
 }

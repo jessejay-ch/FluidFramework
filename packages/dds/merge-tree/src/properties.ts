@@ -3,72 +3,38 @@
  * Licensed under the MIT License.
  */
 
-import { ICombiningOp } from "./ops";
-
+/**
+ * Any mapping from a string to values of type `T`
+ * @legacy
+ * @alpha
+ */
 export interface MapLike<T> {
 	[index: string]: T;
 }
 
-// We use any because when you include custom methods
-// such as toJSON(), JSON.stringify accepts most types other
-// than functions
+/**
+ * A loosely-typed mapping from strings to any value.
+ *
+ * @remarks Property sets are expected to be JSON-stringify-able.
+ *
+ * @privateRemarks PropertySet is typed using `any` because when you include
+ * custom methods such as toJSON(), JSON.stringify accepts most types other than
+ * functions
+ * @legacy
+ * @alpha
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type PropertySet = MapLike<any>;
 
-// Assume these are created with Object.create(null)
-
-export interface IConsensusValue {
-	seq: number;
-	value: any;
-}
-
-export function combine(
-	combiningInfo: ICombiningOp,
-	currentValue: any,
-	newValue: any,
-	seq?: number,
-) {
-	let _currentValue = currentValue;
-
-	if (_currentValue === undefined) {
-		_currentValue = combiningInfo.defaultValue;
-	}
-	// Fixed set of operations for now
-
-	switch (combiningInfo.name) {
-		case "incr":
-			_currentValue += newValue as number;
-			if (combiningInfo.minValue) {
-				if (_currentValue < combiningInfo.minValue) {
-					_currentValue = combiningInfo.minValue;
-				}
-			}
-			break;
-		case "consensus":
-			if (_currentValue === undefined) {
-				const cv: IConsensusValue = {
-					value: newValue,
-					// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-					seq: seq!,
-				};
-
-				_currentValue = cv;
-			} else {
-				const cv = _currentValue as IConsensusValue;
-				if (cv.seq === -1) {
-					// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-					cv.seq = seq!;
-				}
-			}
-			break;
-		default:
-			break;
-	}
-
-	// eslint-disable-next-line @typescript-eslint/no-unsafe-return
-	return _currentValue;
-}
-
-export function matchProperties(a: PropertySet | undefined, b: PropertySet | undefined) {
+/**
+ * Compares two PropertySets for equality.
+ *
+ * @internal
+ */
+export function matchProperties(
+	a: PropertySet | undefined,
+	b: PropertySet | undefined,
+): boolean {
 	if (!a && !b) {
 		return true;
 	}
@@ -84,6 +50,7 @@ export function matchProperties(a: PropertySet | undefined, b: PropertySet | und
 		if (b?.[key] === undefined) {
 			return false;
 		} else if (typeof b[key] === "object") {
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
 			if (!matchProperties(a?.[key], b[key])) {
 				return false;
 			}
@@ -95,73 +62,77 @@ export function matchProperties(a: PropertySet | undefined, b: PropertySet | und
 	return true;
 }
 
-export function extend<T>(
-	base: MapLike<T>,
-	extension: MapLike<T> | undefined,
-	combiningOp?: ICombiningOp,
-	seq?: number,
-) {
+/**
+ * Adds properties from one PropertySet to another.
+ *
+ * @internal
+ */
+export function extend<T>(base: MapLike<T>, extension: MapLike<T> | undefined): MapLike<T> {
 	if (extension !== undefined) {
-		// eslint-disable-next-line guard-for-in, no-restricted-syntax
-		for (const key in extension) {
-			const v = extension[key];
-			if (v === null) {
+		for (const [key, v] of Object.entries(extension)) {
+			if (v === undefined) {
+				continue;
+			} else if (v === null) {
 				// eslint-disable-next-line @typescript-eslint/no-dynamic-delete
 				delete base[key];
 			} else {
-				if (combiningOp && combiningOp.name !== "rewrite") {
-					base[key] = combine(combiningOp, base[key], v, seq);
-				} else {
-					base[key] = v;
-				}
+				base[key] = v;
 			}
 		}
 	}
 	return base;
 }
 
-export function clone<T>(extension: MapLike<T> | undefined) {
+/**
+ * Clones properties in a given PropertySet into a new PropertySet.
+ *
+ * @internal
+ */
+export function clone<T>(extension: MapLike<T> | undefined): MapLike<T> | undefined {
 	if (extension === undefined) {
 		return undefined;
 	}
 	const cloneMap = createMap<T>();
-	// eslint-disable-next-line guard-for-in, no-restricted-syntax
-	for (const key in extension) {
-		const v = extension[key];
-		if (v !== null) {
-			cloneMap[key] = v;
-		}
-	}
-	return cloneMap;
+	return extend(cloneMap, extension);
 }
 
+/**
+ * Add properties in one PropertySet to another PropertySet. If the PropertySet we are adding
+ * to does not exist, create one.
+ *
+ * @internal
+ */
 export function addProperties(
 	oldProps: PropertySet | undefined,
 	newProps: PropertySet,
-	op?: ICombiningOp,
-	seq?: number,
-) {
-	let _oldProps = oldProps;
-	if (!_oldProps || (op && op.name === "rewrite")) {
-		_oldProps = createMap<any>();
-	}
-	extend(_oldProps, newProps, op, seq);
-	return _oldProps;
+): PropertySet {
+	return extend(oldProps ?? createMap<unknown>(), newProps);
 }
 
-export function extendIfUndefined<T>(base: MapLike<T>, extension: MapLike<T> | undefined) {
+/**
+ * Replace values of undefined in one PropertySet with values for the same key from another PropertySet.
+ *
+ * @internal
+ */
+export function extendIfUndefined<T>(
+	base: MapLike<T>,
+	extension: MapLike<T> | undefined,
+): MapLike<T> {
 	if (extension !== undefined) {
-		// eslint-disable-next-line no-restricted-syntax
-		for (const key in extension) {
+		for (const [key, value] of Object.entries(extension)) {
 			if (base[key] === undefined) {
-				base[key] = extension[key];
+				base[key] = value;
 			}
 		}
 	}
 	return base;
 }
 
-// Create a MapLike with good performance.
+/**
+ * Create a MapLike with good performance.
+ *
+ * @internal
+ */
 export function createMap<T>(): MapLike<T> {
 	return Object.create(null) as MapLike<T>;
 }

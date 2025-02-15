@@ -4,32 +4,36 @@
  */
 
 import {
+	IChannelAttributes,
 	IFluidDataStoreRuntime,
 	IChannelStorageService,
-	IChannelAttributes,
-} from "@fluidframework/datastore-definitions";
-import { ISequencedDocumentMessage, MessageType } from "@fluidframework/protocol-definitions";
-import { ISummaryTreeWithStats } from "@fluidframework/runtime-definitions";
-import { readAndParse } from "@fluidframework/driver-utils";
+} from "@fluidframework/datastore-definitions/internal";
 import {
-	createSingleBlobSummary,
+	MessageType,
+	ISequencedDocumentMessage,
+} from "@fluidframework/driver-definitions/internal";
+import { readAndParse } from "@fluidframework/driver-utils/internal";
+import { ISummaryTreeWithStats } from "@fluidframework/runtime-definitions/internal";
+import {
 	IFluidSerializer,
 	SharedObject,
-} from "@fluidframework/shared-object-base";
+	createSingleBlobSummary,
+} from "@fluidframework/shared-object-base/internal";
 import { v4 as uuid } from "uuid";
-import { InkFactory } from "./inkFactory";
+
+import { InkFactory } from "./inkFactory.js";
 import {
 	IClearOperation,
 	ICreateStrokeOperation,
 	IInk,
+	IInkEvents,
 	IInkOperation,
 	IInkPoint,
 	IInkStroke,
 	IPen,
 	IStylusOperation,
-	IInkEvents,
-} from "./interfaces";
-import { InkData, ISerializableInk } from "./snapshot";
+} from "./interfaces.js";
+import { ISerializableInk, InkData } from "./snapshot.js";
 
 /**
  * Filename where the snapshot is stored.
@@ -99,6 +103,7 @@ const snapshotFileName = "header";
  * ink.on("clear", this.renderClear.bind(this));
  * ```
  * @sealed
+ * @internal
  */
 export class Ink extends SharedObject<IInkEvents> implements IInk {
 	/**
@@ -107,7 +112,7 @@ export class Ink extends SharedObject<IInkEvents> implements IInk {
 	 * @param id - Optional name of the Ink; will be assigned a unique ID if not provided
 	 * @returns Newly create Ink object (but not attached yet)
 	 */
-	public static create(runtime: IFluidDataStoreRuntime, id?: string) {
+	public static create(runtime: IFluidDataStoreRuntime, id?: string): Ink {
 		return runtime.createChannel(id, InkFactory.Type) as Ink;
 	}
 
@@ -115,7 +120,7 @@ export class Ink extends SharedObject<IInkEvents> implements IInk {
 	 * Get a factory for Ink to register with the data store.
 	 * @returns A factory that creates and loads Ink
 	 */
-	public static getFactory() {
+	public static getFactory(): InkFactory {
 		return new InkFactory();
 	}
 
@@ -279,7 +284,7 @@ export class Ink extends SharedObject<IInkEvents> implements IInk {
 		return stroke;
 	}
 
-	protected applyStashedOp() {
+	protected applyStashedOp(): void {
 		throw new Error("not implemented");
 	}
 }

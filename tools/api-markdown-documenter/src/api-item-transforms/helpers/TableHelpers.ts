@@ -2,46 +2,46 @@
  * Copyright (c) Microsoft Corporation and contributors. All rights reserved.
  * Licensed under the MIT License.
  */
+
 import {
 	ApiDocumentedItem,
-	ApiItem,
+	type ApiItem,
 	ApiItemKind,
-	ApiPackage,
-	ApiPropertyItem,
-	ApiReleaseTagMixin,
+	type ApiPackage,
+	type ApiPropertyItem,
 	ApiReturnTypeMixin,
-	Excerpt,
-	Parameter,
-	ReleaseTag,
-	TypeParameter,
+	type Excerpt,
+	type Parameter,
+	type TypeParameter,
+	type ApiVariable,
 } from "@microsoft/api-extractor-model";
 
-import { MarkdownDocumenterConfiguration } from "../../Configuration";
 import {
 	CodeSpanNode,
-	DocumentationNode,
+	type DocumentationNode,
 	HeadingNode,
 	LinkNode,
 	PlainTextNode,
 	SectionNode,
-	SpanNode,
 	TableBodyCellNode,
 	TableBodyRowNode,
 	TableHeaderCellNode,
 	TableHeaderRowNode,
 	TableNode,
-} from "../../documentation-domain";
+} from "../../documentation-domain/index.js";
 import {
-	ApiFunctionLike,
-	ApiModifier,
+	type ApiFunctionLike,
+	type ApiModifier,
 	getDefaultValueBlock,
-	getLinkForApiItem,
 	getModifiers,
-	isDeprecated,
-} from "../../utilities";
-import { transformDocSection } from "../DocNodeTransforms";
-import { getDocNodeTransformationOptions } from "../Utilities";
-import { createExcerptSpanWithHyperlinks } from "./Helpers";
+	injectSeparator,
+} from "../../utilities/index.js";
+import { getLinkForApiItem } from "../ApiItemTransformUtilities.js";
+import { transformTsdocSection } from "../TsdocNodeTransforms.js";
+import { getTsdocNodeTransformationOptions } from "../Utilities.js";
+import type { ApiItemTransformationConfiguration } from "../configuration/index.js";
+
+import { createExcerptSpanWithHyperlinks } from "./Helpers.js";
 
 /**
  * Input properties for creating a table of API members
@@ -85,11 +85,11 @@ export interface TableCreationOptions {
  * item, organized by kind.
  *
  * @param memberTableProperties - List of table configurations.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createMemberTables(
 	memberTableProperties: readonly MemberTableProperties[],
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): SectionNode[] | undefined {
 	const sections: SectionNode[] = [];
 
@@ -107,11 +107,11 @@ export function createMemberTables(
  * Creates a simple section containing a heading and a table, based on the provided properties.
  *
  * @param memberTableProperties - The table configuration.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createTableWithHeading(
 	memberTableProperties: MemberTableProperties,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): SectionNode | undefined {
 	const table = createSummaryTable(
 		memberTableProperties.items,
@@ -136,13 +136,13 @@ export function createTableWithHeading(
  *
  * @param apiItems - The items to be displayed. All of these items must be of the kind specified via `itemKind`.
  * @param itemKind - The kind of items being displayed in the table. Used to determine the semantic shape of the table.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  * @param options - Table content / formatting options.
  */
 export function createSummaryTable(
 	apiItems: readonly ApiItem[],
 	itemKind: ApiItemKind,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 	options?: TableCreationOptions,
 ): TableNode | undefined {
 	if (itemKind === ApiItemKind.Model || itemKind === ApiItemKind.EntryPoint) {
@@ -160,30 +160,31 @@ export function createSummaryTable(
 		case ApiItemKind.Constructor:
 		case ApiItemKind.Function:
 		case ApiItemKind.Method:
-		case ApiItemKind.MethodSignature:
+		case ApiItemKind.MethodSignature: {
 			return createFunctionLikeSummaryTable(
-				apiItems.map((apiItem) => apiItem as ApiFunctionLike),
+				apiItems as ApiFunctionLike[],
 				itemKind,
 				config,
 				options,
 			);
+		}
 
 		case ApiItemKind.Property:
-		case ApiItemKind.PropertySignature:
-			return createPropertiesTable(
-				apiItems.map((apiItem) => apiItem as ApiPropertyItem),
-				config,
-				options,
-			);
+		case ApiItemKind.PropertySignature: {
+			return createPropertiesTable(apiItems as ApiPropertyItem[], config, options);
+		}
 
-		case ApiItemKind.Package:
-			return createPackagesTable(
-				apiItems.map((apiItem) => apiItem as ApiPackage),
-				config,
-			);
+		case ApiItemKind.Variable: {
+			return createVariablesTable(apiItems as ApiVariable[], config, options);
+		}
 
-		default:
+		case ApiItemKind.Package: {
+			return createPackagesTable(apiItems as ApiPackage[], config);
+		}
+
+		default: {
 			return createDefaultSummaryTable(apiItems, itemKind, config, options);
+		}
 	}
 }
 
@@ -192,21 +193,22 @@ export function createSummaryTable(
  *
  * @param apiItems - The items to be displayed. All of these items must be of the kind specified via `itemKind`.
  * @param itemKind - The kind of items being displayed in the table. Used to determine the semantic shape of the table.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  * @param options - Table content / formatting options.
  */
 export function createDefaultSummaryTable(
 	apiItems: readonly ApiItem[],
 	itemKind: ApiItemKind,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 	options?: TableCreationOptions,
 ): TableNode | undefined {
 	if (apiItems.length === 0) {
 		return undefined;
 	}
 
-	// Only display "Alerts" column if there are any deprecated items in the list.
-	const hasDeprecated = apiItems.some((element) => isDeprecated(element));
+	// Only display "Alerts" column if there are any alerts to display.
+	const alerts = apiItems.map((apiItem) => config.getAlertsForItem(apiItem));
+	const hasAlerts = alerts.some((itemAlerts) => itemAlerts.length > 0);
 
 	// Only display "Modifiers" column if there are any modifiers to display.
 	const hasModifiers = apiItems.some(
@@ -216,7 +218,7 @@ export function createDefaultSummaryTable(
 	const headerRowCells: TableHeaderCellNode[] = [
 		TableHeaderCellNode.createFromPlainText(getTableHeadingTitleForApiKind(itemKind)),
 	];
-	if (hasDeprecated) {
+	if (hasAlerts) {
 		headerRowCells.push(TableHeaderCellNode.createFromPlainText("Alerts"));
 	}
 	if (hasModifiers) {
@@ -226,15 +228,15 @@ export function createDefaultSummaryTable(
 	const headerRow = new TableHeaderRowNode(headerRowCells);
 
 	const bodyRows: TableBodyRowNode[] = [];
-	for (const apiItem of apiItems) {
-		const bodyRowCells: TableBodyCellNode[] = [createApiTitleCell(apiItem, config)];
-		if (hasDeprecated) {
-			bodyRowCells.push(createDeprecatedCell(apiItem));
+	for (let i = 0; i < apiItems.length; i++) {
+		const bodyRowCells: TableBodyCellNode[] = [createApiTitleCell(apiItems[i], config)];
+		if (hasAlerts) {
+			bodyRowCells.push(createAlertsCell(alerts[i]));
 		}
 		if (hasModifiers) {
-			bodyRowCells.push(createModifiersCell(apiItem, options?.modifiersToOmit));
+			bodyRowCells.push(createModifiersCell(apiItems[i], options?.modifiersToOmit));
 		}
-		bodyRowCells.push(createApiSummaryCell(apiItem, config));
+		bodyRowCells.push(createApiSummaryCell(apiItems[i], config));
 
 		bodyRows.push(new TableBodyRowNode(bodyRowCells));
 	}
@@ -248,12 +250,12 @@ export function createDefaultSummaryTable(
  *
  * @param apiParameters - The items to be displayed. All of these items must be of the kind specified via `itemKind`.
  * @param contextApiItem - The API item with which the parameter is associated.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createParametersSummaryTable(
 	apiParameters: readonly Parameter[],
 	contextApiItem: ApiItem,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): TableNode {
 	// Only display "Modifiers" column if there are any optional parameters present.
 	const hasOptionalParameters = apiParameters.some((apiParameter) => apiParameter.isOptional);
@@ -295,31 +297,53 @@ export function createParametersSummaryTable(
  *
  * @param apiTypeParameters - The items to be displayed. All of these items must be of the kind specified via `itemKind`.
  * @param contextApiItem - The API item with which the parameter is associated.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createTypeParametersSummaryTable(
 	apiTypeParameters: readonly TypeParameter[],
 	contextApiItem: ApiItem,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): TableNode {
-	// Only display "Modifiers" column if there are any optional parameters present.
-	const hasOptionalParameters = apiTypeParameters.some(
-		(apiTypeParameter) => apiTypeParameter.isOptional,
+	// Only display the "Constraint" column if there are any constraints present among the type parameters.
+	const hasAnyConstraints = apiTypeParameters.some(
+		(apiTypeParameter) => !apiTypeParameter.constraintExcerpt.isEmpty,
+	);
+
+	// Only display the "Default" column if there are any defaults present among the type parameters.
+	const hasAnyDefaults = apiTypeParameters.some(
+		(apiTypeParameter) => !apiTypeParameter.defaultTypeExcerpt.isEmpty,
 	);
 
 	const headerRowCells: TableHeaderCellNode[] = [
 		TableHeaderCellNode.createFromPlainText("Parameter"),
 	];
-	if (hasOptionalParameters) {
-		headerRowCells.push(TableHeaderCellNode.createFromPlainText("Modifiers"));
+	if (hasAnyConstraints) {
+		headerRowCells.push(TableHeaderCellNode.createFromPlainText("Constraint"));
+	}
+	if (hasAnyDefaults) {
+		headerRowCells.push(TableHeaderCellNode.createFromPlainText("Default"));
 	}
 	headerRowCells.push(TableHeaderCellNode.createFromPlainText("Description"));
 	const headerRow = new TableHeaderRowNode(headerRowCells);
 
-	function createModifierCell(apiParameter: TypeParameter): TableBodyCellNode {
-		return apiParameter.isOptional
-			? TableBodyCellNode.createFromPlainText("optional")
-			: TableBodyCellNode.Empty;
+	function createTypeConstraintCell(apiParameter: TypeParameter): TableBodyCellNode {
+		const constraintSpan = createExcerptSpanWithHyperlinks(
+			apiParameter.constraintExcerpt,
+			config,
+		);
+		return constraintSpan === undefined
+			? TableBodyCellNode.Empty
+			: new TableBodyCellNode([constraintSpan]);
+	}
+
+	function createTypeDefaultCell(apiParameter: TypeParameter): TableBodyCellNode {
+		const excerptSpan = createExcerptSpanWithHyperlinks(
+			apiParameter.defaultTypeExcerpt,
+			config,
+		);
+		return excerptSpan === undefined
+			? TableBodyCellNode.Empty
+			: new TableBodyCellNode([excerptSpan]);
 	}
 
 	const bodyRows: TableBodyRowNode[] = [];
@@ -327,8 +351,11 @@ export function createTypeParametersSummaryTable(
 		const bodyRowCells: TableBodyCellNode[] = [
 			TableBodyCellNode.createFromPlainText(apiTypeParameter.name),
 		];
-		if (hasOptionalParameters) {
-			bodyRowCells.push(createModifierCell(apiTypeParameter));
+		if (hasAnyConstraints) {
+			bodyRowCells.push(createTypeConstraintCell(apiTypeParameter));
+		}
+		if (hasAnyDefaults) {
+			bodyRowCells.push(createTypeDefaultCell(apiTypeParameter));
 		}
 		bodyRowCells.push(createTypeParameterSummaryCell(apiTypeParameter, contextApiItem, config));
 
@@ -344,21 +371,22 @@ export function createTypeParametersSummaryTable(
  *
  * @param apiItems - The function-like items to be displayed.
  * @param itemKind - The kind of items being rendered in the table. Used to determine the semantic shape of the table.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  * @param options - Table content / formatting options.
  */
 export function createFunctionLikeSummaryTable(
 	apiItems: readonly ApiFunctionLike[],
 	itemKind: ApiItemKind,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 	options?: TableCreationOptions,
 ): TableNode | undefined {
 	if (apiItems.length === 0) {
 		return undefined;
 	}
 
-	// Only display "Alerts" column if there are any deprecated items in the list.
-	const hasDeprecated = apiItems.some((element) => isDeprecated(element));
+	// Only display "Alerts" column if there are any alerts to display.
+	const alerts = apiItems.map((apiItem) => config.getAlertsForItem(apiItem));
+	const hasAlerts = alerts.some((itemAlerts) => itemAlerts.length > 0);
 
 	// Only display "Modifiers" column if there are any modifiers to display.
 	const hasModifiers = apiItems.some(
@@ -369,7 +397,7 @@ export function createFunctionLikeSummaryTable(
 	const headerRowCells: TableHeaderCellNode[] = [
 		TableHeaderCellNode.createFromPlainText(getTableHeadingTitleForApiKind(itemKind)),
 	];
-	if (hasDeprecated) {
+	if (hasAlerts) {
 		headerRowCells.push(TableHeaderCellNode.createFromPlainText("Alerts"));
 	}
 	if (hasModifiers) {
@@ -382,18 +410,18 @@ export function createFunctionLikeSummaryTable(
 	const headerRow = new TableHeaderRowNode(headerRowCells);
 
 	const bodyRows: TableBodyRowNode[] = [];
-	for (const apiItem of apiItems) {
-		const bodyRowCells: TableBodyCellNode[] = [createApiTitleCell(apiItem, config)];
-		if (hasDeprecated) {
-			bodyRowCells.push(createDeprecatedCell(apiItem));
+	for (let i = 0; i < apiItems.length; i++) {
+		const bodyRowCells: TableBodyCellNode[] = [createApiTitleCell(apiItems[i], config)];
+		if (hasAlerts) {
+			bodyRowCells.push(createAlertsCell(alerts[i]));
 		}
 		if (hasModifiers) {
-			bodyRowCells.push(createModifiersCell(apiItem, options?.modifiersToOmit));
+			bodyRowCells.push(createModifiersCell(apiItems[i], options?.modifiersToOmit));
 		}
 		if (hasReturnTypes) {
-			bodyRowCells.push(createReturnTypeCell(apiItem, config));
+			bodyRowCells.push(createReturnTypeCell(apiItems[i], config));
 		}
-		bodyRowCells.push(createApiSummaryCell(apiItem, config));
+		bodyRowCells.push(createApiSummaryCell(apiItems[i], config));
 
 		bodyRows.push(new TableBodyRowNode(bodyRowCells));
 	}
@@ -406,33 +434,34 @@ export function createFunctionLikeSummaryTable(
  * Displays each property's name, modifiers, type, and description (summary) comment.
  *
  * @param apiProperties - The `Property` items to be displayed.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  * @param options - Table content / formatting options.
  */
 export function createPropertiesTable(
 	apiProperties: readonly ApiPropertyItem[],
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 	options?: TableCreationOptions,
 ): TableNode | undefined {
 	if (apiProperties.length === 0) {
 		return undefined;
 	}
 
-	// Only display "Alerts" column if there are any deprecated items in the list.
-	const hasDeprecated = apiProperties.some((element) => isDeprecated(element));
+	// Only display "Alerts" column if there are any alerts to display.
+	const alerts = apiProperties.map((apiItem) => config.getAlertsForItem(apiItem));
+	const hasAlerts = alerts.some((itemAlerts) => itemAlerts.length > 0);
 
 	// Only display "Modifiers" column if there are any modifiers to display.
 	const hasModifiers = apiProperties.some(
 		(apiItem) => getModifiers(apiItem, options?.modifiersToOmit).length > 0,
 	);
 	const hasDefaultValues = apiProperties.some(
-		(apiItem) => getDefaultValueBlock(apiItem, config) !== undefined,
+		(apiItem) => getDefaultValueBlock(apiItem, config.logger) !== undefined,
 	);
 
 	const headerRowCells: TableHeaderCellNode[] = [
 		TableHeaderCellNode.createFromPlainText("Property"),
 	];
-	if (hasDeprecated) {
+	if (hasAlerts) {
 		headerRowCells.push(TableHeaderCellNode.createFromPlainText("Alerts"));
 	}
 	if (hasModifiers) {
@@ -446,19 +475,76 @@ export function createPropertiesTable(
 	const headerRow = new TableHeaderRowNode(headerRowCells);
 
 	const bodyRows: TableBodyRowNode[] = [];
-	for (const apiProperty of apiProperties) {
-		const bodyRowCells: TableBodyCellNode[] = [createApiTitleCell(apiProperty, config)];
-		if (hasDeprecated) {
-			bodyRowCells.push(createDeprecatedCell(apiProperty));
+	for (let i = 0; i < apiProperties.length; i++) {
+		const bodyRowCells: TableBodyCellNode[] = [createApiTitleCell(apiProperties[i], config)];
+		if (hasAlerts) {
+			bodyRowCells.push(createAlertsCell(alerts[i]));
 		}
 		if (hasModifiers) {
-			bodyRowCells.push(createModifiersCell(apiProperty, options?.modifiersToOmit));
+			bodyRowCells.push(createModifiersCell(apiProperties[i], options?.modifiersToOmit));
 		}
 		if (hasDefaultValues) {
-			bodyRowCells.push(createDefaultValueCell(apiProperty, config));
+			bodyRowCells.push(createDefaultValueCell(apiProperties[i], config));
 		}
-		bodyRowCells.push(createPropertyTypeCell(apiProperty, config));
-		bodyRowCells.push(createApiSummaryCell(apiProperty, config));
+		bodyRowCells.push(createTypeExcerptCell(apiProperties[i].propertyTypeExcerpt, config));
+		bodyRowCells.push(createApiSummaryCell(apiProperties[i], config));
+
+		bodyRows.push(new TableBodyRowNode(bodyRowCells));
+	}
+
+	return new TableNode(bodyRows, headerRow);
+}
+
+/**
+ * Creates a simple summary table for a series of variable items.
+ * Displays each variable's name, modifiers, type, and description (summary) comment.
+ *
+ * @param apiVariables - The `Variable` items to be displayed.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
+ * @param options - Table content / formatting options.
+ */
+export function createVariablesTable(
+	apiVariables: readonly ApiVariable[],
+	config: ApiItemTransformationConfiguration,
+	options?: TableCreationOptions,
+): TableNode | undefined {
+	if (apiVariables.length === 0) {
+		return undefined;
+	}
+
+	// Only display "Alerts" column if there are any alerts to display.
+	const alerts = apiVariables.map((apiItem) => config.getAlertsForItem(apiItem));
+	const hasAlerts = alerts.some((itemAlerts) => itemAlerts.length > 0);
+
+	// Only display "Modifiers" column if there are any modifiers to display.
+	const hasModifiers = apiVariables.some(
+		(apiItem) => getModifiers(apiItem, options?.modifiersToOmit).length > 0,
+	);
+
+	const headerRowCells: TableHeaderCellNode[] = [
+		TableHeaderCellNode.createFromPlainText("Variable"),
+	];
+	if (hasAlerts) {
+		headerRowCells.push(TableHeaderCellNode.createFromPlainText("Alerts"));
+	}
+	if (hasModifiers) {
+		headerRowCells.push(TableHeaderCellNode.createFromPlainText("Modifiers"));
+	}
+	headerRowCells.push(TableHeaderCellNode.createFromPlainText("Type"));
+	headerRowCells.push(TableHeaderCellNode.createFromPlainText("Description"));
+	const headerRow = new TableHeaderRowNode(headerRowCells);
+
+	const bodyRows: TableBodyRowNode[] = [];
+	for (let i = 0; i < apiVariables.length; i++) {
+		const bodyRowCells: TableBodyCellNode[] = [createApiTitleCell(apiVariables[i], config)];
+		if (hasAlerts) {
+			bodyRowCells.push(createAlertsCell(alerts[i]));
+		}
+		if (hasModifiers) {
+			bodyRowCells.push(createModifiersCell(apiVariables[i], options?.modifiersToOmit));
+		}
+		bodyRowCells.push(createTypeExcerptCell(apiVariables[i].variableTypeExcerpt, config));
+		bodyRowCells.push(createApiSummaryCell(apiVariables[i], config));
 
 		bodyRows.push(new TableBodyRowNode(bodyRowCells));
 	}
@@ -472,35 +558,36 @@ export function createPropertiesTable(
  * ({@link https://tsdoc.org/pages/tags/packagedocumentation/ | @packageDocumentation}) comment.
  *
  * @param apiPackages - The package items to be displayed.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createPackagesTable(
 	apiPackages: readonly ApiPackage[],
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): TableNode | undefined {
 	if (apiPackages.length === 0) {
 		return undefined;
 	}
 
-	// Only display "Alerts" column if there are any deprecated items in the list.
-	const hasDeprecated = apiPackages.some((element) => isDeprecated(element));
+	// Only display "Alerts" column if there are any alerts to display.
+	const alerts = apiPackages.map((apiItem) => config.getAlertsForItem(apiItem));
+	const hasAlerts = alerts.some((itemAlerts) => itemAlerts.length > 0);
 
 	const headerRowCells: TableHeaderCellNode[] = [
 		TableHeaderCellNode.createFromPlainText("Package"),
 	];
-	if (hasDeprecated) {
+	if (hasAlerts) {
 		headerRowCells.push(TableHeaderCellNode.createFromPlainText("Alerts"));
 	}
 	headerRowCells.push(TableHeaderCellNode.createFromPlainText("Description"));
 	const headerRow = new TableHeaderRowNode(headerRowCells);
 
 	const bodyRows: TableBodyRowNode[] = [];
-	for (const apiPackage of apiPackages) {
-		const bodyRowCells: TableBodyCellNode[] = [createApiTitleCell(apiPackage, config)];
-		if (hasDeprecated) {
-			bodyRowCells.push(createDeprecatedCell(apiPackage));
+	for (let i = 0; i < apiPackages.length; i++) {
+		const bodyRowCells: TableBodyCellNode[] = [createApiTitleCell(apiPackages[i], config)];
+		if (hasAlerts) {
+			bodyRowCells.push(createAlertsCell(alerts[i]));
 		}
-		bodyRowCells.push(createApiSummaryCell(apiPackage, config));
+		bodyRowCells.push(createApiSummaryCell(apiPackages[i], config));
 
 		bodyRows.push(new TableBodyRowNode(bodyRowCells));
 	}
@@ -513,35 +600,24 @@ export function createPackagesTable(
  * If the item has an `@beta` release tag, the comment will be annotated as being beta content.
  *
  * @param apiItem - The API item whose comment will be rendered in the cell.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createApiSummaryCell(
 	apiItem: ApiItem,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): TableBodyCellNode {
-	const contents: DocumentationNode[] = [];
-
-	if (ApiReleaseTagMixin.isBaseClassOf(apiItem) && apiItem.releaseTag === ReleaseTag.Beta) {
-		contents.push(
-			new SpanNode([new PlainTextNode("(BETA)")], {
-				bold: true,
-				italic: true,
-			}),
-		);
-	}
-
 	if (apiItem instanceof ApiDocumentedItem) {
-		const docNodeTransformOptions = getDocNodeTransformationOptions(apiItem, config);
+		const tsdocNodeTransformOptions = getTsdocNodeTransformationOptions(apiItem, config);
 		if (apiItem.tsdocComment !== undefined) {
-			const summaryComment = transformDocSection(
+			const summaryComment = transformTsdocSection(
 				apiItem.tsdocComment.summarySection,
-				docNodeTransformOptions,
+				tsdocNodeTransformOptions,
 			);
-			contents.push(...summaryComment.children);
+			return new TableBodyCellNode(summaryComment.children);
 		}
 	}
 
-	return contents.length === 0 ? TableBodyCellNode.Empty : new TableBodyCellNode(contents);
+	return TableBodyCellNode.Empty;
 }
 
 /**
@@ -552,11 +628,11 @@ export function createApiSummaryCell(
  * API suite (model).
  *
  * @param apiItem - The API item whose return type will be displayed in the cell.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createReturnTypeCell(
 	apiItem: ApiFunctionLike,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): TableBodyCellNode {
 	return ApiReturnTypeMixin.isBaseClassOf(apiItem)
 		? createTypeExcerptCell(apiItem.returnTypeExcerpt, config)
@@ -570,11 +646,11 @@ export function createReturnTypeCell(
  *
  * @param apiItem - The API item whose name will be displayed in the cell, and to whose content the generate link
  * will point.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createApiTitleCell(
 	apiItem: ApiItem,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): TableBodyCellNode {
 	const itemLink = getLinkForApiItem(apiItem, config);
 	return new TableBodyCellNode([LinkNode.createFromPlainTextLink(itemLink)]);
@@ -609,21 +685,21 @@ export function createModifiersCell(
  * Creates a table cell containing the `@defaultValue` comment of the API item if it has one.
  *
  * @param apiItem - The API item whose `@defaultValue` comment will be displayed in the cell.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createDefaultValueCell(
 	apiItem: ApiItem,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): TableBodyCellNode {
-	const docNodeTransformOptions = getDocNodeTransformationOptions(apiItem, config);
+	const tsdocNodeTransformOptions = getTsdocNodeTransformationOptions(apiItem, config);
 
-	const defaultValueSection = getDefaultValueBlock(apiItem, config);
+	const defaultValueSection = getDefaultValueBlock(apiItem, config.logger);
 
 	if (defaultValueSection === undefined) {
 		return TableBodyCellNode.Empty;
 	}
 
-	const contents = transformDocSection(defaultValueSection, docNodeTransformOptions);
+	const contents = transformTsdocSection(defaultValueSection, tsdocNodeTransformOptions);
 
 	// Since we are sticking the contents into a table cell, we can remove the outer Paragraph node
 	// from the hierarchy to simplify things.
@@ -631,32 +707,19 @@ export function createDefaultValueCell(
 }
 
 /**
- * Creates a table cell noting that the item is deprecated if it is annotated with an `@deprecated` comment.
- * Will use an empty table cell otherwise.
+ * Creates a table cell containing the provided alerts, displayed as comma-separated codespan nodes.
  *
- * @param apiItem - The API item for which the deprecation notice will be displayed if appropriate.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param apiItem - The alert values to display.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
-export function createDeprecatedCell(apiItem: ApiItem): TableBodyCellNode {
-	return isDeprecated(apiItem)
-		? new TableBodyCellNode([CodeSpanNode.createFromPlainText("DEPRECATED")])
-		: TableBodyCellNode.Empty;
-}
+export function createAlertsCell(alerts: string[]): TableBodyCellNode {
+	const alertNodes: DocumentationNode[] = alerts.map((alert) =>
+		CodeSpanNode.createFromPlainText(alert),
+	);
 
-/**
- * Creates a table cell containing the type information about the provided property.
- *
- * @remarks This content will be generated as links to type signature documentation for other items local to the same
- * API suite (model).
- *
- * @param apiProperty - The property whose type information will be displayed in the cell.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
- */
-export function createPropertyTypeCell(
-	apiProperty: ApiPropertyItem,
-	config: Required<MarkdownDocumenterConfiguration>,
-): TableBodyCellNode {
-	return createTypeExcerptCell(apiProperty.propertyTypeExcerpt, config);
+	return alerts.length === 0
+		? TableBodyCellNode.Empty
+		: new TableBodyCellNode(injectSeparator(alertNodes, new PlainTextNode(", ")));
 }
 
 /**
@@ -675,11 +738,11 @@ export function createParameterTitleCell(apiParameter: Parameter): TableBodyCell
  * API suite (model).
  *
  * @param apiProperty - The parameter whose type information will be displayed in the cell.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createParameterTypeCell(
 	apiParameter: Parameter,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): TableBodyCellNode {
 	return createTypeExcerptCell(apiParameter.parameterTypeExcerpt, config);
 }
@@ -691,22 +754,22 @@ export function createParameterTypeCell(
  *
  * @param apiParameter - The parameter whose comment will be displayed in the cell.
  * @param contextApiItem - The API item with which the parameter is associated.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createParameterSummaryCell(
 	apiParameter: Parameter,
 	contextApiItem: ApiItem,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): TableBodyCellNode {
 	if (apiParameter.tsdocParamBlock === undefined) {
 		return TableBodyCellNode.Empty;
 	}
 
-	const docNodeTransformOptions = getDocNodeTransformationOptions(contextApiItem, config);
+	const tsdocNodeTransformOptions = getTsdocNodeTransformationOptions(contextApiItem, config);
 
-	const cellContent = transformDocSection(
+	const cellContent = transformTsdocSection(
 		apiParameter.tsdocParamBlock.content,
-		docNodeTransformOptions,
+		tsdocNodeTransformOptions,
 	);
 
 	// Since we are putting the contents into a table cell anyways, omit the Paragraph
@@ -721,22 +784,22 @@ export function createParameterSummaryCell(
  *
  * @param apiTypeParameter - The type parameter whose comment will be displayed in the cell.
  * @param contextApiItem - The API item with which the parameter is associated.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createTypeParameterSummaryCell(
 	apiTypeParameter: TypeParameter,
 	contextApiItem: ApiItem,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): TableBodyCellNode {
 	if (apiTypeParameter.tsdocTypeParamBlock === undefined) {
 		return TableBodyCellNode.Empty;
 	}
 
-	const docNodeTransformOptions = getDocNodeTransformationOptions(contextApiItem, config);
+	const tsdocNodeTransformOptions = getTsdocNodeTransformationOptions(contextApiItem, config);
 
-	const cellContent = transformDocSection(
+	const cellContent = transformTsdocSection(
 		apiTypeParameter.tsdocTypeParamBlock.content,
-		docNodeTransformOptions,
+		tsdocNodeTransformOptions,
 	);
 
 	// Since we are putting the contents into a table cell anyways, omit the Paragraph
@@ -750,11 +813,11 @@ export function createTypeParameterSummaryCell(
  * API suite (model).
  *
  * @param typeExcerpty - An excerpt describing the type to be displayed in the cell.
- * @param config - See {@link MarkdownDocumenterConfiguration}.
+ * @param config - See {@link ApiItemTransformationConfiguration}.
  */
 export function createTypeExcerptCell(
 	typeExcerpt: Excerpt,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 ): TableBodyCellNode {
 	const excerptSpan = createExcerptSpanWithHyperlinks(typeExcerpt, config);
 	return excerptSpan === undefined
@@ -767,13 +830,17 @@ export function createTypeExcerptCell(
  */
 function getTableHeadingTitleForApiKind(itemKind: ApiItemKind): string {
 	switch (itemKind) {
-		case ApiItemKind.EnumMember:
+		case ApiItemKind.EnumMember: {
 			return "Flag";
-		case ApiItemKind.MethodSignature:
+		}
+		case ApiItemKind.MethodSignature: {
 			return ApiItemKind.Method;
-		case ApiItemKind.PropertySignature:
+		}
+		case ApiItemKind.PropertySignature: {
 			return ApiItemKind.Property;
-		default:
+		}
+		default: {
 			return itemKind;
+		}
 	}
 }

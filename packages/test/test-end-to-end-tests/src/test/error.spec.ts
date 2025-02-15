@@ -4,23 +4,28 @@
  */
 
 import { strict as assert } from "assert";
-import { v4 as uuid } from "uuid";
-import { Container, ILoaderProps, Loader } from "@fluidframework/container-loader";
-import { IDocumentServiceFactory, IResolvedUrl } from "@fluidframework/driver-definitions";
-import { createOdspNetworkError } from "@fluidframework/odsp-doclib-utils";
-import { isILoggingError, normalizeError } from "@fluidframework/telemetry-utils";
+
+import { describeCompat, itExpects } from "@fluid-private/test-version-utils";
+import { ContainerErrorTypes } from "@fluidframework/container-definitions/internal";
+import { ILoaderProps, Loader } from "@fluidframework/container-loader/internal";
 import {
-	LocalCodeLoader,
-	LoaderContainerTracker,
+	IDocumentServiceFactory,
+	IResolvedUrl,
+} from "@fluidframework/driver-definitions/internal";
+import { createOdspNetworkError } from "@fluidframework/odsp-doclib-utils/internal";
+import { isILoggingError, normalizeError } from "@fluidframework/telemetry-utils/internal";
+import {
 	ITestObjectProvider,
+	LoaderContainerTracker,
+	LocalCodeLoader,
 	TestFluidObjectFactory,
-} from "@fluidframework/test-utils";
-import { describeNoCompat, itExpects } from "@fluidframework/test-version-utils";
-import { ensureFluidResolvedUrl } from "@fluidframework/driver-utils";
-import { ContainerErrorType } from "@fluidframework/container-definitions";
+} from "@fluidframework/test-utils/internal";
+import { v4 as uuid } from "uuid";
+
+import { wrapObjectAndOverride } from "../mocking.js";
 
 // REVIEW: enable compat testing?
-describeNoCompat("Errors Types", (getTestObjectProvider) => {
+describeCompat("Errors Types", "NoCompat", (getTestObjectProvider) => {
 	let provider: ITestObjectProvider;
 	let fileName: string;
 	let containerUrl: IResolvedUrl;
@@ -29,7 +34,7 @@ describeNoCompat("Errors Types", (getTestObjectProvider) => {
 		provider = getTestObjectProvider();
 	});
 
-	beforeEach(async () => {
+	beforeEach("setup", async () => {
 		const loader = new Loader({
 			logger: provider.logger,
 			urlResolver: provider.urlResolver,
@@ -39,8 +44,8 @@ describeNoCompat("Errors Types", (getTestObjectProvider) => {
 			]),
 		});
 		fileName = uuid();
-		loaderContainerTracker.add(loader);
 		const container = await loader.createDetachedContainer(provider.defaultCodeDetails);
+		loaderContainerTracker.addContainer(container);
 		await container.attach(provider.driver.createCreateNewRequest(fileName));
 		assert(container.resolvedUrl);
 		containerUrl = container.resolvedUrl;
@@ -55,22 +60,15 @@ describeNoCompat("Errors Types", (getTestObjectProvider) => {
 			...props,
 			logger: provider.logger,
 			urlResolver: props?.urlResolver ?? provider.urlResolver,
-			documentServiceFactory:
-				props?.documentServiceFactory ?? provider.documentServiceFactory,
+			documentServiceFactory: props?.documentServiceFactory ?? provider.documentServiceFactory,
 			codeLoader:
 				props?.codeLoader ??
-				new LocalCodeLoader([
-					[provider.defaultCodeDetails, new TestFluidObjectFactory([])],
-				]),
+				new LocalCodeLoader([[provider.defaultCodeDetails, new TestFluidObjectFactory([])]]),
 		});
-		loaderContainerTracker.add(loader);
 		const requestUrl = await provider.driver.createContainerUrl(fileName, containerUrl);
-		const testResolved = await loader.services.urlResolver.resolve({ url: requestUrl });
-		ensureFluidResolvedUrl(testResolved);
-		return Container.load(loader, {
-			resolvedUrl: testResolved,
-			version: undefined,
-		});
+		const container = await loader.resolve({ url: requestUrl });
+		loaderContainerTracker.addContainer(container);
+		return container;
 	}
 
 	itExpects(
@@ -78,38 +76,73 @@ describeNoCompat("Errors Types", (getTestObjectProvider) => {
 		[
 			{
 				eventName: "fluid:telemetry:Container:ContainerClose",
-				errorType: ContainerErrorType.genericError,
-				error: "Injected error",
-				fatalConnectError: true,
-			},
-			{
-				eventName: "fluid:telemetry:Container:ContainerDispose",
-				errorType: ContainerErrorType.genericError,
+				errorType: ContainerErrorTypes.genericError,
 				error: "Injected error",
 				fatalConnectError: true,
 			},
 		],
 		async () => {
 			try {
-				const documentServiceFactory = provider.documentServiceFactory;
-				const mockFactory = Object.create(
-					documentServiceFactory,
-				) as IDocumentServiceFactory;
-				mockFactory.createDocumentService = async (resolvedUrl) => {
-					const service = await documentServiceFactory.createDocumentService(resolvedUrl);
-					service.connectToDeltaStream = async () => {
-						throw new Error("Injected error");
-					};
-					return service;
-				};
+				const mockFactory = wrapObjectAndOverride<IDocumentServiceFactory>(
+					provider.documentServiceFactory,
+					{
+						createDocumentService: {
+							connectToDeltaStream: () => () => {
+								throw new Error("Injected error");
+							},
+						},
+					},
+				);
+
 				await loadContainer({ documentServiceFactory: mockFactory });
 			} catch (e: any) {
-				assert(e.errorType === ContainerErrorType.genericError);
+				assert(e.errorType === ContainerErrorTypes.genericError);
 				assert(e.message === "Injected error");
 				assert(e.fatalConnectError);
 			}
 		},
 	);
+
+	it("Clear odsp driver cache on critical load error", async function () {
+		if (provider.driver.type !== "odsp") {
+			this.skip();
+		}
+		const documentServiceFactory = provider.documentServiceFactory;
+		// eslint-disable-next-line @typescript-eslint/dot-notation
+		const cache = documentServiceFactory["persistedCache"];
+		const cacheFileEntry = {
+			type: "snapshot",
+			key: "",
+			file: {
+				resolvedUrl: containerUrl,
+				docId: containerUrl.id,
+			},
+		};
+		assert(
+			(await cache?.get?.(cacheFileEntry)) !== undefined,
+			"create container should have cached the snapshot",
+		);
+		try {
+			const mockFactory = wrapObjectAndOverride<IDocumentServiceFactory>(
+				provider.documentServiceFactory,
+				{
+					createDocumentService: {
+						connectToStorage: () => () => {
+							throw new Error("Injected error");
+						},
+					},
+				},
+			);
+			await loadContainer({ documentServiceFactory: mockFactory });
+		} catch (e: any) {
+			assert(e.errorType === ContainerErrorTypes.genericError);
+			assert(e.message === "Injected error");
+		}
+		assert(
+			(await cache?.get?.(cacheFileEntry)) === undefined,
+			"odsp cache should have been cleared on critical error/container dispose",
+		);
+	});
 
 	function assertCustomPropertySupport(err: any) {
 		err.asdf = "asdf";

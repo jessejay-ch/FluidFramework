@@ -3,27 +3,27 @@
  * Licensed under the MIT License.
  */
 
-import { IDisposable } from "@fluidframework/common-definitions";
+import { TypedEventEmitter } from "@fluid-internal/client-utils";
+import { IDisposable } from "@fluidframework/core-interfaces";
+import { delay } from "@fluidframework/core-utils/internal";
+import { ConnectionMode } from "@fluidframework/driver-definitions";
 import {
 	IDocumentDeltaConnection,
-	IDocumentDeltaStorageService,
 	IDocumentDeltaConnectionEvents,
+	IDocumentDeltaStorageService,
 	IDocumentService,
-} from "@fluidframework/driver-definitions";
-import {
-	ConnectionMode,
 	IClientConfiguration,
 	IConnected,
 	IDocumentMessage,
-	ISequencedDocumentMessage,
 	ISignalClient,
-	ISignalMessage,
 	ITokenClaims,
 	IVersion,
 	ScopeType,
-} from "@fluidframework/protocol-definitions";
-import { delay, TypedEventEmitter } from "@fluidframework/common-utils";
-import { ReplayController } from "./replayController";
+	ISequencedDocumentMessage,
+	ISignalMessage,
+} from "@fluidframework/driver-definitions/internal";
+
+import { ReplayController } from "./replayController.js";
 
 const ReplayDocumentId = "documentId";
 
@@ -67,7 +67,7 @@ export class ReplayControllerStatic extends ReplayController {
 	}
 
 	public async readBlob(blobId: string): Promise<ArrayBufferLike> {
-		return Promise.reject(new Error("Invalid operation"));
+		throw new Error("Invalid operation");
 	}
 
 	public async getStartingOpSequence(): Promise<number> {

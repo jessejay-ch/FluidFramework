@@ -16,19 +16,15 @@ parameters:
   type: boolean
   default: false
 
-- name: nonScopedPackages
-  type: object
-  default: []
-
 - name: buildNumberInPatch
-  type: string
+  type: boolean
+  default: false
 
 variables:
 - group: prague-key-vault
+- group: ado-feeds
 - name: skipComponentGovernanceDetection
   value: true
-- name: pnpmStorePath
-  value: $(Pipeline.Workspace)/.pnpm-store
 - name: testBuild
   value: ${{ lower(startsWith(variables['Build.SourceBranch'], 'refs/heads/test/')) }}
 - name: shouldPublish
@@ -71,8 +67,6 @@ variables:
         eq(variables.shouldPublish, true)
       )
     )}}
-- name: componentDetection
-  value: ${{ variables.publish }}
 - name: pushImage
   value: ${{ variables.publish }}
 - name: releaseImage
@@ -81,14 +75,8 @@ variables:
       eq(variables.pushImage, true),
       eq(parameters.releaseImage, true)
     )}}
-- name: publishNonScopedPackages
-  value: ${{
-    ne(
-      length(parameters.nonScopedPackages),
-      0
-    )}}
 
-# Forbids occurrences of `.only` through @fluidframework/mocha-test-setup common config
+# Forbids occurrences of `.only` through @fluid-internal/mocha-test-setup common config
 - name: fluid.test.forbid.only
   value: true
 
@@ -103,3 +91,25 @@ variables:
 - ${{ if ne(parameters.releaseBuildOverride, 'none') }}:
   - name: release
     value: ${{ parameters.releaseBuildOverride }}
+
+# We use 'chalk' to colorize output, which auto-detects color support in the
+# running terminal.  The log output shown in Azure DevOps job runs only has
+# basic ANSI color support though, so force that in the pipeline
+- name: FORCE_COLOR
+  value: 1
+
+# Indicates if tests should be run with code coverage analysis.
+# We don't do it for PRs to make those runs faster.
+- name: testCoverage
+  value: ${{ ne(variables['Build.Reason'], 'PullRequest') }}
+  readonly: true
+
+- template: /tools/pipelines/templates/include-vars-telemetry-generator.yml@self
+
+# The way 1ES pipeline templates determine the default branch of a repository only works for repos hosted in ADO.
+# For repos hosted in Github, they fail to determine a default branch and set the current branch as default,
+# causing CodeQL tasks to run for all branches.
+# They add a significant amount of time to pipeline runs when they trigger, so we force-disable them for non-main branches.
+- ${{ if ne(variables['Build.SourceBranch'], 'refs/heads/main') }}:
+  - name: ONEES_ENFORCED_CODEQL_ENABLED
+    value: 'false'

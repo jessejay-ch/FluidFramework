@@ -15,23 +15,15 @@ Updates configuration for type tests in package.json files. If the previous vers
 
 ```
 USAGE
-  $ flub typetests [-v] [-d <value> | --packages | -g client|server|azure|build-tools] [--private | ] [--scope
-    <value> | -g client|server|azure|build-tools] [--reset] [-p | --exact <value> | -r | --disable] [-n | --enable]
+  $ flub typetests [-v | --quiet] [--reset] [-p | --exact <value> | -r | --disable] [-n | --enable]
+    [--concurrency <value>] [--branch <value> [--changed | [--all | --dir <value>... | --packages | -g
+    client|server|azure|build-tools|gitrest|historian|all... | --releaseGroupRoot
+    client|server|azure|build-tools|gitrest|historian|all...]]] [--private] [--scope <value>... | --skipScope
+    <value>...]
 
 FLAGS
-  -d, --dir=<value>
-      Run on the package in this directory. Cannot be used with --releaseGroup or --packages.
-
-  -g, --releaseGroup=<option>
-      Run on all packages within this release group. Cannot be used with --dir or --packages.
-      <options: client|server|azure|build-tools>
-
-  -g, --skipScope=<option>...
-      Package scopes to filter out.
-      <options: client|server|azure|build-tools>
-
   -n, --normalize
-      Removes any unrecognized data from "typeValidation" in the package.json
+      Removes any unrecognized data from "typeValidation" in the package.json and adds any missing default settings.
 
   -p, --previous
       Use the version immediately before the current version.
@@ -53,30 +45,49 @@ FLAGS
       Remove the test "-previous" version dependency. This is also done implicitly (without this flag) if type tests are
       disabled.
 
-  -v, --verbose
-      Verbose logging.
+  --concurrency=<value>
+      [default: 25] The number of tasks to execute concurrently.
 
   --disable
-      Set the "typeValidation.disabled" setting to "true" in the package.json
+      Set the "typeValidation.disabled" setting to "true" in the package.json.
 
   --enable
-      Remove the "typeValidation.disabled" setting in the package.json
+      Remove the "typeValidation.disabled" setting in the package.json.
 
   --exact=<value>
       An exact string to use as the previous version constraint. The string will be used as-is.
 
-  --packages
-      Run on all independent packages in the repo. This is an alternative to using the --dir flag for independent
-      packages.
-
-  --[no-]private
-      Only include private packages (or non-private packages for --no-private)
-
   --reset
       Resets the broken type test settings in package.json.
 
-  --scope=<value>...
-      Package scopes to filter to.
+PACKAGE SELECTION FLAGS
+  -g, --releaseGroup=<option>...      Run on all child packages within the specified release groups. This does not
+                                      include release group root packages. To include those, use the --releaseGroupRoot
+                                      argument. Cannot be used with --all.
+                                      <options: client|server|azure|build-tools|gitrest|historian|all>
+      --all                           Run on all packages and release groups. Cannot be used with --dir, --packages,
+                                      --releaseGroup, or --releaseGroupRoot.
+      --branch=<value>                [default: main] Select only packages that have been changed when compared to this
+                                      base branch. Can only be used with --changed.
+      --changed                       Select packages that have changed when compared to a base branch. Use the --branch
+                                      option to specify a different base branch. Cannot be used with --all.
+      --dir=<value>...                Run on the package in this directory. Cannot be used with --all.
+      --packages                      Run on all independent packages in the repo. Cannot be used with --all.
+      --releaseGroupRoot=<option>...  Run on the root package of the specified release groups. This does not include any
+                                      child packages within the release group. To include those, use the --releaseGroup
+                                      argument. Cannot be used with --all.
+                                      <options: client|server|azure|build-tools|gitrest|historian|all>
+
+LOGGING FLAGS
+  -v, --verbose  Enable verbose logging.
+      --quiet    Disable all logging.
+
+PACKAGE FILTER FLAGS
+  --[no-]private          Only include private packages. Use --no-private to exclude private packages instead.
+  --scope=<value>...      Package scopes to filter to. If provided, only packages whose scope matches the flag will be
+                          included. Cannot be used with --skipScope.
+  --skipScope=<value>...  Package scopes to filter out. If provided, packages whose scope matches the flag will be
+                          excluded. Cannot be used with --scope.
 
 DESCRIPTION
   Updates configuration for type tests in package.json files. If the previous version changes after running preparation,

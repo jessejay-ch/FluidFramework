@@ -3,33 +3,40 @@
  * Licensed under the MIT License.
  */
 
-import { assert } from "@fluidframework/common-utils";
-import { ChildLogger } from "@fluidframework/telemetry-utils";
+import { IFluidHandle, ITelemetryBaseLogger } from "@fluidframework/core-interfaces";
+import { assert } from "@fluidframework/core-utils/internal";
 import {
 	IFluidDataStoreRuntime,
 	IChannelStorageService,
-} from "@fluidframework/datastore-definitions";
-import { ITelemetryBaseLogger } from "@fluidframework/common-definitions";
+} from "@fluidframework/datastore-definitions/internal";
+import { ISequencedDocumentMessage } from "@fluidframework/driver-definitions/internal";
 import {
 	BaseSegment,
-	ISegment,
 	Client,
-	IMergeTreeDeltaOpArgs,
+	IJSONSegment,
 	IMergeTreeDeltaCallbackArgs,
-	MergeTreeDeltaType,
+	IMergeTreeDeltaOpArgs,
 	IMergeTreeMaintenanceCallbackArgs,
+	ISegment,
+	ISegmentInternal,
+	MergeTreeDeltaType,
 	MergeTreeMaintenanceType,
-	ReferenceType,
-} from "@fluidframework/merge-tree";
-import { IFluidHandle } from "@fluidframework/core-interfaces";
-import { IFluidSerializer } from "@fluidframework/shared-object-base";
-import { ISummaryTreeWithStats } from "@fluidframework/runtime-definitions";
-import { ObjectStoragePartition, SummaryTreeBuilder } from "@fluidframework/runtime-utils";
-import { ISequencedDocumentMessage } from "@fluidframework/protocol-definitions";
-import { HandleTable, Handle, isHandleValid } from "./handletable";
-import { deserializeBlob } from "./serialization";
-import { HandleCache } from "./handlecache";
-import { VectorUndoProvider } from "./undoprovider";
+	segmentIsRemoved,
+	type IMergeTreeInsertMsg,
+	type IMergeTreeRemoveMsg,
+} from "@fluidframework/merge-tree/internal";
+import { ISummaryTreeWithStats } from "@fluidframework/runtime-definitions/internal";
+import {
+	ObjectStoragePartition,
+	SummaryTreeBuilder,
+} from "@fluidframework/runtime-utils/internal";
+import { IFluidSerializer } from "@fluidframework/shared-object-base/internal";
+import { createChildLogger } from "@fluidframework/telemetry-utils/internal";
+
+import { HandleCache } from "./handlecache.js";
+import { Handle, HandleTable, isHandleValid } from "./handletable.js";
+import { deserializeBlob } from "./serialization.js";
+import { VectorUndoProvider } from "./undoprovider.js";
 
 const enum SnapshotPath {
 	segments = "segments",
@@ -42,7 +49,7 @@ export class PermutationSegment extends BaseSegment {
 	public static readonly typeString: string = "PermutationSegment";
 	private _start = Handle.unallocated;
 
-	public static fromJSONObject(spec: any) {
+	public static fromJSONObject(spec: IJSONSegment): PermutationSegment {
 		const [length, start] = spec as PermutationSegmentSpec;
 		return new PermutationSegment(length, start);
 	}
@@ -55,7 +62,7 @@ export class PermutationSegment extends BaseSegment {
 		this.cachedLength = length;
 	}
 
-	public get start() {
+	public get start(): Handle {
 		return this._start;
 	}
 	public set start(value: Handle) {
@@ -71,44 +78,15 @@ export class PermutationSegment extends BaseSegment {
 		this._start = value;
 	}
 
-	/**
-	 * Invoked by '_undoRow/ColRemove' to prepare the newly inserted destination
-	 * segment to serve as the replacement for this removed segment.  This moves handle
-	 * allocations from this segment to the replacement as well as maintains tracking
-	 * groups for the undo/redo stack.
-	 */
-	public transferToReplacement(destination: PermutationSegment) {
-		// When this segment was removed, it may have been split from a larger original
-		// segment.  In this case, it will have been added to an undo/redo tracking group
-		// that associates all of the fragments from the original insertion.
-		//
-		// Move this association from the this removed segment to its replacement so that
-		// it is included if the undo stack continues to unwind to the original insertion.
-		//
-		// Out of paranoia we link and unlink in separate loops to avoid mutating the underlying
-		// set during enumeration.  In practice, this is unlikely to matter since there should be
-		// exactly 0 or 1 items in the enumeration.
-		for (const group of this.trackingCollection.trackingGroups) {
-			group.link(destination);
-		}
-		for (const group of this.trackingCollection.trackingGroups) {
-			group.unlink(this);
-		}
-
-		// Move handle allocations from this segment to its replacement.
-		destination._start = this._start;
-		this.reset();
-	}
-
-	public reset() {
+	public reset(): void {
 		this._start = Handle.unallocated;
 	}
 
-	public toJSONObject() {
+	public toJSONObject(): number[] {
 		return [this.cachedLength, this.start];
 	}
 
-	public clone(start = 0, end = this.cachedLength) {
+	public clone(start = 0, end = this.cachedLength): PermutationSegment {
 		const b = new PermutationSegment(
 			/* length: */ end - start,
 			/* start: */ this.start + start,
@@ -117,7 +95,7 @@ export class PermutationSegment extends BaseSegment {
 		return b;
 	}
 
-	public canAppend(segment: ISegment) {
+	public canAppend(segment: ISegment): boolean {
 		const asPerm = segment as PermutationSegment;
 
 		return this.start === Handle.unallocated
@@ -125,7 +103,7 @@ export class PermutationSegment extends BaseSegment {
 			: asPerm.start === this.start + this.cachedLength;
 	}
 
-	protected createSplitSegmentAt(pos: number) {
+	protected createSplitSegmentAt(pos: number): PermutationSegment {
 		assert(
 			0 < pos && pos < this.cachedLength,
 			0x026 /* "Trying to split segment at out-of-bounds position!" */,
@@ -141,13 +119,14 @@ export class PermutationSegment extends BaseSegment {
 		return leafSegment;
 	}
 
-	public toString() {
+	public toString(): string {
 		return this.start === Handle.unallocated
 			? `<${this.cachedLength} empty>`
 			: `<${this.cachedLength}: ${this.start}..${this.start + this.cachedLength - 1}>`;
 	}
 }
 
+// eslint-disable-next-line import/no-deprecated
 export class PermutationVector extends Client {
 	private handleTable = new HandleTable<never>(); // Tracks available storage handles for rows.
 	public readonly handleCache = new HandleCache(this);
@@ -163,37 +142,27 @@ export class PermutationVector extends Client {
 			numInserted: number,
 		) => void,
 		private readonly handlesRecycledCallback: (handles: Handle[]) => void,
+		getMinInFlightRefSeq: () => number | undefined,
 	) {
 		super(
 			PermutationSegment.fromJSONObject,
-			ChildLogger.create(logger, `Matrix.${path}.MergeTreeClient`),
+			createChildLogger({ logger, namespace: `Matrix.${path}.MergeTreeClient` }),
 			{
 				...runtime.options,
-				newMergeTreeSnapshotFormat: true, // Temporarily force new snapshot format until it is the default.
+				newMergeTreeSnapshotFormat: true, // Force new snapshot format as it's generally more efficient for matrices.
 			},
-		); // (See https://github.com/microsoft/FluidFramework/issues/84)
+			getMinInFlightRefSeq,
+		);
 
 		this.on("delta", this.onDelta);
 		this.on("maintenance", this.onMaintenance);
 	}
 
-	public insert(start: number, length: number) {
+	public insert(start: number, length: number): IMergeTreeInsertMsg | undefined {
 		return this.insertSegmentLocal(start, new PermutationSegment(length));
 	}
 
-	public insertRelative(segment: ISegment, length: number) {
-		const inserted = new PermutationSegment(length);
-
-		return {
-			op: this.insertAtReferencePositionLocal(
-				this.createLocalReferencePosition(segment, 0, ReferenceType.Transient, undefined),
-				inserted,
-			),
-			inserted,
-		};
-	}
-
-	public remove(start: number, length: number) {
+	public remove(start: number, length: number): IMergeTreeRemoveMsg {
 		return this.removeRangeLocal(start, start + length);
 	}
 
@@ -229,8 +198,11 @@ export class PermutationVector extends Client {
 		return handle;
 	}
 
-	public adjustPosition(pos: number, op: ISequencedDocumentMessage) {
-		const { segment, offset } = this.getContainingSegment(pos, {
+	public adjustPosition(
+		pos: number,
+		op: Pick<ISequencedDocumentMessage, "referenceSequenceNumber" | "clientId">,
+	): number | undefined {
+		const { segment, offset } = this.getContainingSegment<ISegmentInternal>(pos, {
 			referenceSequenceNumber: op.referenceSequenceNumber,
 			clientId: op.clientId,
 		});
@@ -238,7 +210,7 @@ export class PermutationVector extends Client {
 		// Note that until the MergeTree GCs, the segment is still reachable via `getContainingSegment()` with
 		// a `refSeq` in the past.  Prevent remote ops from accidentally allocating or using recycled handles
 		// by checking for the presence of 'removedSeq'.
-		if (segment === undefined || segment.removedSeq !== undefined) {
+		if (segment === undefined || segmentIsRemoved(segment)) {
 			return undefined;
 		}
 
@@ -246,7 +218,7 @@ export class PermutationVector extends Client {
 		return this.getPosition(segment) + offset!;
 	}
 
-	public handleToPosition(handle: Handle, localSeq = this.getCollabWindow().localSeq) {
+	public handleToPosition(handle: Handle, localSeq = this.getCollabWindow().localSeq): number {
 		assert(
 			localSeq <= this.getCollabWindow().localSeq,
 			0x028 /* "'localSeq' for op being resubmitted must be <= the 'localSeq' of the last submitted op." */,
@@ -328,12 +300,15 @@ export class PermutationVector extends Client {
 		runtime: IFluidDataStoreRuntime,
 		storage: IChannelStorageService,
 		serializer: IFluidSerializer,
-	) {
-		const handleTableData = await deserializeBlob(
+	): Promise<{
+		catchupOpsP: Promise<ISequencedDocumentMessage[]>;
+	}> {
+		const handleTableData = (await deserializeBlob(
 			storage,
 			SnapshotPath.handleTable,
 			serializer,
-		);
+			// Cast is needed since the (de)serializer returns content of type `any`.
+		)) as Handle[];
 
 		this.handleTable = HandleTable.load<never>(handleTableData);
 
@@ -346,10 +321,10 @@ export class PermutationVector extends Client {
 
 	private readonly onDelta = (
 		opArgs: IMergeTreeDeltaOpArgs,
-		{ operation, deltaSegments }: IMergeTreeDeltaCallbackArgs,
-	) => {
+		deltaArgs: IMergeTreeDeltaCallbackArgs,
+	): void => {
 		// Apply deltas in descending order to prevent positions from shifting.
-		const ranges = deltaSegments
+		const ranges = deltaArgs.deltaSegments
 			.map(({ segment }) => ({
 				segment: segment as PermutationSegment,
 				position: this.getPosition(segment),
@@ -360,11 +335,11 @@ export class PermutationVector extends Client {
 
 		// Notify the undo provider, if any is attached.
 		if (this.undo !== undefined && isLocal) {
-			this.undo.record(operation, ranges);
+			this.undo.record(deltaArgs);
 		}
 
-		switch (operation) {
-			case MergeTreeDeltaType.INSERT:
+		switch (deltaArgs.operation) {
+			case MergeTreeDeltaType.INSERT: {
 				// Pass 1: Perform any internal maintenance first to avoid reentrancy.
 				for (const { segment, position } of ranges) {
 					// HACK: We need to include the allocated handle in the segment's JSON representation
@@ -388,6 +363,7 @@ export class PermutationVector extends Client {
 					);
 				}
 				break;
+			}
 
 			case MergeTreeDeltaType.REMOVE: {
 				// Pass 1: Perform any internal maintenance first to avoid reentrancy.
@@ -410,12 +386,13 @@ export class PermutationVector extends Client {
 				break;
 			}
 
-			default:
+			default: {
 				throw new Error("Unhandled MergeTreeDeltaType");
+			}
 		}
 	};
 
-	private readonly onMaintenance = (args: IMergeTreeMaintenanceCallbackArgs) => {
+	private readonly onMaintenance = (args: IMergeTreeMaintenanceCallbackArgs): void => {
 		if (args.operation === MergeTreeMaintenanceType.UNLINK) {
 			let freed: number[] = [];
 
@@ -423,8 +400,9 @@ export class PermutationVector extends Client {
 				const asPerm = segment as PermutationSegment;
 				if (isHandleValid(asPerm.start)) {
 					// Note: Using the spread operator with `.splice()` can exhaust the stack.
+					// eslint-disable-next-line unicorn/prefer-spread
 					freed = freed.concat(
-						new Array(asPerm.cachedLength)
+						Array.from({ length: asPerm.cachedLength })
 							.fill(0)
 							.map((value, index) => index + asPerm.start),
 					);
@@ -442,14 +420,45 @@ export class PermutationVector extends Client {
 		}
 	};
 
-	public toString() {
+	public toString(): string {
 		const s: string[] = [];
 
 		this.walkSegments((segment) => {
+			// eslint-disable-next-line @typescript-eslint/no-base-to-string
 			s.push(`${segment}`);
 			return true;
 		});
 
 		return s.join("");
 	}
+}
+
+export function reinsertSegmentIntoVector(
+	vector: PermutationVector,
+	pos: number,
+	spec: IJSONSegment,
+): {
+	op: IMergeTreeInsertMsg | undefined;
+	inserted: PermutationSegment;
+} {
+	const original = PermutationSegment.fromJSONObject(spec);
+
+	// (Re)insert the removed number of rows at the original position.
+	const op = vector.insertSegmentLocal(pos, original);
+	const inserted = vector.getContainingSegment(pos).segment as PermutationSegment;
+
+	// we reuse the original handle here
+	// so if cells exist, they can be found, and re-inserted
+	if (isHandleValid(original.start)) {
+		inserted.start = original.start;
+	}
+
+	// Invalidate the handleCache in case it was populated during the 'rowsChanged'
+	// callback, which occurs before the handle span is populated.
+	vector.handleCache.itemsChanged(
+		pos,
+		/* removedCount: */ 0,
+		/* insertedCount: */ inserted.cachedLength,
+	);
+	return { op, inserted };
 }

@@ -3,38 +3,61 @@
  * Licensed under the MIT License.
  */
 
+export { IProvideTestFluidObject, ITestFluidObject } from "./interfaces.js";
+export { LoaderContainerTracker } from "./loaderContainerTracker.js";
 export {
-	wrapDocumentService,
-	wrapDocumentServiceFactory,
-	wrapDocumentStorageService,
-} from "./DriverWrappers";
-export { IProvideTestFluidObject, ITestFluidObject } from "./interfaces";
-export { LoaderContainerTracker } from "./loaderContainerTracker";
-export { fluidEntryPoint, LocalCodeLoader, SupportedExportInterfaces } from "./localCodeLoader";
-export { createAndAttachContainer, createLoader } from "./localLoader";
-export { retryWithEventualValue } from "./retry";
-export { mockConfigProvider } from "./TestConfigs";
+	fluidEntryPoint,
+	LocalCodeLoader,
+	SupportedExportInterfaces,
+} from "./localCodeLoader.js";
+export {
+	createAndAttachContainer,
+	createLoader,
+	createLoaderProps,
+	createAndAttachContainerUsingProps,
+} from "./localLoader.js";
+export { retryWithEventualValue } from "./retry.js";
+export { createTestConfigProvider, ITestConfigProvider } from "./TestConfigs.js";
 export {
 	createTestContainerRuntimeFactory,
 	TestContainerRuntimeFactory,
-} from "./testContainerRuntimeFactory";
-export { ChannelFactoryRegistry, TestFluidObject, TestFluidObjectFactory } from "./testFluidObject";
+} from "./testContainerRuntimeFactory.js";
+export {
+	ChannelFactoryRegistry,
+	TestFluidObject,
+	TestFluidObjectFactory,
+} from "./testFluidObject.js";
 export {
 	createDocumentId,
 	DataObjectFactoryType,
 	EventAndErrorTrackingLogger,
+	type IEventAndErrorTrackingLogger,
 	getUnexpectedLogErrorException,
+	IDocumentIdStrategy,
 	IOpProcessingController,
 	ITestContainerConfig,
 	ITestObjectProvider,
 	TestObjectProvider,
-} from "./testObjectProvider";
-export { createSummarizer, createSummarizerFromFactory, summarizeNow } from "./TestSummaryUtils";
+	TestObjectProviderWithVersionedLoad,
+} from "./testObjectProvider.js";
 export {
-	defaultTimeoutDurationMs,
+	createSummarizer,
+	createSummarizerCore,
+	createSummarizerFromFactory,
+	summarizeNow,
+	SummaryInfo,
+} from "./TestSummaryUtils.js";
+export {
 	timeoutAwait,
 	timeoutPromise,
-	TimeoutWithError,
-	TimeoutWithValue,
-} from "./timeoutUtils";
-export { ensureContainerConnected, waitForContainerConnection } from "./containerUtils";
+	type TimeoutDurationOption,
+	type TimeoutWithError,
+	type TimeoutWithValue,
+} from "./timeoutUtils.js";
+export {
+	toIDeltaManagerFull,
+	waitForContainerConnection,
+	getContainerEntryPointBackCompat,
+	getDataStoreEntryPointBackCompat,
+} from "./containerUtils.js";
+export { createContainerRuntimeFactoryWithDefaultDataStore } from "./testContainerRuntimeFactoryWithDefaultDataStore.js";

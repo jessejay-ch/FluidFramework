@@ -3,39 +3,55 @@
  * Licensed under the MIT License.
  */
 
-import { IContainerContext } from "@fluidframework/container-definitions";
-import { ContainerRuntime } from "@fluidframework/container-runtime";
-import { IContainerRuntime } from "@fluidframework/container-runtime-definitions";
-import { FluidObject } from "@fluidframework/core-interfaces";
-import { buildRuntimeRequestHandler, RuntimeRequestHandler } from "@fluidframework/request-handler";
-import {
-	NamedFluidDataStoreRegistryEntries,
+import type {
+	IContainerContext,
+	IRuntime,
+} from "@fluidframework/container-definitions/internal";
+import { loadContainerRuntime } from "@fluidframework/container-runtime/internal";
+import type { IContainerRuntime } from "@fluidframework/container-runtime-definitions/internal";
+import type { FluidObject } from "@fluidframework/core-interfaces";
+import type {
 	IFluidDataStoreFactory,
-} from "@fluidframework/runtime-definitions";
-import { RuntimeFactoryHelper } from "@fluidframework/runtime-utils";
+	NamedFluidDataStoreRegistryEntries,
+} from "@fluidframework/runtime-definitions/internal";
+import { RuntimeFactoryHelper } from "@fluidframework/runtime-utils/internal";
 
 const defaultStoreId = "" as const;
 
+/**
+ * {@link RuntimeFactory} construction properties.
+ * @internal
+ */
+export interface RuntimeFactoryProps {
+	defaultStoreFactory: IFluidDataStoreFactory;
+	storeFactories: IFluidDataStoreFactory[];
+	provideEntryPoint: (runtime: IContainerRuntime) => Promise<FluidObject>;
+}
+
+/**
+ * @internal
+ */
 export class RuntimeFactory extends RuntimeFactoryHelper {
 	private readonly registry: NamedFluidDataStoreRegistryEntries;
 
-	constructor(
-		private readonly defaultStoreFactory: IFluidDataStoreFactory,
-		storeFactories: IFluidDataStoreFactory[] = [defaultStoreFactory],
-		private readonly requestHandlers: RuntimeRequestHandler[] = [],
-		private readonly initializeEntryPoint?: (
-			runtime: IContainerRuntime,
-		) => Promise<FluidObject>,
-	) {
+	private readonly defaultStoreFactory: IFluidDataStoreFactory;
+	private readonly provideEntryPoint: (runtime: IContainerRuntime) => Promise<FluidObject>;
+
+	public constructor(props: RuntimeFactoryProps) {
 		super();
+
+		this.defaultStoreFactory = props.defaultStoreFactory;
+		this.provideEntryPoint = props.provideEntryPoint;
+		const storeFactories = props.storeFactories ?? [this.defaultStoreFactory];
+
 		this.registry = (
-			storeFactories.includes(defaultStoreFactory)
+			storeFactories.includes(this.defaultStoreFactory)
 				? storeFactories
-				: storeFactories.concat(defaultStoreFactory)
+				: [...storeFactories, this.defaultStoreFactory]
 		).map((factory) => [factory.type, factory]) as NamedFluidDataStoreRegistryEntries;
 	}
 
-	public async instantiateFirstTime(runtime: ContainerRuntime): Promise<void> {
+	public async instantiateFirstTime(runtime: IContainerRuntime): Promise<void> {
 		const dataStore = await runtime.createDataStore(this.defaultStoreFactory.type);
 		await dataStore.trySetAlias(defaultStoreId);
 	}
@@ -43,13 +59,12 @@ export class RuntimeFactory extends RuntimeFactoryHelper {
 	public async preInitialize(
 		context: IContainerContext,
 		existing: boolean,
-	): Promise<ContainerRuntime> {
-		const runtime: ContainerRuntime = await ContainerRuntime.loadRuntime({
+	): Promise<IContainerRuntime & IRuntime> {
+		const runtime = await loadContainerRuntime({
 			context,
 			registryEntries: this.registry,
-			requestHandler: buildRuntimeRequestHandler(...this.requestHandlers),
 			existing,
-			initializeEntryPoint: this.initializeEntryPoint,
+			provideEntryPoint: this.provideEntryPoint,
 		});
 
 		return runtime;

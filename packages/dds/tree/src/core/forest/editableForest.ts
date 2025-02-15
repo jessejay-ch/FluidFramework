@@ -3,55 +3,87 @@
  * Licensed under the MIT License.
  */
 
+import type { SessionSpaceCompressedId, IIdCompressor } from "@fluidframework/id-compressor";
+import { assert } from "@fluidframework/core-utils/internal";
+
+import type { RevisionTagCodec } from "../rebase/index.js";
+import type { FieldKey } from "../schema-stored/index.js";
 import {
-	AnchorSet,
-	FieldKey,
-	DetachedField,
-	Delta,
-	Anchor,
-	ITreeCursorSynchronous,
-	rootFieldKeySymbol,
-} from "../tree";
-import { IForestSubscription, ITreeSubscriptionCursor } from "./forest";
+	type Anchor,
+	type DeltaRoot,
+	type DeltaVisitor,
+	type DetachedField,
+	type ITreeCursorSynchronous,
+	combineVisitors,
+	deltaForRootInitialization,
+	makeDetachedFieldIndex,
+	visitDelta,
+} from "../tree/index.js";
+
+import type { IForestSubscription, ITreeSubscriptionCursor } from "./forest.js";
 
 /**
  * Editing APIs.
- * @alpha
  */
 export interface IEditableForest extends IForestSubscription {
 	/**
-	 * Set of anchors this forest is tracking.
+	 * Provides a visitor that can be used to mutate the forest.
 	 *
-	 * To keep these anchors usable, this AnchorSet must be updated / rebased for any changes made to the forest.
-	 * It is the responsibility of the called of the forest editing methods to do this, not the forest itself.
-	 * The caller performs these updates because it has more semantic knowledge about the edits, which can be needed to
-	 * update the anchors in a semantically optimal way.
+	 * @returns a visitor that can be used to mutate the forest.
+	 *
+	 * @remarks
+	 * Mutating the forest does NOT update anchors.
+	 * The visitor must be released after use by calling {@link DeltaVisitor.free} on it.
+	 * It is invalid to acquire a visitor without releasing the previous one.
 	 */
-	readonly anchors: AnchorSet;
-
-	/**
-	 * Applies the supplied Delta to the forest.
-	 * Does NOT update anchors.
-	 */
-	applyDelta(delta: Delta.Root): void;
+	acquireVisitor(): DeltaVisitor;
 }
 
-export function initializeForest(forest: IEditableForest, content: ITreeCursorSynchronous[]): void {
-	// TODO: maybe assert forest is empty?
-	const insert: Delta.Insert = { type: Delta.MarkType.Insert, content };
-	forest.applyDelta(new Map([[rootFieldKeySymbol, [insert]]]));
+/**
+ * Initializes the given forest with the given content.
+ * @remarks The forest must be empty when this function is called.
+ * This does not perform an edit in the typical sense.
+ * Instead, it creates a delta expressing a creation and insertion of the `content` under the {@link rootFieldKey}, and then applies the delta to the forest.
+ * If `visitAnchors` is enabled, then the delta will also be applied to the forest's {@link AnchorSet} (in which case there must be no existing anchors when this function is called).
+ *
+ * @remarks
+ * This does not perform an edit: it updates the forest content as if there was an edit that did that.
+ */
+export function initializeForest(
+	forest: IEditableForest,
+	content: readonly ITreeCursorSynchronous[],
+	revisionTagCodec: RevisionTagCodec,
+	idCompressor: IIdCompressor,
+	visitAnchors = false,
+): void {
+	assert(forest.isEmpty, 0x747 /* forest must be empty */);
+	const delta: DeltaRoot = deltaForRootInitialization(content);
+	let visitor = forest.acquireVisitor();
+	if (visitAnchors) {
+		assert(forest.anchors.isEmpty(), 0x9b7 /* anchor set must be empty */);
+		const anchorVisitor = forest.anchors.acquireVisitor();
+		visitor = combineVisitors([visitor, anchorVisitor]);
+	}
+
+	// any detached trees built here are immediately attached so the revision used here doesn't matter
+	// we use a dummy revision to make correctness checks in the detached field index easier
+	visitDelta(
+		delta,
+		visitor,
+		makeDetachedFieldIndex("init", revisionTagCodec, idCompressor),
+		0 as SessionSpaceCompressedId,
+	);
+	visitor.free();
 }
 
 // TODO: Types below here may be useful for input into edit building APIs, but are no longer used here directly.
 
 /**
  * Ways to refer to a node in an IEditableForest.
- * @alpha
  */
 export type ForestLocation = ITreeSubscriptionCursor | Anchor;
 
 /**
- * @alpha
  */
 export interface TreeLocation {
 	readonly range: FieldLocation | DetachedField;
@@ -63,8 +95,7 @@ export function isFieldLocation(range: FieldLocation | DetachedField): range is 
 }
 
 /**
- * Wrapper around DetachedField that can be detected at runtime.
- * @alpha
+ * Location of a field within a tree that is not a detached/root field.
  */
 export interface FieldLocation {
 	readonly key: FieldKey;

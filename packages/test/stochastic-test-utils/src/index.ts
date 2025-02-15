@@ -3,15 +3,21 @@
  * Licensed under the MIT License.
  */
 
+export { combineReducers, combineReducersAsync } from "./combineReducers.js";
 export {
 	createFuzzDescribe,
+	CreateMochaSuite,
 	defaultOptions,
 	DescribeFuzz,
 	describeFuzz,
-	DescribeFuzzSuite,
+	DescribeStress,
+	describeStress,
 	FuzzDescribeOptions,
 	FuzzSuiteArguments,
-} from "./describeFuzz";
+	MochaSuiteWithArguments,
+	StressSuiteArguments,
+	StressMode,
+} from "./describeFuzz.js";
 export {
 	asyncGeneratorFromArray,
 	chain,
@@ -20,6 +26,7 @@ export {
 	chainIterables,
 	createWeightedAsyncGenerator,
 	createWeightedGenerator,
+	ExitBehavior,
 	generatorFromArray,
 	interleave,
 	interleaveAsync,
@@ -27,10 +34,19 @@ export {
 	repeatAsync,
 	take,
 	takeAsync,
-} from "./generators";
-export { PerformanceWordMarkovChain, SpaceEfficientWordMarkovChain } from "./markovChain";
-export { performFuzzActions, performFuzzActionsAsync } from "./performActions";
-export { makeRandom } from "./random";
+} from "./generators.js";
+export {
+	MarkovChain,
+	PerformanceWordMarkovChain,
+	SpaceEfficientWordMarkovChain,
+	WordSpacing,
+} from "./markovChain.js";
+export {
+	performFuzzActions,
+	performFuzzActionsAsync,
+	saveOpsToFile,
+} from "./performActions.js";
+export { makeRandom } from "./random.js";
 export {
 	AcceptanceCondition,
 	AsyncGenerator,
@@ -42,6 +58,7 @@ export {
 	IRandom,
 	Reducer,
 	SaveInfo,
+	SaveDestination,
 	Weights,
-} from "./types";
-export { XSadd } from "./xsadd";
+} from "./types.js";
+export { XSadd, XSaddCtor } from "./xsadd.js";

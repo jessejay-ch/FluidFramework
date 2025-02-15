@@ -3,14 +3,21 @@
  * Licensed under the MIT License.
  */
 
-import assert from "assert";
-import { ITelemetryBaseEvent } from "@fluidframework/common-definitions";
-import { IContainerContext } from "@fluidframework/container-definitions";
-import { MockDeltaManager, MockQuorumClients } from "@fluidframework/test-runtime-utils";
-import { MockLogger } from "@fluidframework/telemetry-utils";
-import { ContainerRuntime, getDeviceSpec } from "../containerRuntime";
+import assert from "node:assert";
+
+import { IContainerContext } from "@fluidframework/container-definitions/internal";
+import { ITelemetryBaseEvent } from "@fluidframework/core-interfaces";
+import { MockLogger } from "@fluidframework/telemetry-utils/internal";
+import {
+	MockDeltaManager,
+	MockQuorumClients,
+	MockAudience,
+} from "@fluidframework/test-runtime-utils/internal";
+
+import { ContainerRuntime, getDeviceSpec } from "../containerRuntime.js";
 
 function setNavigator(
+	// eslint-disable-next-line @rushstack/no-new-null -- testing behavior with global
 	navigator: Partial<Navigator & { deviceMemory?: number }> | undefined | null,
 ) {
 	global.navigator = navigator as Navigator;
@@ -20,35 +27,42 @@ describe("Hardware Stats", () => {
 	let mockLogger = new MockLogger();
 	let mockContext: Partial<IContainerContext> = {
 		deltaManager: new MockDeltaManager(),
+		audience: new MockAudience(),
 		quorum: new MockQuorumClients(),
 		taggedLogger: mockLogger,
 		clientDetails: { capabilities: { interactive: true } },
 		updateDirtyContainerState: (dirty: boolean) => {},
+		getLoadedFromVersion: () => undefined,
 	};
 
 	const getDeviceSpecEvents = (): ITelemetryBaseEvent[] =>
 		mockLogger.events.filter((event) => event.eventName === "DeviceSpec");
 
 	const loadContainer = async () =>
-		ContainerRuntime.load(
-			mockContext as IContainerContext,
-			[],
-			undefined, // requestHandler
-			{
+		ContainerRuntime.loadRuntime({
+			context: mockContext as IContainerContext,
+			registryEntries: [],
+			runtimeOptions: {
 				summaryOptions: {
 					summaryConfigOverrides: { state: "disabled" },
 				},
 			},
-		);
+			provideEntryPoint: async () => ({
+				myProp: "myValue",
+			}),
+			existing: false,
+		});
 
 	beforeEach(async () => {
 		mockLogger = new MockLogger();
 		mockContext = {
 			deltaManager: new MockDeltaManager(),
+			audience: new MockAudience(),
 			quorum: new MockQuorumClients(),
 			taggedLogger: mockLogger,
 			clientDetails: { capabilities: { interactive: true } },
 			updateDirtyContainerState: (dirty: boolean) => {},
+			getLoadedFromVersion: () => undefined,
 		};
 	});
 
@@ -77,6 +91,7 @@ describe("Hardware Stats", () => {
 	});
 
 	it("should generate correct hardware stats with null navigator", async () => {
+		// eslint-disable-next-line unicorn/no-null -- testing behavior with global
 		const navigator = null;
 		setNavigator(navigator);
 		// testing function

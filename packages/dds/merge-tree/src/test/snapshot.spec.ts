@@ -3,13 +3,18 @@
  * Licensed under the MIT License.
  */
 
-import { strict as assert } from "assert";
-import { SnapshotV1 } from "../snapshotV1";
-import { IMergeTreeOptions } from "../mergeTree";
-import { createInsertOnlyAttributionPolicy } from "../attributionCollection";
-import { loadSnapshot, TestString } from "./snapshot.utils";
+import { strict as assert } from "node:assert";
 
-function makeSnapshotSuite(options?: IMergeTreeOptions): void {
+import {
+	createInsertOnlyAttributionPolicy,
+	createPropertyTrackingAttributionPolicyFactory,
+} from "../attributionPolicy.js";
+import { IMergeTreeOptionsInternal } from "../mergeTree.js";
+import { SnapshotV1 } from "../snapshotV1.js";
+
+import { TestString, loadSnapshot } from "./snapshot.utils.js";
+
+function makeSnapshotSuite(options?: IMergeTreeOptionsInternal): void {
 	describe("from an empty initial state", () => {
 		let str: TestString;
 		beforeEach(() => {
@@ -90,6 +95,42 @@ function makeSnapshotSuite(options?: IMergeTreeOptions): void {
 			await str.expect("0123");
 		});
 
+		it("includes obliterates above the MSN of segments below the MSN", async () => {
+			str.append("0x", /* increaseMsn: */ true);
+			str.obliterateRange(1, 2, /* increaseMsn: */ false);
+			await str.expect("0");
+		});
+
+		it("can insert segments after loading obliterated segment", async () => {
+			str.append("0x", /* increaseMsn: */ true);
+			str.obliterateRange(1, 2, /* increaseMsn: */ false);
+			await str.expect("0");
+			str.append("1", /* increaseMsn: */ false);
+			await str.expect("01");
+		});
+
+		it("can insert segments relative to obliterated segment", async () => {
+			str.append("0x", /* increaseMsn: */ false);
+			str.append("2", /* increaseMsn: */ false);
+			str.obliterateRange(1, 2, /* increaseMsn: */ false);
+			str.insert(1, "1", /* increaseMsn: */ false);
+			str.append("3", /* increaseMsn: */ false);
+			await str.expect("0123");
+		});
+
+		it("can insert segments relative to obliterated segment loaded from snapshot", async () => {
+			str.append("0x", /* increaseMsn: */ false);
+			str.append("2", /* increaseMsn: */ false);
+			str.obliterateRange(1, 2, /* increaseMsn: */ false);
+
+			// Note that calling str.expect() switches the underlying client to the one loaded from the snapshot.
+			await str.expect("02");
+
+			str.insert(1, "1", /* increaseMsn: */ false);
+			str.append("3", /* increaseMsn: */ false);
+			await str.expect("0123");
+		});
+
 		it("includes ACKed segments below MSN in body", async () => {
 			for (let i = 0; i < SnapshotV1.chunkSize + 10; i++) {
 				str.append(`${i % 10}`, /* increaseMsn: */ true);
@@ -102,6 +143,13 @@ function makeSnapshotSuite(options?: IMergeTreeOptions): void {
 			for (let i = 0; i < SnapshotV1.chunkSize + 10; i++) {
 				str.append(`${i % 10}`, /* increaseMsn: */ false);
 			}
+
+			await str.checkSnapshot();
+		});
+
+		it("recovers annotated segments", async () => {
+			str.append("123", false);
+			str.annotate(1, 2, { foo: 1 }, false);
 
 			await str.checkSnapshot();
 		});
@@ -119,11 +167,25 @@ describe("snapshot", () => {
 	describe("with attribution", () => {
 		makeSnapshotSuite({
 			attribution: { track: true, policyFactory: createInsertOnlyAttributionPolicy },
+			mergeTreeEnableObliterate: true,
+		});
+	});
+
+	describe("with attribution and custom channels", () => {
+		makeSnapshotSuite({
+			attribution: {
+				track: true,
+				policyFactory: createPropertyTrackingAttributionPolicyFactory("foo"),
+			},
+			mergeTreeEnableObliterate: true,
 		});
 	});
 
 	describe("without attribution", () => {
-		makeSnapshotSuite({ attribution: { track: false } });
+		makeSnapshotSuite({
+			attribution: { track: false },
+			mergeTreeEnableObliterate: true,
+		});
 	});
 
 	it("presence of attribution overrides merge-tree initialization value", async () => {

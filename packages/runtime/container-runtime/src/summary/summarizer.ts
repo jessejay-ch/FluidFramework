@@ -3,41 +3,46 @@
  * Licensed under the MIT License.
  */
 
-import { EventEmitter } from "events";
-import { Deferred } from "@fluidframework/common-utils";
-import { ITelemetryLogger } from "@fluidframework/common-definitions";
-import { ILoader, LoaderHeader } from "@fluidframework/container-definitions";
-import { UsageError } from "@fluidframework/container-utils";
-import { DriverHeader } from "@fluidframework/driver-definitions";
-import { requestFluidObject } from "@fluidframework/runtime-utils";
+import { TypedEventEmitter } from "@fluid-internal/client-utils";
+import type {
+	ISummarizerEvents,
+	SummarizerStopReason,
+} from "@fluidframework/container-runtime-definitions/internal";
+import { IFluidHandleContext } from "@fluidframework/core-interfaces/internal";
+import { Deferred } from "@fluidframework/core-utils/internal";
 import {
-	ChildLogger,
 	IFluidErrorBase,
+	ITelemetryLoggerExt,
 	LoggingError,
+	UsageError,
+	createChildLogger,
 	wrapErrorAndLog,
-} from "@fluidframework/telemetry-utils";
+} from "@fluidframework/telemetry-utils/internal";
+
+import { ISummaryConfiguration } from "../containerRuntime.js";
+
+// eslint-disable-next-line import/no-deprecated
+import { ICancellableSummarizerController } from "./runWhileConnectedCoordinator.js";
+import { RunningSummarizer } from "./runningSummarizer.js";
+import { SummarizeHeuristicData } from "./summarizerHeuristics.js";
 import {
-	FluidObject,
-	IFluidHandleContext,
-	IFluidHandle,
-	IRequest,
-} from "@fluidframework/core-interfaces";
-import { ISummaryConfiguration } from "../containerRuntime";
-import { ICancellableSummarizerController } from "./runWhileConnectedCoordinator";
-import { summarizerClientType } from "./summarizerClientElection";
-import { SummaryCollection } from "./summaryCollection";
-import { SummarizerHandle } from "./summarizerHandle";
-import { RunningSummarizer } from "./runningSummarizer";
-import {
+	EnqueueSummarizeResult,
+	// eslint-disable-next-line import/no-deprecated
 	IConnectableRuntime,
+	IEnqueueSummarizeOptions,
+	IOnDemandSummarizeOptions,
+	ISummarizeHeuristicData,
+	ISummarizeResults,
 	ISummarizer,
+	// eslint-disable-next-line import/no-deprecated
 	ISummarizerInternalsProvider,
+	// eslint-disable-next-line import/no-deprecated
 	ISummarizerRuntime,
 	ISummarizingWarning,
-	SummarizerStopReason,
-} from "./summarizerTypes";
-import { SummarizeHeuristicData } from "./summarizerHeuristics";
-import { SummarizeResultBuilder } from "./summaryGenerator";
+	type IRetriableFailureError,
+} from "./summarizerTypes.js";
+import { SummaryCollection } from "./summaryCollection.js";
+import { SummarizeResultBuilder } from "./summaryGenerator.js";
 
 const summarizingError = "summarizingError";
 
@@ -48,104 +53,95 @@ export class SummarizingWarning
 	readonly errorType = summarizingError;
 	readonly canRetry = true;
 
-	constructor(errorMessage: string, readonly logged: boolean = false) {
+	constructor(
+		errorMessage: string,
+		readonly logged: boolean = false,
+	) {
 		super(errorMessage);
 	}
 
-	static wrap(error: any, logged: boolean = false, logger: ITelemetryLogger) {
-		const newErrorFn = (errMsg: string) => new SummarizingWarning(errMsg, logged);
+	static wrap(
+		error: unknown,
+		logged: boolean = false,
+		logger: ITelemetryLoggerExt,
+	): SummarizingWarning {
+		const newErrorFn = (errMsg: string): SummarizingWarning =>
+			new SummarizingWarning(errMsg, logged);
 		return wrapErrorAndLog<SummarizingWarning>(error, newErrorFn, logger);
 	}
 }
 
-export const createSummarizingWarning = (errorMessage: string, logged: boolean) =>
-	new SummarizingWarning(errorMessage, logged);
+export const createSummarizingWarning = (
+	errorMessage: string,
+	logged: boolean,
+): SummarizingWarning => new SummarizingWarning(errorMessage, logged);
 
 /**
  * Summarizer is responsible for coordinating when to generate and send summaries.
  * It is the main entry point for summary work.
  * It is created only by summarizing container (i.e. one with clientType === "summarizer")
+ * @legacy
+ * @alpha
+ * @deprecated This type will be moved to internal in 2.30. External usage is not necessary or supported.
  */
-export class Summarizer extends EventEmitter implements ISummarizer {
-	public get IFluidLoadable() {
-		return this;
-	}
-	public get ISummarizer() {
+export class Summarizer extends TypedEventEmitter<ISummarizerEvents> implements ISummarizer {
+	public get ISummarizer(): this {
 		return this;
 	}
 
-	private readonly logger: ITelemetryLogger;
+	private readonly logger: ITelemetryLoggerExt;
 	private runningSummarizer?: RunningSummarizer;
 	private _disposed: boolean = false;
 	private starting: boolean = false;
 
-	private readonly innerHandle: IFluidHandle<this>;
-
-	public get handle(): IFluidHandle<this> {
-		return this.innerHandle;
-	}
 	private readonly stopDeferred = new Deferred<SummarizerStopReason>();
 
 	constructor(
-		url: string,
-		/** Reference to runtime that created this object.
+		/**
+		 * Reference to runtime that created this object.
 		 * i.e. runtime with clientType === "summarizer"
 		 */
+		// eslint-disable-next-line import/no-deprecated
 		private readonly runtime: ISummarizerRuntime,
 		private readonly configurationGetter: () => ISummaryConfiguration,
-		/** Represents an object that can generate summary.
+		/**
+		 * Represents an object that can generate summary.
 		 * In practical terms, it's same runtime (this.runtime) with clientType === "summarizer".
 		 */
+		// eslint-disable-next-line import/no-deprecated
 		private readonly internalsProvider: ISummarizerInternalsProvider,
 		handleContext: IFluidHandleContext,
 		public readonly summaryCollection: SummaryCollection,
 		private readonly runCoordinatorCreateFn: (
+			// eslint-disable-next-line import/no-deprecated
 			runtime: IConnectableRuntime,
+			// eslint-disable-next-line import/no-deprecated
 		) => Promise<ICancellableSummarizerController>,
 	) {
 		super();
-		this.logger = ChildLogger.create(this.runtime.logger, "Summarizer");
-		this.innerHandle = new SummarizerHandle(this, url, handleContext);
-	}
-
-	/**
-	 * Creates a Summarizer and its underlying client.
-	 * Note that different implementations of ILoader will handle the URL differently.
-	 * ILoader provided by a ContainerRuntime is a RelativeLoader, which will treat URL's
-	 * starting with "/" as relative to the Container. The general ILoader
-	 * interface will expect an absolute URL and will not handle "/".
-	 * @param loader - the loader that resolves the request
-	 * @param url - the URL used to resolve the container
-	 */
-	public static async create(loader: ILoader, url: string): Promise<ISummarizer> {
-		const request: IRequest = {
-			headers: {
-				[LoaderHeader.cache]: false,
-				[LoaderHeader.clientDetails]: {
-					capabilities: { interactive: false },
-					type: summarizerClientType,
-				},
-				[DriverHeader.summarizingClient]: true,
-				[LoaderHeader.reconnect]: false,
-			},
-			url,
-		};
-
-		const resolvedContainer = await loader.resolve(request);
-		const fluidObject = await requestFluidObject<FluidObject<ISummarizer>>(resolvedContainer, {
-			url: "_summarizer",
+		this.logger = createChildLogger({
+			logger: this.runtime.baseLogger,
+			namespace: "Summarizer",
 		});
-		if (fluidObject.ISummarizer === undefined) {
-			throw new UsageError("Fluid object does not implement ISummarizer");
-		}
-		return fluidObject.ISummarizer;
 	}
 
 	public async run(onBehalfOf: string): Promise<SummarizerStopReason> {
 		try {
-			return await this.runCore(onBehalfOf);
+			const stopReason = await this.runCore(onBehalfOf);
+			this.emit("summarizerStop", {
+				stopReason,
+				numUnsummarizedRuntimeOps: this._heuristicData?.numRuntimeOps,
+				numUnsummarizedNonRuntimeOps: this._heuristicData?.numNonRuntimeOps,
+			});
+			return stopReason;
 		} catch (error) {
 			this.stop("summarizerException");
+			this.emit("summarizerStop", {
+				stopReason: "summarizerException",
+				error,
+				numUnsummarizedRuntimeOps: this._heuristicData?.numRuntimeOps,
+				numUnsummarizedNonRuntimeOps: this._heuristicData?.numNonRuntimeOps,
+			});
 			throw SummarizingWarning.wrap(error, false /* logged */, this.logger);
 		} finally {
 			this.close();
@@ -157,24 +153,26 @@ export class Summarizer extends EventEmitter implements ISummarizer {
 	 * the run promise, and also close the container.
 	 * @param reason - reason code for stopping
 	 */
-	public stop(reason: SummarizerStopReason) {
+	public stop(reason: SummarizerStopReason): void {
 		this.stopDeferred.resolve(reason);
 	}
 
-	public close() {
+	public close(): void {
 		// This will result in "summarizerClientDisconnected" stop reason recorded in telemetry,
 		// unless stop() was called earlier
 		this.dispose();
-		(this.runtime.disposeFn ?? this.runtime.closeFn)();
+		this.runtime.disposeFn();
 	}
 
 	private async runCore(onBehalfOf: string): Promise<SummarizerStopReason> {
+		// eslint-disable-next-line import/no-deprecated
 		const runCoordinator: ICancellableSummarizerController = await this.runCoordinatorCreateFn(
 			this.runtime,
 		);
 
 		// Wait for either external signal to cancel, or loss of connectivity.
 		const stopP = Promise.race([runCoordinator.waitCancelled, this.stopDeferred.promise]);
+		// eslint-disable-next-line no-void
 		void stopP.then((reason) => {
 			this.logger.sendTelemetryEvent({
 				eventName: "StoppingSummarizer",
@@ -184,8 +182,19 @@ export class Summarizer extends EventEmitter implements ISummarizer {
 		});
 
 		if (runCoordinator.cancelled) {
+			this.emit("summarizerStartupFailed", {
+				reason: await runCoordinator.waitCancelled,
+				numUnsummarizedRuntimeOps: this._heuristicData?.numRuntimeOps,
+				numUnsummarizedNonRuntimeOps: this._heuristicData?.numNonRuntimeOps,
+			});
 			return runCoordinator.waitCancelled;
 		}
+
+		this.emit("summarizerStart", {
+			onBehalfOf,
+			numUnsummarizedRuntimeOps: this._heuristicData?.numRuntimeOps,
+			numUnsummarizedNonRuntimeOps: this._heuristicData?.numNonRuntimeOps,
+		});
 
 		const runningSummarizer = await this.start(onBehalfOf, runCoordinator);
 
@@ -223,11 +232,13 @@ export class Summarizer extends EventEmitter implements ISummarizer {
 	 * Should we try to run a last summary for the given stop reason?
 	 * Currently only allows "parentNotConnected"
 	 * @param stopReason - SummarizerStopReason
-	 * @returns - true if the stop reason can run a last summary
+	 * @returns `true` if the stop reason can run a last summary, otherwise `false`.
 	 */
 	public static stopReasonCanRunLastSummary(stopReason: SummarizerStopReason): boolean {
 		return stopReason === "parentNotConnected";
 	}
+
+	private _heuristicData: ISummarizeHeuristicData | undefined;
 
 	/**
 	 * Put the summarizer in a started state, including creating and initializing the RunningSummarizer.
@@ -236,10 +247,11 @@ export class Summarizer extends EventEmitter implements ISummarizer {
 	 * @param onBehalfOf - ID of the client that requested that the summarizer start
 	 * @param runCoordinator - cancellation token
 	 * @param newConfig - Summary configuration to override the existing config when invoking the RunningSummarizer.
-	 * @returns - Promise that is fulfilled when the RunningSummarizer is ready
+	 * @returns A promise that is fulfilled when the RunningSummarizer is ready.
 	 */
 	private async start(
 		onBehalfOf: string,
+		// eslint-disable-next-line import/no-deprecated
 		runCoordinator: ICancellableSummarizerController,
 	): Promise<RunningSummarizer> {
 		if (this.runningSummarizer) {
@@ -266,33 +278,32 @@ export class Summarizer extends EventEmitter implements ISummarizer {
 			throw new UsageError("clientId should be defined if connected.");
 		}
 
+		this._heuristicData = new SummarizeHeuristicData(
+			this.runtime.deltaManager.lastSequenceNumber,
+			{
+				/**
+				 * summary attempt baseline for heuristics
+				 */
+				refSequenceNumber: this.runtime.deltaManager.initialSequenceNumber,
+				summaryTime: Date.now(),
+			} as const,
+		);
+
 		const runningSummarizer = await RunningSummarizer.start(
 			this.logger,
 			this.summaryCollection.createWatcher(clientId),
 			this.configurationGetter(),
 			async (...args) => this.internalsProvider.submitSummary(...args), // submitSummaryCallback
-			async (...args) => this.internalsProvider.refreshLatestSummaryAck(...args), // refreshLatestSummaryCallback
-			new SummarizeHeuristicData(this.runtime.deltaManager.lastSequenceNumber, {
-				/** summary attempt baseline for heuristics */
-				refSequenceNumber: this.runtime.deltaManager.initialSequenceNumber,
-				summaryTime: Date.now(),
-			} as const),
-			(errorMessage: string) => {
-				if (!this._disposed) {
-					this.logger.sendErrorEvent(
-						{ eventName: "summarizingError" },
-						createSummarizingWarning(errorMessage, true),
-					);
-				}
-			},
+			async (...args) => this.internalsProvider.refreshLatestSummaryAck(...args), // refreshLatestSummaryAckCallback
+			this._heuristicData,
 			this.summaryCollection,
 			runCoordinator /* cancellationToken */,
 			(reason) => runCoordinator.stop(reason) /* stopSummarizerCallback */,
 			this.runtime,
 		);
 		this.runningSummarizer = runningSummarizer;
+		this.setupForwardedEvents();
 		this.starting = false;
-
 		return runningSummarizer;
 	}
 
@@ -302,18 +313,19 @@ export class Summarizer extends EventEmitter implements ISummarizer {
 	 * properties.
 	 * Called by ContainerRuntime when it is disposed, as well as at the end the run().
 	 */
-	public dispose() {
+	public dispose(): void {
 		// Given that the call can come from own ContainerRuntime, ensure that we stop all the processes.
 		this.stop("summarizerClientDisconnected");
 
 		this._disposed = true;
 		if (this.runningSummarizer) {
+			this.cleanupForwardedEvents();
 			this.runningSummarizer.dispose();
 			this.runningSummarizer = undefined;
 		}
 	}
 
-	public readonly summarizeOnDemand: ISummarizer["summarizeOnDemand"] = (...args) => {
+	public summarizeOnDemand(options: IOnDemandSummarizeOptions): ISummarizeResults {
 		try {
 			if (this._disposed || this.runningSummarizer?.disposed) {
 				throw new UsageError("Summarizer is already disposed.");
@@ -332,7 +344,7 @@ export class Summarizer extends EventEmitter implements ISummarizer {
 			const builder = new SummarizeResultBuilder();
 			if (this.runningSummarizer) {
 				// Summarizer is already running. Go ahead and start.
-				return this.runningSummarizer.summarizeOnDemand(builder, ...args);
+				return this.runningSummarizer.summarizeOnDemand(options, builder);
 			}
 
 			// Summarizer isn't running, so we need to start it, which is an async operation.
@@ -349,7 +361,7 @@ export class Summarizer extends EventEmitter implements ISummarizer {
 					startP
 						.then(async (runningSummarizer) => {
 							// Successfully started the summarizer. Run it.
-							runningSummarizer.summarizeOnDemand(builder, ...args);
+							runningSummarizer.summarizeOnDemand(options, builder);
 							// Wait for a command to stop or loss of connectivity before tearing down the summarizer and client.
 							const stopReason = await Promise.race([
 								this.stopDeferred.promise,
@@ -359,21 +371,21 @@ export class Summarizer extends EventEmitter implements ISummarizer {
 							runCoordinator.stop(stopReason);
 							this.close();
 						})
-						.catch((reason) => {
-							builder.fail("Failed to start summarizer", reason);
+						.catch((error: IRetriableFailureError) => {
+							builder.fail("Failed to start summarizer", error);
 						});
 				})
-				.catch((reason) => {
-					builder.fail("Failed to create cancellation token", reason);
+				.catch((error: IRetriableFailureError) => {
+					builder.fail("Failed to create cancellation token", error);
 				});
 
 			return builder.build();
 		} catch (error) {
 			throw SummarizingWarning.wrap(error, false /* logged */, this.logger);
 		}
-	};
+	}
 
-	public readonly enqueueSummarize: ISummarizer["enqueueSummarize"] = (...args) => {
+	public enqueueSummarize(options: IEnqueueSummarizeOptions): EnqueueSummarizeResult {
 		if (
 			this._disposed ||
 			this.runningSummarizer === undefined ||
@@ -381,6 +393,31 @@ export class Summarizer extends EventEmitter implements ISummarizer {
 		) {
 			throw new UsageError("Summarizer is not running or already disposed.");
 		}
-		return this.runningSummarizer.enqueueSummarize(...args);
-	};
+		return this.runningSummarizer.enqueueSummarize(options);
+	}
+
+	public recordSummaryAttempt?(summaryRefSeqNum?: number): void {
+		this._heuristicData?.recordAttempt(summaryRefSeqNum);
+	}
+
+	private readonly forwardedEvents = new Map<string, () => void>();
+
+	private setupForwardedEvents(): void {
+		for (const event of ["summarize", "summarizeAllAttemptsFailed"]) {
+			const listener = (...args: unknown[]): void => {
+				this.emit(event, ...args);
+			};
+			// TODO: better typing here
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument
+			this.runningSummarizer?.on(event as any, listener);
+			this.forwardedEvents.set(event, listener);
+		}
+	}
+
+	private cleanupForwardedEvents(): void {
+		for (const [event, listener] of this.forwardedEvents.entries()) {
+			this.runningSummarizer?.off(event, listener);
+		}
+		this.forwardedEvents.clear();
+	}
 }

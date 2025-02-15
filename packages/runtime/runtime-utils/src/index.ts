@@ -3,44 +3,51 @@
  * Licensed under the MIT License.
  */
 
-export { generateHandleContextPath } from "./dataStoreHandleContextUtils";
+export { generateHandleContextPath } from "./dataStoreHandleContextUtils.js";
 export {
 	create404Response,
 	createDataStoreFactory,
 	createResponseError,
 	exceptionToResponse,
 	Factory,
-	packagePathToTelemetryProperty,
-	requestFluidObject,
 	responseToException,
-} from "./dataStoreHelpers";
-export { ObjectStoragePartition } from "./objectstoragepartition";
-export { getNormalizedObjectStoragePathParts, listBlobsAtTreePath } from "./objectstorageutils";
-export { RequestParser } from "./requestParser";
-export { RuntimeFactoryHelper } from "./runtimeFactoryHelper";
-// TODO: Move summarizerNode content to container-runtime in next branch.
+} from "./dataStoreHelpers.js";
 export {
-	createRootSummarizerNode,
-	createRootSummarizerNodeWithGC,
-	IFetchSnapshotResult,
-	IRootSummarizerNode,
-	IRootSummarizerNodeWithGC,
-	ISummarizerNodeRootContract,
-	RefreshSummaryResult,
-} from "./summarizerNode";
+	ISerializedHandle,
+	isSerializedHandle,
+	isFluidHandle,
+	toFluidHandleErased,
+	toFluidHandleInternal,
+	FluidHandleBase,
+	compareFluidHandles,
+} from "./handles.js";
+export { ObjectStoragePartition } from "./objectstoragepartition.js";
+export {
+	getNormalizedObjectStoragePathParts,
+	listBlobsAtTreePath,
+} from "./objectstorageutils.js";
+export { RequestParser } from "./requestParser.js";
+export { RuntimeFactoryHelper } from "./runtimeFactoryHelper.js";
 export {
 	addBlobToSummary,
 	addSummarizeResultToSummary,
-	addTreeToSummary,
 	calculateStats,
 	convertSnapshotTreeToSummaryTree,
 	convertSummaryTreeToITree,
 	convertToSummaryTree,
 	convertToSummaryTreeWithStats,
+	GCDataBuilder,
 	getBlobSize,
 	mergeStats,
+	processAttachMessageGCData,
 	SummaryTreeBuilder,
 	TelemetryContext,
 	utf8ByteLength,
-} from "./summaryUtils";
-export { ReadAndParseBlob, seqFromTree } from "./utils";
+} from "./summaryUtils.js";
+export { unpackChildNodesUsedRoutes } from "./unpackUsedRoutes.js";
+export { ReadAndParseBlob, seqFromTree, encodeCompactIdToString } from "./utils.js";
+export { isSnapshotFetchRequiredForLoadingGroupId } from "./snapshotUtils.js";
+export {
+	toDeltaManagerErased,
+	toDeltaManagerInternal,
+} from "./deltaManager.js";
