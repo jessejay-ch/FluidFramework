@@ -3,20 +3,31 @@
  * Licensed under the MIT License.
  */
 
-import { IDisposable, IEvent, ITelemetryLogger } from "@fluidframework/common-definitions";
-import { Deferred, assert, TypedEventEmitter } from "@fluidframework/common-utils";
-import { IDeltaManager } from "@fluidframework/container-definitions";
+import { TypedEventEmitter } from "@fluid-internal/client-utils";
+import { IDeltaManager } from "@fluidframework/container-definitions/internal";
+import {
+	IDisposable,
+	IEvent,
+	type ITelemetryBaseLogger,
+} from "@fluidframework/core-interfaces";
+import { assert, Deferred } from "@fluidframework/core-utils/internal";
 import {
 	IDocumentMessage,
-	ISequencedDocumentMessage,
 	ISummaryAck,
 	ISummaryContent,
 	ISummaryNack,
 	MessageType,
-} from "@fluidframework/protocol-definitions";
+	ISequencedDocumentMessage,
+} from "@fluidframework/driver-definitions/internal";
+import {
+	createChildLogger,
+	ITelemetryLoggerExt,
+} from "@fluidframework/telemetry-utils/internal";
 
 /**
  * Interface for summary op messages with typed contents.
+ * @legacy
+ * @alpha
  */
 export interface ISummaryOpMessage extends ISequencedDocumentMessage {
 	type: MessageType.Summarize;
@@ -25,6 +36,8 @@ export interface ISummaryOpMessage extends ISequencedDocumentMessage {
 
 /**
  * Interface for summary ack messages with typed contents.
+ * @legacy
+ * @alpha
  */
 export interface ISummaryAckMessage extends ISequencedDocumentMessage {
 	type: MessageType.SummaryAck;
@@ -33,6 +46,8 @@ export interface ISummaryAckMessage extends ISequencedDocumentMessage {
 
 /**
  * Interface for summary nack messages with typed contents.
+ * @legacy
+ * @alpha
  */
 export interface ISummaryNackMessage extends ISequencedDocumentMessage {
 	type: MessageType.SummaryNack;
@@ -42,6 +57,8 @@ export interface ISummaryNackMessage extends ISequencedDocumentMessage {
 /**
  * A single summary which can be tracked as it goes through its life cycle.
  * The life cycle is: Local to Broadcast to Acked/Nacked.
+ * @legacy
+ * @alpha
  */
 export interface ISummary {
 	readonly clientId: string;
@@ -52,6 +69,8 @@ export interface ISummary {
 
 /**
  * A single summary which has already been acked by the server.
+ * @legacy
+ * @alpha
  */
 export interface IAckedSummary {
 	readonly summaryOp: ISummaryOpMessage;
@@ -66,11 +85,13 @@ enum SummaryState {
 }
 
 class Summary implements ISummary {
-	public static createLocal(clientId: string, clientSequenceNumber: number) {
+	public static createLocal(clientId: string, clientSequenceNumber: number): Summary {
 		return new Summary(clientId, clientSequenceNumber);
 	}
-	public static createFromOp(op: ISummaryOpMessage) {
-		const summary = new Summary(op.clientId, op.clientSequenceNumber);
+	public static createFromOp(op: ISummaryOpMessage): Summary {
+		// TODO: Verify whether this should be able to handle server-generated ops (with null clientId)
+
+		const summary = new Summary(op.clientId as string, op.clientSequenceNumber);
 		summary.broadcast(op);
 		return summary;
 	}
@@ -83,10 +104,10 @@ class Summary implements ISummary {
 	private readonly defSummaryOp = new Deferred<void>();
 	private readonly defSummaryAck = new Deferred<void>();
 
-	public get summaryOp() {
+	public get summaryOp(): ISummaryOpMessage | undefined {
 		return this._summaryOp;
 	}
-	public get summaryAckNack() {
+	public get summaryAckNack(): ISummaryAckMessage | ISummaryNackMessage | undefined {
 		return this._summaryAckNack;
 	}
 
@@ -99,7 +120,7 @@ class Summary implements ISummary {
 		return this.state === SummaryState.Acked;
 	}
 
-	public broadcast(op: ISummaryOpMessage) {
+	public broadcast(op: ISummaryOpMessage): boolean {
 		assert(
 			this.state === SummaryState.Local,
 			0x175 /* "Can only broadcast if summarizer starts in local state" */,
@@ -110,7 +131,7 @@ class Summary implements ISummary {
 		return true;
 	}
 
-	public ackNack(op: ISummaryAckMessage | ISummaryNackMessage) {
+	public ackNack(op: ISummaryAckMessage | ISummaryNackMessage): boolean {
 		assert(
 			this.state === SummaryState.Broadcast,
 			0x176 /* "Can only ack/nack if summarizer is in broadcasting state" */,
@@ -136,6 +157,8 @@ class Summary implements ISummary {
 
 /**
  * Watches summaries created by a specific client.
+ * @legacy
+ * @alpha
  */
 export interface IClientSummaryWatcher extends IDisposable {
 	watchSummary(clientSequenceNumber: number): ISummary;
@@ -151,7 +174,7 @@ class ClientSummaryWatcher implements IClientSummaryWatcher {
 	private readonly localSummaries = new Map<number, Summary>();
 	private _disposed = false;
 
-	public get disposed() {
+	public get disposed(): boolean {
 		return this._disposed;
 	}
 
@@ -177,8 +200,7 @@ class ClientSummaryWatcher implements IClientSummaryWatcher {
 	 * Waits until all of the pending summaries in the underlying SummaryCollection
 	 * are acked/nacked.
 	 */
-	// eslint-disable-next-line @typescript-eslint/promise-function-async
-	public waitFlushed() {
+	public async waitFlushed(): Promise<IAckedSummary | undefined> {
 		return this.summaryCollection.waitFlushed();
 	}
 
@@ -186,7 +208,7 @@ class ClientSummaryWatcher implements IClientSummaryWatcher {
 	 * Gets a watched summary or returns undefined if not watched.
 	 * @param clientSequenceNumber - client sequence number of sent summary op
 	 */
-	public tryGetSummary(clientSequenceNumber: number) {
+	public tryGetSummary(clientSequenceNumber: number): Summary | undefined {
 		return this.localSummaries.get(clientSequenceNumber);
 	}
 
@@ -194,22 +216,35 @@ class ClientSummaryWatcher implements IClientSummaryWatcher {
 	 * Starts watching a summary made by this client.
 	 * @param summary - summary to start watching
 	 */
-	public setSummary(summary: Summary) {
+	public setSummary(summary: Summary): void {
 		this.localSummaries.set(summary.clientSequenceNumber, summary);
 	}
 
-	public dispose() {
+	public dispose(): void {
 		this.summaryCollection.removeWatcher(this.clientId);
 		this._disposed = true;
 	}
 }
-
+/**
+ * @legacy
+ * @alpha
+ */
 export type OpActionEventName =
 	| MessageType.Summarize
 	| MessageType.SummaryAck
 	| MessageType.SummaryNack
 	| "default";
+
+/**
+ * @legacy
+ * @alpha
+ */
 export type OpActionEventListener = (op: ISequencedDocumentMessage) => void;
+
+/**
+ * @legacy
+ * @alpha
+ */
 export interface ISummaryCollectionOpEvents extends IEvent {
 	(event: OpActionEventName, listener: OpActionEventListener);
 }
@@ -218,6 +253,8 @@ export interface ISummaryCollectionOpEvents extends IEvent {
  * Data structure that looks at the op stream to track summaries as they
  * are broadcast, acked and nacked.
  * It provides functionality for watching specific summaries.
+ * @legacy
+ * @alpha
  */
 export class SummaryCollection extends TypedEventEmitter<ISummaryCollectionOpEvents> {
 	// key: clientId
@@ -239,27 +276,29 @@ export class SummaryCollection extends TypedEventEmitter<ISummaryCollectionOpEve
 		return super.emit(event, ...args);
 	}
 
-	public get opsSinceLastAck() {
+	public get opsSinceLastAck(): number {
 		return (
 			this.deltaManager.lastSequenceNumber -
 			(this.lastAck?.summaryAck.sequenceNumber ?? this.deltaManager.initialSequenceNumber)
 		);
 	}
 
-	public addOpListener(listener: () => void) {
+	public addOpListener(listener: () => void): void {
 		this.deltaManager.on("op", listener);
 	}
 
-	public removeOpListener(listener: () => void) {
+	public removeOpListener(listener: () => void): void {
 		this.deltaManager.off("op", listener);
 	}
 
+	private readonly logger: ITelemetryLoggerExt;
 	public constructor(
 		private readonly deltaManager: IDeltaManager<ISequencedDocumentMessage, IDocumentMessage>,
-		private readonly logger: ITelemetryLogger,
+		logger: ITelemetryBaseLogger,
 	) {
 		super();
 		this.deltaManager.on("op", (op) => this.handleOp(op));
+		this.logger = createChildLogger({ logger });
 	}
 
 	/**
@@ -273,16 +312,19 @@ export class SummaryCollection extends TypedEventEmitter<ISummaryCollectionOpEve
 		return watcher;
 	}
 
-	public removeWatcher(clientId: string) {
+	public removeWatcher(clientId: string): void {
 		this.summaryWatchers.delete(clientId);
 	}
 
-	public setPendingAckTimerTimeoutCallback(maxAckWaitTime: number, timeoutCallback: () => void) {
+	public setPendingAckTimerTimeoutCallback(
+		maxAckWaitTime: number,
+		timeoutCallback: () => void,
+	): void {
 		this.maxAckWaitTime = maxAckWaitTime;
 		this.pendingAckTimerTimeoutCallback = timeoutCallback;
 	}
 
-	public unsetPendingAckTimerTimeoutCallback() {
+	public unsetPendingAckTimerTimeoutCallback(): void {
 		this.maxAckWaitTime = undefined;
 		this.pendingAckTimerTimeoutCallback = undefined;
 	}
@@ -318,13 +360,11 @@ export class SummaryCollection extends TypedEventEmitter<ISummaryCollectionOpEve
 		return this.lastAck;
 	}
 
-	private parseContent(op: ISequencedDocumentMessage) {
-		// back-compat: ADO #1385: Make this unconditional in the future,
-		// when Container.processRemoteMessage stops parsing contents. That said, we should move to
-		// listen for "op" events from ContainerRuntime, and parsing may not be required at all if
-		// ContainerRuntime.process() would parse it for all types of ops.
-		// Can make either of those changes only when LTS moves to a version that has no content
-		// parsing in loader layer!
+	private parseContent(op: ISequencedDocumentMessage): void {
+		// This should become unconditional once (Loader LTS) reaches 2.4 or later
+		// There will be a long time of needing both cases, until LTS catches up to the change.
+		// That said, we may instead move to listen for "op" events from ContainerRuntime,
+		// and parsing may not be required at all if ContainerRuntime.process() continues to parse it for all types of ops.
 		if (typeof op.contents === "string") {
 			op.contents = JSON.parse(op.contents);
 		}
@@ -334,25 +374,26 @@ export class SummaryCollection extends TypedEventEmitter<ISummaryCollectionOpEve
 	 * Handler for ops; only handles ops relating to summaries.
 	 * @param op - op message to handle
 	 */
-	private handleOp(opArg: ISequencedDocumentMessage) {
+	private handleOp(opArg: ISequencedDocumentMessage): void {
 		const op = { ...opArg };
 
 		switch (op.type) {
-			case MessageType.Summarize:
+			case MessageType.Summarize: {
 				this.parseContent(op);
 				return this.handleSummaryOp(op as ISummaryOpMessage);
+			}
 			case MessageType.SummaryAck:
-			case MessageType.SummaryNack:
+			case MessageType.SummaryNack: {
 				// Old files (prior to PR #10077) may not contain this info
-				// back-compat: ADO #1385: remove cast when ISequencedDocumentMessage changes are propagated
-				if ((op as any).data !== undefined) {
-					op.contents = JSON.parse((op as any).data);
-				} else {
+				if (op.data === undefined) {
 					this.parseContent(op);
+				} else {
+					op.contents = JSON.parse(op.data);
 				}
 				return op.type === MessageType.SummaryAck
 					? this.handleSummaryAck(op as ISummaryAckMessage)
 					: this.handleSummaryNack(op as ISummaryNackMessage);
+			}
 			default: {
 				// If the difference between timestamp of current op and last summary op is greater than
 				// the maxAckWaitTime, then we need to inform summarizer to not wait and summarize
@@ -372,11 +413,13 @@ export class SummaryCollection extends TypedEventEmitter<ISummaryCollectionOpEve
 		}
 	}
 
-	private handleSummaryOp(op: ISummaryOpMessage) {
+	private handleSummaryOp(op: ISummaryOpMessage): void {
 		let summary: Summary | undefined;
 
 		// Check if summary already being watched, broadcast if so
-		const watcher = this.summaryWatchers.get(op.clientId);
+		// TODO: Verify whether this should be able to handle server-generated ops (with null clientId)
+
+		const watcher = this.summaryWatchers.get(op.clientId as string);
 		if (watcher) {
 			summary = watcher.tryGetSummary(op.clientSequenceNumber);
 			if (summary) {
@@ -396,9 +439,10 @@ export class SummaryCollection extends TypedEventEmitter<ISummaryCollectionOpEve
 		this.emit(MessageType.Summarize, op);
 	}
 
-	private handleSummaryAck(op: ISummaryAckMessage) {
+	private handleSummaryAck(op: ISummaryAckMessage): void {
 		const seq = op.contents.summaryProposal.summarySequenceNumber;
 		const summary = this.pendingSummaries.get(seq);
+		// eslint-disable-next-line @typescript-eslint/prefer-optional-chain -- optional chain is not logically equivalent
 		if (!summary || summary.summaryOp === undefined) {
 			// Summary ack without an op should be rare. We could fetch the
 			// reference sequence number from the snapshot, but instead we
@@ -438,7 +482,7 @@ export class SummaryCollection extends TypedEventEmitter<ISummaryCollectionOpEve
 		}
 	}
 
-	private handleSummaryNack(op: ISummaryNackMessage) {
+	private handleSummaryNack(op: ISummaryNackMessage): void {
 		const seq = op.contents.summaryProposal.summarySequenceNumber;
 		const summary = this.pendingSummaries.get(seq);
 		if (summary) {

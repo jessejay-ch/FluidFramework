@@ -9,67 +9,59 @@ import {
 	BenchmarkRunningOptionsSync,
 	BenchmarkRunningOptionsAsync,
 	BenchmarkTimingOptions,
+	benchmarkArgumentsIsCustom,
+	BenchmarkTimer,
 } from "./Configuration";
-import { Stats, getArrayStatistics } from "./ReporterUtilities";
-import { Timer, defaultMinTime, timer } from "./timer";
+import type { BenchmarkData } from "./ResultTypes";
+import { getArrayStatistics, prettyNumber } from "./RunnerUtilities";
+import { Timer, defaultMinimumTime, timer } from "./timer";
 
-export const defaults: Required<BenchmarkTimingOptions> = {
+/**
+ * @public
+ */
+export enum Phase {
+	WarmUp,
+	AdjustIterationPerBatch,
+	CollectData,
+}
+
+export const defaultTimingOptions: Required<BenchmarkTimingOptions> = {
 	maxBenchmarkDurationSeconds: 5,
 	minBatchCount: 5,
-	minBatchDurationSeconds: defaultMinTime,
+	minBatchDurationSeconds: defaultMinimumTime,
+	startPhase: Phase.WarmUp,
 };
 
 /**
- * Result of successfully running a benchmark.
+ * Use for readonly view of Json compatible data.
+ *
+ * Note that this does not robustly forbid non json comparable data via type checking,
+ * but instead mostly restricts access to it.
+ *
  * @public
  */
-export interface BenchmarkData {
-	/**
-	 * Iterations per batch.
-	 */
-	readonly iterationsPerBatch: number;
+export type JsonCompatible =
+	| string
+	| number
+	| boolean
+	| readonly JsonCompatible[]
+	| { readonly [P in string]: JsonCompatible | undefined };
 
-	/**
-	 * Number of batches, each with `iterationsPerBatch` iterations.
-	 */
-	readonly numberOfBatches: number;
-
-	/**
-	 * Stats about runtime, in seconds.
-	 * This is already scaled to be per iteration and not per batch.
-	 */
-	readonly stats: Stats;
-
-	/**
-	 * Time it took to run the benchmark in seconds.
-	 */
-	readonly elapsedSeconds: number;
-}
+export type Results = { readonly [P in string]: JsonCompatible | undefined };
 
 /**
- * Result of trying to run a benchmark.
+ * Runs the benchmark.
  * @public
  */
-export type BenchmarkResult = BenchmarkError | BenchmarkData;
-
-/**
- * @public
- */
-export function isResultError(result: BenchmarkResult): result is BenchmarkError {
-	return (result as Partial<BenchmarkError>).error !== undefined;
-}
-
-/**
- * Result of failing to run a benchmark.
- * @public
- */
-export interface BenchmarkError {
-	error: string;
-}
-
 export async function runBenchmark(args: BenchmarkRunningOptions): Promise<BenchmarkData> {
+	if (benchmarkArgumentsIsCustom(args)) {
+		const state = new BenchmarkState(timer, args);
+		await args.benchmarkFnCustom(state);
+		return state.computeData();
+	}
+
 	const options = {
-		...defaults,
+		...defaultTimingOptions,
 		...args,
 	};
 	const { isAsync, benchmarkFn: argsBenchmarkFn } = validateBenchmarkArguments(args);
@@ -81,7 +73,7 @@ export async function runBenchmark(args: BenchmarkRunningOptions): Promise<Bench
 	if (isAsync) {
 		data = await runBenchmarkAsync({
 			...options,
-			benchmarkFnAsync: argsBenchmarkFn as any,
+			benchmarkFnAsync: argsBenchmarkFn,
 		});
 	} else {
 		data = runBenchmarkSync({ ...options, benchmarkFn: argsBenchmarkFn });
@@ -101,45 +93,45 @@ function tryRunGarbageCollection(): void {
 	global?.gc?.();
 }
 
-enum Mode {
-	WarmUp,
-	AdjustIterationPerBatch,
-	CollectData,
-}
-
-class BenchmarkState<T> {
+class BenchmarkState<T> implements BenchmarkTimer<T> {
 	/**
 	 * Duration for each batch, in seconds.
 	 */
 	private readonly samples: number[];
 	private readonly options: Readonly<Required<BenchmarkTimingOptions>>;
 	private readonly startTime: T;
-	private mode: Mode = Mode.WarmUp;
+	private phase: Phase;
 	public iterationsPerBatch: number;
-	public constructor(public readonly timer: Timer<T>, options: BenchmarkTimingOptions) {
+	public constructor(
+		public readonly timer: Timer<T>,
+		options: BenchmarkTimingOptions,
+	) {
 		this.startTime = timer.now();
 		this.samples = [];
 		this.options = {
-			...defaults,
+			...defaultTimingOptions,
 			...options,
 		};
+		this.phase = this.options.startPhase;
 
 		if (this.options.minBatchCount < 1) {
 			throw new Error("Invalid minSampleCount");
 		}
-		this.iterationsPerBatch = this.options.minBatchCount;
+		this.iterationsPerBatch = 1;
 		tryRunGarbageCollection();
 	}
 
 	public recordBatch(duration: number): boolean {
-		switch (this.mode) {
-			case Mode.WarmUp: {
-				this.mode = Mode.AdjustIterationPerBatch;
+		switch (this.phase) {
+			case Phase.WarmUp: {
+				this.phase = Phase.AdjustIterationPerBatch;
 				return true;
 			}
-			case Mode.AdjustIterationPerBatch: {
+			case Phase.AdjustIterationPerBatch: {
 				if (!this.growBatchSize(duration)) {
-					this.mode = Mode.CollectData;
+					this.phase = Phase.CollectData;
+					// Since batch is big enough, include it in data collection.
+					return this.addSample(duration);
 				}
 				return true;
 			}
@@ -175,7 +167,7 @@ class BenchmarkState<T> {
 		}
 
 		const stats = getArrayStatistics(this.samples);
-		if (stats.marginOfErrorPercent < 1.0) {
+		if (stats.marginOfErrorPercent < 1) {
 			// Already below 1% margin of error.
 			// Note that this margin of error computation doesn't account for low frequency noise (noise spanning a time scale longer than this test so far)
 			// which can be caused by many factors like CPU frequency changes due to limited boost time or thermals.
@@ -184,7 +176,7 @@ class BenchmarkState<T> {
 		}
 
 		// Exit if way too many samples to avoid out of memory.
-		if (this.samples.length > 1000000) {
+		if (this.samples.length > 1_000_000) {
 			// Test failed to converge after many samples.
 			// TODO: produce some warning or error state in this case (and probably the case for hitting max time as well).
 			return false;
@@ -195,16 +187,44 @@ class BenchmarkState<T> {
 
 	public computeData(): BenchmarkData {
 		const now = this.timer.now();
-		const stats: Stats = getArrayStatistics(
-			this.samples.map((v) => v / this.iterationsPerBatch),
-		);
+		const stats = getArrayStatistics(this.samples.map((v) => v / this.iterationsPerBatch));
 		const data: BenchmarkData = {
 			elapsedSeconds: this.timer.toSeconds(this.startTime, now),
-			numberOfBatches: this.samples.length,
-			stats,
-			iterationsPerBatch: this.iterationsPerBatch,
+			customData: {
+				"Batch Count": {
+					rawValue: this.samples.length,
+					formattedValue: prettyNumber(this.samples.length, 0),
+				},
+				"Iterations per Batch": {
+					rawValue: this.iterationsPerBatch,
+					formattedValue: prettyNumber(this.iterationsPerBatch, 0),
+				},
+				"Period (ns/op)": {
+					rawValue: 1e9 * stats.arithmeticMean,
+					formattedValue: prettyNumber(1e9 * stats.arithmeticMean, 2),
+				},
+				"Margin of Error": {
+					rawValue: stats.marginOfError,
+					formattedValue: `±${prettyNumber(stats.marginOfError, 2)}%`,
+				},
+				"Relative Margin of Error": {
+					rawValue: stats.marginOfErrorPercent,
+					formattedValue: `±${prettyNumber(stats.marginOfErrorPercent, 2)}%`,
+				},
+			},
 		};
 		return data;
+	}
+
+	public timeBatch(callback: () => void): boolean {
+		let counter = this.iterationsPerBatch;
+		const before = this.timer.now();
+		while (counter--) {
+			callback();
+		}
+		const after = this.timer.now();
+		const duration = this.timer.toSeconds(before, after);
+		return this.recordBatch(duration);
 	}
 }
 
@@ -216,7 +236,9 @@ export function runBenchmarkSync(args: BenchmarkRunningOptionsSync): BenchmarkDa
 	const state = new BenchmarkState(timer, args);
 	while (
 		state.recordBatch(doBatch(state.iterationsPerBatch, args.benchmarkFn, args.beforeEachBatch))
-	) {}
+	) {
+		// No-op
+	}
 	return state.computeData();
 }
 
@@ -236,7 +258,9 @@ export async function runBenchmarkAsync(
 				args.beforeEachBatch,
 			),
 		)
-	) {}
+	) {
+		// No-op
+	}
 	return state.computeData();
 }
 

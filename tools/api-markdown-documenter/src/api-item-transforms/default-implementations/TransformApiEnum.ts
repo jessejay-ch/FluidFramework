@@ -2,30 +2,53 @@
  * Copyright (c) Microsoft Corporation and contributors. All rights reserved.
  * Licensed under the MIT License.
  */
-import { ApiEnum, ApiEnumMember, ApiItem, ApiItemKind } from "@microsoft/api-extractor-model";
 
-import { MarkdownDocumenterConfiguration } from "../../Configuration";
-import { DocumentationNode, SectionNode } from "../../documentation-domain";
-import { filterByKind } from "../../utilities";
-import { createMemberTables, wrapInSection } from "../helpers";
+import {
+	type ApiEnum,
+	type ApiEnumMember,
+	type ApiItem,
+	ApiItemKind,
+} from "@microsoft/api-extractor-model";
+
+import type { DocumentationNode, SectionNode } from "../../documentation-domain/index.js";
+import { getApiItemKind, getScopedMemberNameForDiagnostics } from "../../utilities/index.js";
+import { getFilteredMembers } from "../ApiItemTransformUtilities.js";
+import type { ApiItemTransformationConfiguration } from "../configuration/index.js";
+import { createMemberTables, wrapInSection } from "../helpers/index.js";
 
 /**
- * Default policy for rendering doc sections for `Enum` items.
+ * Default documentation transform for `Enum` items.
  */
 export function transformApiEnum(
 	apiEnum: ApiEnum,
-	config: Required<MarkdownDocumenterConfiguration>,
+	config: ApiItemTransformationConfiguration,
 	generateChildContent: (apiItem: ApiItem) => SectionNode[],
 ): SectionNode[] {
 	const sections: SectionNode[] = [];
 
-	const hasAnyChildren = apiEnum.members.length > 0;
-
-	if (hasAnyChildren) {
+	const filteredChildren = getFilteredMembers(apiEnum, config);
+	if (filteredChildren.length > 0) {
 		// Accumulate child items
-		const flags = filterByKind(apiEnum.members, [ApiItemKind.EnumMember]).map(
-			(apiItem) => apiItem as ApiEnumMember,
-		);
+		const flags: ApiEnumMember[] = [];
+		for (const child of filteredChildren) {
+			const childKind = getApiItemKind(child);
+			switch (childKind) {
+				case ApiItemKind.EnumMember: {
+					flags.push(child as ApiEnumMember);
+					break;
+				}
+				default: {
+					config.logger?.error(
+						`Child item "${
+							child.displayName
+						}" of Enum "${getScopedMemberNameForDiagnostics(
+							apiEnum,
+						)}" is of unsupported API item kind: "${childKind}"`,
+					);
+					break;
+				}
+			}
+		}
 
 		// Render summary tables
 		const memberTableSections = createMemberTables(
@@ -53,5 +76,5 @@ export function transformApiEnum(
 		}
 	}
 
-	return config.createChildContentSections(apiEnum, sections, config);
+	return config.defaultSectionLayout(apiEnum, sections, config);
 }

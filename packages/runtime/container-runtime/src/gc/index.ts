@@ -3,44 +3,58 @@
  * Licensed under the MIT License.
  */
 
-export { GarbageCollector } from "./garbageCollection";
+export { GarbageCollector } from "./garbageCollection.js";
+export { computeTombstoneTimeout } from "./gcConfigs.js";
 export {
-	currentGCVersion,
+	nextGCVersion,
 	defaultInactiveTimeoutMs,
+	defaultSweepGracePeriodMs,
 	defaultSessionExpiryDurationMs,
-	disableSweepLogKey,
 	GCNodeType,
 	gcTestModeKey,
-	gcTombstoneGenerationOptionName,
+	gcGenerationOptionName,
+	GCFeatureMatrix,
 	GCVersion,
-	gcVersionUpgradeToV2Key,
-	IGarbageCollectionRuntime, // Deprecated
+	gcVersionUpgradeToV4Key,
+	IGarbageCollectionRuntime,
 	IGarbageCollector,
 	IGarbageCollectorConfigs,
 	IGarbageCollectorCreateParams,
 	IGCMetadata,
+	IGCMetadata_Deprecated,
+	IGCNodeUpdatedProps,
+	IGCResult,
 	IGCRuntimeOptions,
+	IMarkPhaseStats,
+	ISweepPhaseStats,
 	IGCStats,
 	oneDayMs,
-	runGCKey,
 	runSessionExpiryKey,
-	runSweepKey,
 	stableGCVersion,
-	sweepAttachmentBlobsKey,
-	sweepDatastoresKey,
-	throwOnTombstoneLoadKey,
-	throwOnTombstoneUsageKey,
 	UnreferencedState,
-} from "./gcDefinitions";
+	disableThrowOnTombstoneLoadKey,
+	GarbageCollectionMessage,
+	GarbageCollectionMessageType,
+	ISweepMessage,
+} from "./gcDefinitions.js";
 export {
-	getSnapshotDataFromOldSnapshotFormat,
-	sendGCUnexpectedUsageEvent,
-	shouldAllowGcTombstoneEnforcement,
-} from "./gcHelpers";
-export { GCSummaryStateTracker } from "./gcSummaryStateTracker";
+	cloneGCData,
+	concatGarbageCollectionStates,
+	getGCVersionInEffect,
+	unpackChildNodesGCDetails,
+	urlToGCNodePath,
+} from "./gcHelpers.js";
+export { runGarbageCollection } from "./gcReferenceGraphAlgorithm.js";
 export {
-	skipClosureForXDaysKey,
-	closuresMapLocalStorageKey,
-	SweepReadyUsageDetectionHandler,
-} from "./gcSweepReadyUsageDetection";
-export { UnreferencedStateTracker } from "./gcUnreferencedStateTracker";
+	IGarbageCollectionNodeData,
+	IGarbageCollectionSnapshotData,
+	IGarbageCollectionState,
+	IGarbageCollectionSummaryDetailsLegacy,
+} from "./gcSummaryDefinitions.js";
+export {
+	gcStateBlobKey,
+	GCSummaryStateTracker,
+	IGCSummaryTrackingData,
+} from "./gcSummaryStateTracker.js";
+export { GCTelemetryTracker } from "./gcTelemetry.js";
+export { UnreferencedStateTracker } from "./gcUnreferencedStateTracker.js";

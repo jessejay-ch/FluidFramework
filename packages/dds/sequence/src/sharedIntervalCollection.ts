@@ -3,36 +3,38 @@
  * Licensed under the MIT License.
  */
 
-import { bufferToString } from "@fluidframework/common-utils";
+import { bufferToString } from "@fluid-internal/client-utils";
+import { assert } from "@fluidframework/core-utils/internal";
 import {
 	IChannelAttributes,
-	IFluidDataStoreRuntime,
-	IChannelStorageService,
-	IChannelServices,
 	IChannelFactory,
-} from "@fluidframework/datastore-definitions";
-import { ISequencedDocumentMessage, MessageType } from "@fluidframework/protocol-definitions";
-import { ISummaryTreeWithStats } from "@fluidframework/runtime-definitions";
+	IFluidDataStoreRuntime,
+	IChannelServices,
+	IChannelStorageService,
+} from "@fluidframework/datastore-definitions/internal";
 import {
-	createSingleBlobSummary,
+	MessageType,
+	ISequencedDocumentMessage,
+} from "@fluidframework/driver-definitions/internal";
+import { ISummaryTreeWithStats } from "@fluidframework/runtime-definitions/internal";
+import {
 	IFluidSerializer,
 	SharedObject,
-} from "@fluidframework/shared-object-base";
-import {
-	Interval,
-	IntervalCollection,
-	IntervalCollectionValueType,
-	ISerializableInterval,
-} from "./intervalCollection";
-import { DefaultMap } from "./defaultMap";
-import { pkgVersion } from "./packageVersion";
-import { IMapMessageLocalMetadata } from "./defaultMapInterfaces";
+	createSingleBlobSummary,
+} from "@fluidframework/shared-object-base/internal";
+
+import { IIntervalCollection, IntervalCollectionValueType } from "./intervalCollection.js";
+import { IMapOperation, IntervalCollectionMap } from "./intervalCollectionMap.js";
+import { IMapMessageLocalMetadata } from "./intervalCollectionMapInterfaces.js";
+import { ISerializableInterval, Interval } from "./intervals/index.js";
+import { pkgVersion } from "./packageVersion.js";
 
 const snapshotFileName = "header";
 
 /**
  * The factory that defines the SharedIntervalCollection.
  * @deprecated `SharedIntervalCollection` is not maintained and is planned to be removed.
+ * @internal
  */
 export class SharedIntervalCollectionFactory implements IChannelFactory {
 	public static readonly Type = "https://graph.microsoft.com/types/sharedIntervalCollection";
@@ -74,12 +76,17 @@ export class SharedIntervalCollectionFactory implements IChannelFactory {
 	}
 }
 
+/**
+ * @legacy
+ * @alpha
+ */
 export interface ISharedIntervalCollection<TInterval extends ISerializableInterval> {
-	getIntervalCollection(label: string): IntervalCollection<TInterval>;
+	getIntervalCollection(label: string): IIntervalCollection<TInterval>;
 }
 
 /**
  * @deprecated `SharedIntervalCollection` is not maintained and is planned to be removed.
+ * @internal
  */
 export class SharedIntervalCollection
 	extends SharedObject
@@ -109,7 +116,7 @@ export class SharedIntervalCollection
 	}
 
 	public readonly [Symbol.toStringTag]: string = "SharedIntervalCollection";
-	private readonly intervalCollections: DefaultMap<IntervalCollection<Interval>>;
+	private readonly intervalCollections: IntervalCollectionMap<Interval>;
 
 	/**
 	 * Constructs a new shared SharedIntervalCollection. If the object is non-local an id and service interfaces will
@@ -117,15 +124,16 @@ export class SharedIntervalCollection
 	 */
 	constructor(id: string, runtime: IFluidDataStoreRuntime, attributes: IChannelAttributes) {
 		super(id, runtime, attributes, "fluid_sharedIntervalCollection_");
-		this.intervalCollections = new DefaultMap(
+		this.intervalCollections = new IntervalCollectionMap(
 			this.serializer,
 			this.handle,
 			(op, localOpMetadata) => this.submitLocalMessage(op, localOpMetadata),
 			new IntervalCollectionValueType(),
+			runtime.options,
 		);
 	}
 
-	public getIntervalCollection(label: string): IntervalCollection<Interval> {
+	public getIntervalCollection(label: string): IIntervalCollection<Interval> {
 		const realLabel = this.getIntervalCollectionPath(label);
 		const sharedCollection = this.intervalCollections.get(realLabel);
 		return sharedCollection;
@@ -162,11 +170,14 @@ export class SharedIntervalCollection
 		localOpMetadata: unknown,
 	) {
 		if (message.type === MessageType.Operation) {
-			this.intervalCollections.tryProcessMessage(
-				message.contents,
-				local,
-				message,
-				localOpMetadata,
+			assert(
+				this.intervalCollections.tryProcessMessage(
+					message.contents as IMapOperation,
+					local,
+					message,
+					localOpMetadata,
+				),
+				0xab3 /* SharedIntervalCollection received an unrecognized op, possibly from a newer version */,
 			);
 		}
 	}

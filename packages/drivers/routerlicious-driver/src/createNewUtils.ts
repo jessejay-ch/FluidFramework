@@ -3,19 +3,16 @@
  * Licensed under the MIT License.
  */
 
-import { Uint8ArrayToString } from "@fluidframework/common-utils";
-import { ISummaryTree, SummaryType } from "@fluidframework/protocol-definitions";
+import { Uint8ArrayToString } from "@fluid-internal/client-utils";
+import { ISummaryTree, SummaryType } from "@fluidframework/driver-definitions";
 
 /**
  * Utility api to convert ISummaryTree to a summary tree where blob contents are only utf8 strings.
  * @param summary - Summary supplied by the runtime to upload.
- * @returns - Modified summary tree where the blob contents could be utf8 string only.
+ * @returns Modified summary tree where the blob contents could be utf8 string only.
  */
 export function convertSummaryToCreateNewSummary(summary: ISummaryTree): ISummaryTree {
-	const keys = Object.keys(summary.tree);
-	for (const key of keys) {
-		const summaryObject = summary.tree[key];
-
+	for (const [key, summaryObject] of Object.entries(summary.tree)) {
 		switch (summaryObject.type) {
 			case SummaryType.Tree: {
 				summary.tree[key] = convertSummaryToCreateNewSummary(summaryObject);

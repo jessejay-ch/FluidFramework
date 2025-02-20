@@ -3,11 +3,13 @@
  * Licensed under the MIT License.
  */
 
-import { FieldKey } from "./types";
+import type { FieldKey } from "../schema-stored/index.js";
+
+import { type DetachedField, keyAsDetachedField } from "./types.js";
 
 /**
- * Identical to {@link UpPathDefault}, but a duplicate declaration is needed to make the default type parameter compile.
- * @alpha
+ * Identical to {@link UpPath}, but a duplicate declaration is needed to make
+ * the default type parameter compile.
  */
 export type UpPathDefault = UpPath;
 
@@ -18,11 +20,10 @@ export type UpPathDefault = UpPath;
  * costs related to the depth of the local subtree.
  *
  * UpPaths can be thought of as terminating at a special root node (that is `undefined`)
- * who's FieldKeys are all LocalFieldKey's that correspond to detached sequences.
+ * whose FieldKeys correspond to detached sequences.
  *
  * UpPaths can be mutated over time and should be considered to be invalidated when any edits occurs:
  * Use of an UpPath that was acquired before the most recent edit is undefined behavior.
- * @alpha
  */
 export interface UpPath<TParent = UpPathDefault> {
 	/**
@@ -37,26 +38,72 @@ export interface UpPath<TParent = UpPathDefault> {
 	/**
 	 * The index within `parentField` this path is pointing to.
 	 */
-	readonly parentIndex: number; // TODO: field index branded type?
+	readonly parentIndex: NodeIndex;
 }
 
 /**
  * Path from a field in the tree upward.
  *
  * See {@link UpPath}.
- * @alpha
  */
-export interface FieldUpPath {
+export interface FieldUpPath<TUpPath extends UpPath = UpPath> {
 	/**
 	 * The parent, or undefined in the case where this path is to a detached sequence.
 	 */
-	readonly parent: UpPath | undefined;
+	readonly parent: TUpPath | undefined;
+
 	/**
 	 * The Field to which this path points.
 	 * Note that if `parent` returns `undefined`, this key  corresponds to a detached sequence.
 	 */
 	readonly field: FieldKey; // TODO: Type information, including when in DetachedField.
 }
+
+/**
+ * Delimits the extend of a range.
+ */
+export interface Range {
+	/**
+	 * The location before the first node.
+	 * Must be less than or equal to `end`.
+	 */
+	readonly start: PlaceIndex;
+	/**
+	 * The location after the last node.
+	 * Must be greater than or equal to `start`.
+	 */
+	readonly end: PlaceIndex;
+}
+
+/**
+ * A possibly empty range of nodes in a field.
+ * This object only characterizes the location of the range, it does not own/contain the nodes in the range.
+ */
+export interface RangeUpPath<TUpPath extends UpPath = UpPath>
+	extends FieldUpPath<TUpPath>,
+		Range {}
+
+/**
+ * A place in a field.
+ */
+export interface PlaceUpPath<TUpPath extends UpPath = UpPath> extends FieldUpPath<TUpPath> {
+	/**
+	 * The location in the field.
+	 */
+	readonly index: PlaceIndex;
+}
+
+/**
+ * Indicates the index of a node in a field.
+ * Zero indicates the first node in a field.
+ */
+export type NodeIndex = number;
+
+/**
+ * Indicates a place between nodes in a field or at the extremity of a field.
+ * Zero indicates the place at the start of the field (before the first node if any).
+ */
+export type PlaceIndex = number;
 
 /**
  * @returns the number of nodes above this one.
@@ -104,9 +151,10 @@ export function topDownPath(path: UpPath | undefined): UpPath[] {
 	const out: UpPath[] = [];
 	let curr = path;
 	while (curr !== undefined) {
-		out.unshift(curr);
+		out.push(curr);
 		curr = curr.parent;
 	}
+	out.reverse();
 	return out;
 }
 
@@ -139,4 +187,21 @@ export function compareFieldUpPaths(a: FieldUpPath, b: FieldUpPath): boolean {
 		return false;
 	}
 	return compareUpPaths(a.parent, b.parent);
+}
+
+/**
+ * Checks whether or not a given path is parented under the root field.
+ * @param path - the path you want to check.
+ * @returns the {@link DetachedField} which contains the path.
+ */
+export function getDetachedFieldContainingPath(path: UpPath): DetachedField {
+	let currentPath = path;
+	while (currentPath !== undefined) {
+		if (currentPath.parent === undefined) {
+			return keyAsDetachedField(currentPath.parentField);
+		} else {
+			currentPath = currentPath.parent;
+		}
+	}
+	return keyAsDetachedField(path.parentField);
 }

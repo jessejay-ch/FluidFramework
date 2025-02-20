@@ -3,11 +3,17 @@
  * Licensed under the MIT License.
  */
 
-import type { ITelemetryProperties } from '@fluidframework/common-definitions';
-import type { IFluidSerializer } from '@fluidframework/shared-object-base';
-import { fail } from './Common';
-import { getNumberOfHandlesFromEditLogSummary } from './EditLog';
-import { SharedTreeSummary, SharedTreeSummaryBase, SharedTreeSummary_0_0_2, WriteFormat } from './persisted-types';
+import type { ITelemetryBaseProperties } from '@fluidframework/core-interfaces';
+import type { IFluidSerializer } from '@fluidframework/shared-object-base/internal';
+
+import { fail } from './Common.js';
+import { getNumberOfHandlesFromEditLogSummary } from './EditLog.js';
+import {
+	SharedTreeSummary,
+	SharedTreeSummaryBase,
+	SharedTreeSummary_0_0_2,
+	WriteFormat,
+} from './persisted-types/index.js';
 
 /**
  * Deserializes a JSON object produced by `serialize()` and uses it to initialize the tree with the encoded state.
@@ -22,7 +28,7 @@ import { SharedTreeSummary, SharedTreeSummaryBase, SharedTreeSummary_0_0_2, Writ
 export function deserialize(jsonSummary: string, serializer: IFluidSerializer): SharedTreeSummaryBase {
 	let summary: Partial<SharedTreeSummaryBase>;
 	try {
-		summary = serializer.parse(jsonSummary);
+		summary = serializer.parse(jsonSummary) as Partial<SharedTreeSummaryBase>;
 	} catch {
 		fail('Json syntax error in Summary');
 	}
@@ -43,7 +49,7 @@ export function deserialize(jsonSummary: string, serializer: IFluidSerializer): 
 /**
  * General statistics about summaries.
  */
-export interface SummaryStatistics extends ITelemetryProperties {
+export interface SummaryStatistics extends ITelemetryBaseProperties {
 	/** Format version the summary is written in. */
 	readonly formatVersion: string;
 	/** Number of edits. */

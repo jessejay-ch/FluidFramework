@@ -3,10 +3,13 @@
  * Licensed under the MIT License.
  */
 
-export {
+export type {
 	IContainerRuntime,
 	IContainerRuntimeBaseWithCombinedEvents,
 	IContainerRuntimeEvents,
-	IDataStoreWithBindToContext_Deprecated,
-	IProvideContainerRuntime,
-} from "./containerRuntime";
+	IContainerRuntimeWithResolveHandle_Deprecated,
+	SummarizerStopReason,
+	ISummarizeEventProps,
+	ISummarizerObservabilityProps,
+	ISummarizerEvents,
+} from "./containerRuntime.js";

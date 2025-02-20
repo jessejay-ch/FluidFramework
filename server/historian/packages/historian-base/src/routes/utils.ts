@@ -3,91 +3,323 @@
  * Licensed under the MIT License.
  */
 
-import { AsyncLocalStorage } from "async_hooks";
-import { RequestHandler, Response } from "express";
+import { RequestHandler } from "express";
 import { decode } from "jsonwebtoken";
 import * as nconf from "nconf";
 import { ITokenClaims } from "@fluidframework/protocol-definitions";
 import { NetworkError } from "@fluidframework/server-services-client";
-import { Lumberjack } from "@fluidframework/server-services-telemetry";
-import { ICache, ITenantService, RestGitService, ITenantCustomDataExternal } from "../services";
+import { validateTokenClaims } from "@fluidframework/server-services-utils";
+import { handleResponse } from "@fluidframework/server-services-shared";
+import {
+	Lumberjack,
+	getGlobalTelemetryContext,
+	getLumberBaseProperties,
+} from "@fluidframework/server-services-telemetry";
+import {
+	runWithRetry,
+	IStorageNameRetriever,
+	IRevokedTokenChecker,
+	IDocumentManager,
+	IThrottler,
+} from "@fluidframework/server-services-core";
+import {
+	ICache,
+	ITenantService,
+	RestGitService,
+	ITenantCustomDataExternal,
+	IDenyList,
+	ISimplifiedCustomDataRetriever,
+} from "../services";
 import { containsPathTraversal, parseToken } from "../utils";
 
-/**
- * Helper function to handle a promise that should be returned to the user.
- * TODO: Replace with handleResponse from services-shared.
- * @param resultP - Promise whose resolved value or rejected error will send with appropriate status codes.
- * @param response - Express Response used for writing response body, headers, and status.
- * @param allowClientCache - sends Cache-Control header with maximum age set to 1 yr if true or no store if false.
- * @param errorStatus - Overrides any error status code; leave undefined for pass-through error codes or 400 default.
- * @param successStatus - Status to send when result is successful. Default: 200
- * @param onSuccess - Additional callback fired when response is successful before sending response.
- */
-export function handleResponse<T>(
-	resultP: Promise<T>,
-	response: Response,
-	allowClientCache?: boolean,
-	errorStatus?: number,
-	successStatus: number = 200,
-	onSuccess: (value: T) => void = () => {},
-) {
-	resultP.then(
-		(result) => {
-			if (allowClientCache === true) {
-				response.setHeader("Cache-Control", "public, max-age=31536000");
-			} else if (allowClientCache === false) {
-				response.setHeader("Cache-Control", "no-store, max-age=0");
-			}
+export { handleResponse } from "@fluidframework/server-services-shared";
 
-			onSuccess(result);
-			response.status(successStatus).json(result);
-		},
-		(error) => {
-			// Only log unexpected errors on the assumption that explicitly thrown
-			// NetworkErrors have additional logging in place at the source.
-			if (error instanceof Error && error?.name === "NetworkError") {
-				const networkError = error as NetworkError;
-				response
-					.status(errorStatus ?? networkError.code ?? 400)
-					.json(networkError.details ?? error);
-			} else {
-				// Mask unexpected internal errors in outgoing response.
-				Lumberjack.error("Unexpected error when processing HTTP Request", undefined, error);
-				response.status(errorStatus ?? 400).json("Internal Server Error");
-			}
-		},
-	);
+export type CommonRouteParams = [
+	config: nconf.Provider,
+	tenantService: ITenantService,
+	storageNameRetriever: IStorageNameRetriever | undefined,
+	restTenantThrottlers: Map<string, IThrottler>,
+	restClusterThrottlers: Map<string, IThrottler>,
+	documentManager: IDocumentManager,
+	cache?: ICache,
+	revokedTokenChecker?: IRevokedTokenChecker,
+	denyList?: IDenyList,
+	ephemeralDocumentTTLSec?: number,
+	simplifiedCustomDataRetriever?: ISimplifiedCustomDataRetriever,
+];
+
+export interface ICreateGitServiceArgs {
+	config: nconf.Provider;
+	tenantId: string;
+	authorization: string | undefined;
+	tenantService: ITenantService;
+	storageNameRetriever?: IStorageNameRetriever;
+	documentManager: IDocumentManager;
+	cache?: ICache;
+	initialUpload?: boolean;
+	storageName?: string;
+	allowDisabledTenant?: boolean;
+	isEphemeralContainer?: boolean;
+	ephemeralDocumentTTLSec?: number; // 24 hours
+	denyList?: IDenyList;
+	simplifiedCustomDataRetriever?: ISimplifiedCustomDataRetriever;
 }
 
-export async function createGitService(
-	config: nconf.Provider,
+function getEphemeralContainerCacheKey(documentId: string): string {
+	return `isEphemeralContainer:${documentId}`;
+}
+
+async function updateIsEphemeralCache(
+	documentId: string,
 	tenantId: string,
-	authorization: string,
-	tenantService: ITenantService,
-	cache?: ICache,
-	asyncLocalStorage?: AsyncLocalStorage<string>,
-	allowDisabledTenant = false,
-): Promise<RestGitService> {
-	const token = parseToken(tenantId, authorization);
-	const details = await tenantService.getTenant(tenantId, token, allowDisabledTenant);
-	const customData: ITenantCustomDataExternal = details.customData;
-	const writeToExternalStorage = !!customData?.externalStorageData;
-	const storageName = customData?.storageName;
-	const decoded = decode(token) as ITokenClaims;
-	const storageUrl = config.get("storageUrl") as string | undefined;
-	if (containsPathTraversal(decoded.documentId)) {
-		// Prevent attempted directory traversal.
-		throw new NetworkError(400, `Invalid document id: ${decoded.documentId}`);
+	isEphemeral: boolean,
+	cache: ICache | undefined,
+): Promise<void> {
+	if (!cache) {
+		Lumberjack.warning("Cache not provided. Skipping ephemeral cache update.", {
+			...getLumberBaseProperties(documentId, tenantId),
+			isEphemeral,
+		});
+		return;
 	}
+	const isEphemeralKey: string = getEphemeralContainerCacheKey(documentId);
+	Lumberjack.info(
+		`Setting cache for ${isEphemeralKey} to ${isEphemeral}.`,
+		getLumberBaseProperties(documentId, tenantId),
+	);
+	await runWithRetry(
+		async () => cache?.set(isEphemeralKey, isEphemeral) /* api */,
+		"utils.createGitService.set" /* callName */,
+		3 /* maxRetries */,
+		1000 /* retryAfterMs */,
+		getLumberBaseProperties(documentId, tenantId) /* telemetryProperties */,
+	).catch((error) => {
+		Lumberjack.error(
+			"Error setting isEphemeral flag in cache.",
+			{ ...getLumberBaseProperties(documentId, tenantId), isEphemeralKey },
+			error,
+		);
+	});
+}
+
+async function getDocumentCachedEphemeralProperties(
+	cache: ICache | undefined,
+	documentId: string,
+	tenantId: string,
+): Promise<boolean | undefined> {
+	if (!cache) {
+		Lumberjack.warning("Cache not provided. Skipping ephemeral cache check.", {
+			...getLumberBaseProperties(documentId, tenantId),
+		});
+		return undefined;
+	}
+	const isEphemeralKey: string = getEphemeralContainerCacheKey(documentId);
+	try {
+		const cachedIsEphemeral = await runWithRetry(
+			async () => cache?.get(isEphemeralKey) /* api */,
+			"utils.createGitService.get" /* callName */,
+			3 /* maxRetries */,
+			1000 /* retryAfterMs */,
+			getLumberBaseProperties(documentId, tenantId) /* telemetryProperties */,
+		);
+		if (typeof cachedIsEphemeral === "boolean") {
+			return cachedIsEphemeral;
+		}
+	} catch (error) {
+		Lumberjack.error(
+			"Error getting isEphemeral flag from cache.",
+			{ ...getLumberBaseProperties(documentId, tenantId), isEphemeralKey },
+			error,
+		);
+	}
+	return undefined;
+}
+
+/**
+ * Whether a document is an Ephemeral Container and when it was created.
+ * If the document does not exist or an error is encountered when accessing the document,
+ * the document is considered _not_ ephemeral, with an undefined create time.
+ *
+ * If the document exists and the isEphemeralContainer flag is not set, the document is considered _not_ ephemeral.
+ */
+async function getDocumentStaticEphemeralProperties(
+	documentManager: IDocumentManager,
+	tenantId: string,
+	documentId: string,
+): Promise<{ isEphemeralContainer: boolean; createTime: number | undefined }> {
+	try {
+		const staticProps = await runWithRetry(
+			async () => documentManager.readStaticProperties(tenantId, documentId) /* api */,
+			"utils.createGitService.readStaticProperties" /* callName */,
+			3 /* maxRetries */,
+			1000 /* retryAfterMs */,
+			getLumberBaseProperties(documentId, tenantId) /* telemetryProperties */,
+		);
+		if (!staticProps) {
+			Lumberjack.error(
+				`Static data not found when checking isEphemeral flag.`,
+				getLumberBaseProperties(documentId, tenantId),
+			);
+			return { isEphemeralContainer: false, createTime: undefined };
+		}
+		return {
+			isEphemeralContainer: staticProps.isEphemeralContainer ?? false,
+			createTime: staticProps.createTime,
+		};
+	} catch (error) {
+		Lumberjack.error(
+			`Failed to retrieve static data from document when checking isEphemeral flag.`,
+			getLumberBaseProperties(documentId, tenantId),
+			error,
+		);
+		return { isEphemeralContainer: false, createTime: undefined };
+	}
+}
+
+/**
+ * Checks the cache for the isEphemeral flag for the given document. If the flag is not in the cache, it fetches the
+ * static data from the document and caches the flag.
+ *
+ * Returns false if the flag is not found in the static data will cause Ephemeral Container access
+ * to fail, which is better than returning true and causing durable container access to fail.
+ * Ephemeral containers do not have as strong of an SLA as durable containers, so this is the safer choice.
+ *
+ * @returns - Returns a boolean indicating whether the container is ephemeral or not.
+ * @throws - Throws an error if falling back to static data indicates an ephemeral document is older than the provided
+ * max ephemeral document TTL.
+ */
+async function checkAndCacheIsEphemeral({
+	documentId,
+	tenantId,
+	documentManager,
+	ephemeralDocumentTTLSec,
+	isEphemeralContainerOverride,
+	cache,
+}: {
+	documentId: string;
+	tenantId: string;
+	documentManager: IDocumentManager;
+	ephemeralDocumentTTLSec: number;
+	isEphemeralContainerOverride?: boolean;
+	cache?: ICache;
+}): Promise<boolean> {
+	if (typeof isEphemeralContainerOverride === "boolean") {
+		// If an isEphemeralContainerOverride flag was passed in, cache it and return it.
+		// This typically happens on the first request to the document.
+		await updateIsEphemeralCache(documentId, tenantId, isEphemeralContainerOverride, cache);
+		return isEphemeralContainerOverride;
+	}
+	// When no override is provided, check the cache first.
+	const cachedIsEphemeral: boolean | undefined = await getDocumentCachedEphemeralProperties(
+		cache,
+		documentId,
+		tenantId,
+	);
+	if (cachedIsEphemeral !== undefined) {
+		return cachedIsEphemeral;
+	}
+
+	// Finally, if isEphemeral was not in the cache, fetch the value from database.
+	const { isEphemeralContainer: staticPropsIsEphemeral, createTime } =
+		await getDocumentStaticEphemeralProperties(documentManager, tenantId, documentId);
+
+	if (staticPropsIsEphemeral === true && createTime !== undefined) {
+		// Explicitly check for ephemeral document expiration.
+		const currentTime = Date.now();
+		const documentExpirationTime = createTime + ephemeralDocumentTTLSec * 1000;
+		if (currentTime > documentExpirationTime) {
+			// If the document is ephemeral and older than the max ephemeral document TTL, throw an error indicating that it can't be accessed.
+			const documentExpiredByMs = currentTime - documentExpirationTime;
+			// TODO: switch back to "Ephemeral Container Expired" once clients update to use errorType, not error message. AB#12867
+			const error = new NetworkError(404, "Document is deleted and cannot be accessed.");
+			Lumberjack.warning(
+				"Document is older than the max ephemeral document TTL.",
+				{
+					...getLumberBaseProperties(documentId, tenantId),
+					documentCreateTime: createTime,
+					documentExpirationTime,
+					documentExpiredByMs,
+				},
+				error,
+			);
+			throw error;
+		}
+	}
+	await updateIsEphemeralCache(documentId, tenantId, staticPropsIsEphemeral, cache);
+	return staticPropsIsEphemeral;
+}
+
+export async function createGitService(createArgs: ICreateGitServiceArgs): Promise<RestGitService> {
+	const {
+		config,
+		tenantId,
+		authorization,
+		tenantService,
+		storageNameRetriever,
+		documentManager,
+		cache,
+		initialUpload,
+		storageName,
+		allowDisabledTenant,
+		isEphemeralContainer,
+		ephemeralDocumentTTLSec,
+		denyList,
+		simplifiedCustomDataRetriever,
+	} = { ...createArgs };
+	if (!authorization) {
+		throw new NetworkError(403, "Authorization header is missing.");
+	}
+	const token = parseToken(tenantId, authorization);
+	if (!token) {
+		throw new NetworkError(403, "Authorization token is missing.");
+	}
+	const decoded = decode(token) as ITokenClaims;
+	const documentId = decoded.documentId;
+	if (containsPathTraversal(documentId)) {
+		// Prevent attempted directory traversal.
+		throw new NetworkError(400, `Invalid document id: ${documentId}`);
+	}
+	if (denyList?.isDenied(tenantId, documentId)) {
+		throw new NetworkError(500, `Unable to process request for document id: ${documentId}`);
+	}
+	const details = await tenantService.getTenant(tenantId, token, allowDisabledTenant ?? false);
+	const customData: ITenantCustomDataExternal = details.customData;
+	const simplifiedCustomData = simplifiedCustomDataRetriever?.get(customData);
+	const writeToExternalStorage = !!customData?.externalStorageData;
+	const storageUrl = config.get("storageUrl") as string | undefined;
+	const ignoreEphemeralFlag: boolean = config.get("ignoreEphemeralFlag");
+	const maxCacheableSummarySize: number =
+		config.get("restGitService:maxCacheableSummarySize") ?? 1_000_000_000; // default: 1gb
+
+	const isEphemeral: boolean = ignoreEphemeralFlag
+		? false
+		: await checkAndCacheIsEphemeral({
+				documentId,
+				tenantId,
+				documentManager,
+				ephemeralDocumentTTLSec: ephemeralDocumentTTLSec ?? 24 * 60 * 60, // default: 24 hours
+				isEphemeralContainerOverride: isEphemeralContainer,
+				cache,
+		  });
+	if (isEphemeral) {
+		Lumberjack.info(`Document is ephemeral.`, getLumberBaseProperties(documentId, tenantId));
+	}
+
+	const calculatedStorageName =
+		initialUpload && storageName
+			? storageName
+			: (await storageNameRetriever?.get(tenantId, documentId)) ?? customData?.storageName;
 	const service = new RestGitService(
 		details.storage,
 		writeToExternalStorage,
 		tenantId,
-		decoded.documentId,
+		documentId,
 		cache,
-		asyncLocalStorage,
-		storageName,
+		calculatedStorageName,
 		storageUrl,
+		isEphemeral,
+		maxCacheableSummarySize,
+		simplifiedCustomData,
 	);
 	return service;
 }
@@ -96,7 +328,7 @@ export async function createGitService(
  * Helper function to convert Request's query param to a number.
  * @param value - The value to be converted to number.
  */
-export function queryParamToNumber(value: any): number {
+export function queryParamToNumber(value: any): number | undefined {
 	if (typeof value !== "string") {
 		return undefined;
 	}
@@ -108,35 +340,57 @@ export function queryParamToNumber(value: any): number {
  * Helper function to convert Request's query param to a string.
  * @param value - The value to be converted to number.
  */
-export function queryParamToString(value: any): string {
+export function queryParamToString(value: any): string | undefined {
 	if (typeof value !== "string") {
 		return undefined;
 	}
 	return value;
 }
 
-export const Constants = Object.freeze({
-	throttleIdSuffix: "HistorianRest",
-});
-
-/**
- * Validate specific request parameters to prevent directory traversal.
- * TODO: replace with validateRequestParams from service-shared.
- */
-export function validateRequestParams(...paramNames: (string | number)[]): RequestHandler {
-	return (req, res, next) => {
-		for (const paramName of paramNames) {
-			const param = req.params[paramName];
-			if (!param) {
-				continue;
+export function verifyToken(revokedTokenChecker: IRevokedTokenChecker | undefined): RequestHandler {
+	// eslint-disable-next-line @typescript-eslint/no-misused-promises
+	return async (request, response, next) => {
+		try {
+			const reqTenantId = request.params.tenantId;
+			const authorization = request.get("Authorization");
+			if (!authorization) {
+				throw new NetworkError(403, "Authorization header is missing.");
 			}
-			if (containsPathTraversal(param)) {
-				return handleResponse(
-					Promise.reject(new NetworkError(400, `Invalid ${paramName}: ${param}`)),
-					res,
+			const token = parseToken(reqTenantId, authorization);
+			if (!token) {
+				throw new NetworkError(403, "Authorization token is missing.");
+			}
+			const claims = validateTokenClaims(token, "documentId", reqTenantId, false);
+			const documentId = claims.documentId;
+			const tenantId = claims.tenantId;
+			if (containsPathTraversal(documentId)) {
+				// Prevent attempted directory traversal.
+				throw new NetworkError(400, `Invalid document id: ${documentId}`);
+			}
+			// Verify token not revoked if JTI claim is present
+			if (revokedTokenChecker && claims.jti) {
+				const isTokenRevoked = await revokedTokenChecker.isTokenRevoked(
+					tenantId,
+					claims.documentId,
+					claims.jti,
 				);
+
+				if (isTokenRevoked) {
+					throw new NetworkError(
+						403,
+						"Permission denied. Token has been revoked.",
+						false /* canRetry */,
+						true /* isFatal */,
+					);
+				}
 			}
+			// eslint-disable-next-line @typescript-eslint/return-await
+			return getGlobalTelemetryContext().bindPropertiesAsync(
+				{ tenantId, documentId },
+				async () => next(),
+			);
+		} catch (error) {
+			return handleResponse(Promise.reject(error), response);
 		}
-		next();
 	};
 }

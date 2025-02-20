@@ -3,35 +3,50 @@
  * Licensed under the MIT License.
  */
 
+import { TestDriverTypes } from "@fluid-internal/test-driver-definitions";
 import {
-	CompressionAlgorithms,
-	IContainerRuntimeOptions,
-	IGCRuntimeOptions,
-	ISummaryRuntimeOptions,
-} from "@fluidframework/container-runtime";
-import {
+	OptionsMatrix,
 	booleanCases,
 	generatePairwiseOptions,
-	OptionsMatrix,
 	numberCases,
-} from "@fluidframework/test-pairwise-generator";
-import { ILoaderOptions } from "@fluidframework/container-loader";
-import { ConfigTypes, LoggingError } from "@fluidframework/telemetry-utils";
+} from "@fluid-private/test-pairwise-generator";
+import { ILoaderOptions } from "@fluidframework/container-definitions/internal";
+import {
+	CompressionAlgorithms,
+	disabledCompressionConfig,
+	IGCRuntimeOptions,
+	ISummaryRuntimeOptions,
+	type IContainerRuntimeOptionsInternal,
+} from "@fluidframework/container-runtime/internal";
+import { ConfigTypes } from "@fluidframework/core-interfaces";
+import { LoggingError } from "@fluidframework/telemetry-utils/internal";
 
-const loaderOptionsMatrix: OptionsMatrix<ILoaderOptions> = {
+import type { OptionOverride, TestConfiguration } from "./testConfigFile.js";
+
+interface ILoaderOptionsExperimental extends ILoaderOptions {
+	enableOfflineSnapshotRefresh?: boolean;
+	snapshotRefreshTimeoutMs?: number;
+}
+
+const loaderOptionsMatrix: OptionsMatrix<ILoaderOptionsExperimental> = {
 	cache: booleanCases,
+	client: [undefined],
 	provideScopeLoader: booleanCases,
 	maxClientLeaveWaitTime: numberCases,
-	summarizeProtocolTree: [undefined],
+	enableOfflineLoad: booleanCases,
+	enableOfflineSnapshotRefresh: booleanCases,
+	snapshotRefreshTimeoutMs: [undefined, 60 * 5 * 1000 /* 5min */],
 };
 
-export function applyOverrides<T>(
+export function applyOverrides<T extends Record<string, any>>(
 	options: OptionsMatrix<T>,
 	optionsOverrides: Partial<OptionsMatrix<T>> | undefined,
 ) {
 	const realOptions: OptionsMatrix<T> = { ...options };
 	if (optionsOverrides !== undefined) {
-		for (const key of Object.keys(optionsOverrides)) {
+		// The cast is required because TS5 infers that 'key' must be in the set 'keyof T' and
+		// notes that the type 'Partial<OptionsMatrix<T>>' may contain additional keys not in T.
+		for (const key of Object.keys(optionsOverrides) as (string & keyof T)[]) {
 			const override = optionsOverrides[key];
 			if (override !== undefined) {
 				if (Array.isArray(override)) {
@@ -49,20 +64,19 @@ export function applyOverrides<T>(
 
 export const generateLoaderOptions = (
 	seed: number,
-	overrides: Partial<OptionsMatrix<ILoaderOptions>> | undefined,
-): ILoaderOptions[] => {
-	return generatePairwiseOptions<ILoaderOptions>(
+	overrides: Partial<OptionsMatrix<ILoaderOptionsExperimental>> | undefined,
+): ILoaderOptionsExperimental[] => {
+	return generatePairwiseOptions<ILoaderOptionsExperimental>(
 		applyOverrides(loaderOptionsMatrix, overrides),
 		seed,
 	);
 };
 
 const gcOptionsMatrix: OptionsMatrix<IGCRuntimeOptions> = {
-	disableGC: booleanCases,
-	gcAllowed: booleanCases,
 	runFullGC: booleanCases,
-	sweepAllowed: [false],
-	sessionExpiryTimeoutMs: [undefined], // Don't want coverage here
+	sessionExpiryTimeoutMs: [undefined], // Don't want sessions to expire at a fixed time
+	enableGCSweep: [undefined], // Don't need coverage here, GC sweep is tested separately
+	sweepGracePeriodMs: [undefined], // Don't need coverage here, GC sweep is tested separately
 };
 
 const summaryOptionsMatrix: OptionsMatrix<ISummaryRuntimeOptions> = {
@@ -72,7 +86,7 @@ const summaryOptionsMatrix: OptionsMatrix<ISummaryRuntimeOptions> = {
 
 export function generateRuntimeOptions(
 	seed: number,
-	overrides: Partial<OptionsMatrix<IContainerRuntimeOptions>> | undefined,
+	overrides: Partial<OptionsMatrix<IContainerRuntimeOptionsInternal>> | undefined,
 ) {
 	const gcOptions = generatePairwiseOptions(
 		applyOverrides(gcOptionsMatrix, overrides?.gcOptions as any),
@@ -84,22 +98,23 @@ export function generateRuntimeOptions(
 		seed,
 	);
 
-	const runtimeOptionsMatrix: OptionsMatrix<IContainerRuntimeOptions> = {
+	const runtimeOptionsMatrix: OptionsMatrix<IContainerRuntimeOptionsInternal> = {
 		gcOptions: [undefined, ...gcOptions],
 		summaryOptions: [undefined, ...summaryOptions],
 		loadSequenceNumberVerification: [undefined],
-		enableOfflineLoad: [undefined],
 		flushMode: [undefined],
 		compressionOptions: [
 			{ minimumBatchSizeInBytes: 500, compressionAlgorithm: CompressionAlgorithms.lz4 },
 		],
 		maxBatchSizeInBytes: [716800],
-		enableOpReentryCheck: [true],
 		// Compressed payloads exceeding this size will be chunked into messages of exactly this size
 		chunkSizeInBytes: [204800],
+		enableRuntimeIdCompressor: ["on", undefined, "delayed"],
+		enableGroupedBatching: [true, false],
+		explicitSchemaControl: [true, false],
 	};
 
-	return generatePairwiseOptions<IContainerRuntimeOptions>(
+	const pairwiseOptions = generatePairwiseOptions<IContainerRuntimeOptionsInternal>(
 		applyOverrides(runtimeOptionsMatrix, {
 			...overrides,
 			gcOptions: undefined,
@@ -107,6 +122,20 @@ export function generateRuntimeOptions(
 		}),
 		seed,
 	);
+
+	// Override compressionOptions to disable it if Grouped Batching is disabled
+	pairwiseOptions.map((options) => {
+		if (options.enableGroupedBatching === false) {
+			(
+				options as {
+					// Remove readonly modifier to allow overriding
+					-readonly [P in keyof IContainerRuntimeOptionsInternal]: IContainerRuntimeOptionsInternal[P];
+				}
+			).compressionOptions = disabledCompressionConfig;
+		}
+	});
+
+	return pairwiseOptions;
 }
 
 export function generateConfigurations(
@@ -117,4 +146,25 @@ export function generateConfigurations(
 		return [{}];
 	}
 	return generatePairwiseOptions<Record<string, ConfigTypes>>(overrides, seed);
+}
+
+/**
+ *
+ * @param testConfig - the ILoadTestConfig to extract the Option Override from
+ * @param driverType - the DriverType being used in the test, used to determine which option override to pick
+ * @param endpoint - the Endpoint being used in the test, used to determine which option override to pick
+ * @returns an option override
+ */
+export function getOptionOverride(
+	testConfig: TestConfiguration | undefined,
+	driverType: TestDriverTypes,
+	endpoint: string | undefined,
+): OptionOverride | undefined {
+	// Specifically using an all or nothing strategy as that's how our current test config options are written today
+	// We first search for the key driverType-endpoint, if that doesn't exist then we just key on the driverType
+	const driverEndpointOverride = `${driverType}-${endpoint}`;
+	return (
+		testConfig?.optionOverrides?.[driverEndpointOverride] ??
+		testConfig?.optionOverrides?.[driverType]
+	);
 }

@@ -3,28 +3,42 @@
  * Licensed under the MIT License.
  */
 
-import assert from "assert";
+import assert from "node:assert";
+
 import { stub } from "sinon";
-import * as fetchModule from "node-fetch";
+
+/**
+ * Mock response returned by {@link createResponse}.
+ */
+export interface MockResponse {
+	ok: boolean;
+	status: number;
+	text: () => Promise<string>;
+	arrayBuffer: () => Promise<unknown>;
+	headers: Headers;
+	json: () => Promise<unknown>;
+}
 
 export const createResponse = async (
 	headers: { [key: string]: string },
-	response: any | undefined,
+	response: unknown,
 	status: number,
-) =>
-	Promise.resolve({
-		ok: response !== undefined,
-		status,
-		text: async () => Promise.resolve(JSON.stringify(response)),
-		arrayBuffer: async () => Promise.resolve({ byteLength: 10 }),
-		headers: headers ? new fetchModule.Headers(headers) : new fetchModule.Headers(),
-		json: async () => Promise.resolve(response),
-	});
+): Promise<MockResponse> => ({
+	ok: response !== undefined,
+	status,
+	text: async () => JSON.stringify(response),
+	arrayBuffer: async () => response,
+	headers: headers ? new Headers(headers) : new Headers(),
+	json: async () => response,
+});
 
-export const okResponse = async (headers: { [key: string]: string }, response: any) =>
-	createResponse(headers, response, 200);
-export const notFound = async (headers: { [key: string]: string } = {}) =>
-	createResponse(headers, undefined, 404);
+export const okResponse = async (
+	headers: { [key: string]: string },
+	response: object,
+): Promise<MockResponse> => createResponse(headers, response, 200);
+export const notFound = async (
+	headers: { [key: string]: string } = {},
+): Promise<MockResponse> => createResponse(headers, undefined, 404);
 
 export type FetchCallType = "internal" | "external" | "single";
 
@@ -33,14 +47,14 @@ export async function mockFetchMultiple<T>(
 	responses: (() => Promise<object>)[],
 	type: FetchCallType = "single",
 ): Promise<T> {
-	const fetchStub = stub(fetchModule, "default");
+	const fetchStub = stub(globalThis, "fetch");
 	fetchStub.callsFake(async () => {
 		if (type === "external") {
 			fetchStub.restore();
 		}
 		const cb = responses.shift();
 		assert(cb !== undefined, "the end");
-		return cb() as Promise<fetchModule.Response>;
+		return cb() as Promise<Response>;
 	});
 	try {
 		return await callback();
@@ -62,7 +76,7 @@ export async function mockFetchSingle<T>(
 
 export async function mockFetchOk<T>(
 	callback: () => Promise<T>,
-	response: object = {},
+	response = {},
 	headers: { [key: string]: string } = {},
 ): Promise<T> {
 	return mockFetchSingle(callback, async () => okResponse(headers, response));
@@ -73,7 +87,7 @@ export async function mockFetchError<T>(
 	response: Error,
 	type: FetchCallType = "single",
 ): Promise<T> {
-	const fetchStub = stub(fetchModule, "default");
+	const fetchStub = stub(globalThis, "fetch");
 	fetchStub.callsFake(async () => {
 		if (type === "external") {
 			fetchStub.restore();

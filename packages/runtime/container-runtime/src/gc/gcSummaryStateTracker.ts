@@ -3,33 +3,33 @@
  * Licensed under the MIT License.
  */
 
-import { getGCDataFromSnapshot } from "@fluidframework/garbage-collector";
-import { SummaryType } from "@fluidframework/protocol-definitions";
+import { SummaryType } from "@fluidframework/driver-definitions";
 import {
+	ISummaryTreeWithStats,
+	ISummarizeResult,
 	gcBlobPrefix,
 	gcDeletedBlobKey,
 	gcTombstoneBlobKey,
 	gcTreeKey,
+} from "@fluidframework/runtime-definitions/internal";
+import { SummaryTreeBuilder, mergeStats } from "@fluidframework/runtime-utils/internal";
+
+import { IRefreshSummaryResult } from "../summary/index.js";
+
+// eslint-disable-next-line import/no-deprecated
+import { IGCStats, IGarbageCollectorConfigs } from "./gcDefinitions.js";
+import { generateSortedGCState } from "./gcHelpers.js";
+import {
 	IGarbageCollectionSnapshotData,
 	IGarbageCollectionState,
-	ISummarizeResult,
-	ISummaryTreeWithStats,
-} from "@fluidframework/runtime-definitions";
-import {
-	mergeStats,
-	ReadAndParseBlob,
-	RefreshSummaryResult,
-	SummaryTreeBuilder,
-} from "@fluidframework/runtime-utils";
-import { IContainerRuntimeMetadata, metadataBlobName } from "../summary";
-import { GCVersion } from "./gcDefinitions";
-import { generateSortedGCState, getGCVersion } from "./gcHelpers";
-import { IGarbageCollectorConfigs } from ".";
+} from "./gcSummaryDefinitions.js";
+
+export const gcStateBlobKey = `${gcBlobPrefix}_root`;
 
 /**
  * The GC data that is tracked for a summary.
  */
-interface IGCSummaryTrackingData {
+export interface IGCSummaryTrackingData {
 	serializedGCState: string | undefined;
 	serializedTombstones: string | undefined;
 	serializedDeletedNodes: string | undefined;
@@ -42,72 +42,41 @@ interface IGCSummaryTrackingData {
  * On summarize, it decides whether to write new state or re-use previous summary's state.
  */
 export class GCSummaryStateTracker {
-	// The current version of GC running.
-	public readonly currentGCVersion: GCVersion = this.configs.gcVersionInEffect;
-	// This is the version of GC data in the latest summary being tracked.
-	private latestSummaryGCVersion: GCVersion;
-
 	// Keeps track of the GC data from the latest summary successfully acked by the server.
 	private latestSummaryData: IGCSummaryTrackingData | undefined;
 	// Keeps track of the GC data from the last summary submitted to the server but not yet acked.
 	private pendingSummaryData: IGCSummaryTrackingData | undefined;
 
-	// Tracks whether there was GC was run in latest summary being tracked.
-	private wasGCRunInLatestSummary: boolean;
+	// Tracks the count of data stores whose state updated since the last summary, i.e., they went from referenced
+	// to unreferenced or vice-versa.
+	public updatedDSCountSinceLastSummary: number = 0;
 
 	constructor(
 		// Tells whether GC should run or not.
 		private readonly configs: Pick<
 			IGarbageCollectorConfigs,
-			"shouldRunGC" | "tombstoneMode" | "gcVersionInBaseSnapshot" | "gcVersionInEffect"
+			"gcAllowed" | "gcVersionInBaseSnapshot" | "gcVersionInEffect"
 		>,
-		// Tells whether GC was run in the base snapshot this container loaded from.
-		wasGCRunInBaseSnapshot: boolean,
-	) {
-		this.wasGCRunInLatestSummary = wasGCRunInBaseSnapshot;
-		// For existing document, the latest summary is the one that we loaded from. So, use its GC version as the
-		// latest tracked GC version. For new documents, we will be writing the first summary with the current version.
-		this.latestSummaryGCVersion = this.configs.gcVersionInBaseSnapshot ?? this.currentGCVersion;
-	}
+	) {}
 
 	/**
-	 * Tells whether the GC state needs to be reset. This can happen under 3 conditions:
-	 *
-	 * 1. The base snapshot contains GC state but GC is disabled. This will happen the first time GC is disabled after
-	 * it was enabled before. GC state needs to be removed from summary and all nodes should be marked referenced.
-	 *
-	 * 2. The base snapshot does not have GC state but GC is enabled. This will happen the very first time GC runs on
-	 * a document and the first time GC is enabled after is was disabled before.
-	 *
-	 * 3. GC is enabled and the latest summary state is refreshed from a snapshot that had GC disabled and vice-versa.
-	 *
-	 * Note that the state will be reset only once for the first summary generated after this returns true. After that,
-	 * this will return false.
+	 * Called during GC initialization. Initialize the latest summary data from the base snapshot data.
 	 */
-	public get doesGCStateNeedReset(): boolean {
-		return this.wasGCRunInLatestSummary !== this.configs.shouldRunGC;
-	}
+	public initializeBaseState(
+		baseSnapshotData: IGarbageCollectionSnapshotData | undefined,
+	): void {
+		if (baseSnapshotData === undefined) {
+			return;
+		}
 
-	/**
-	 * Tells whether the GC state needs to be reset in the next summary. We need to do this if:
-	 *
-	 * 1. GC was enabled and is now disabled. The GC state needs to be removed and everything becomes referenced.
-	 *
-	 * 2. GC was disabled and is now enabled. The GC state needs to be regenerated and added to summary.
-	 *
-	 * 3. GC is enabled and the latest summary state is refreshed from a snapshot that had GC disabled and vice-versa.
-	 *
-	 * 4. The GC version in the latest summary is different from the current GC version. This can happen if:
-	 *
-	 * 4.1. The summary this client loaded with has data from a different GC version.
-	 *
-	 * 4.2. This client's latest summary was updated from a snapshot that has a different GC version.
-	 */
-	public get doesSummaryStateNeedReset(): boolean {
-		return (
-			this.doesGCStateNeedReset ||
-			(this.configs.shouldRunGC && this.latestSummaryGCVersion !== this.currentGCVersion)
-		);
+		// If tracking state across summaries, update latest summary data from the snapshot's GC data.
+		this.latestSummaryData = {
+			serializedGCState: baseSnapshotData.gcState
+				? JSON.stringify(generateSortedGCState(baseSnapshotData.gcState))
+				: undefined,
+			serializedTombstones: JSON.stringify(baseSnapshotData.tombstones),
+			serializedDeletedNodes: JSON.stringify(baseSnapshotData.deletedNodes),
+		};
 	}
 
 	/**
@@ -117,13 +86,12 @@ export class GCSummaryStateTracker {
 	 * If none of the components changed, it returns a summary handle for the entire GC data.
 	 */
 	public summarize(
-		fullTree: boolean,
 		trackState: boolean,
 		gcState: IGarbageCollectionState,
 		deletedNodes: Set<string>,
 		tombstones: string[],
 	): ISummarizeResult | undefined {
-		if (!this.configs.shouldRunGC) {
+		if (!this.configs.gcAllowed) {
 			return;
 		}
 
@@ -131,13 +99,10 @@ export class GCSummaryStateTracker {
 		// Serialize and write deleted nodes, if any. This is done irrespective of whether sweep is enabled or not so
 		// to identify deleted nodes' usage.
 		const serializedDeletedNodes =
-			deletedNodes.size > 0 ? JSON.stringify(Array.from(deletedNodes).sort()) : undefined;
-		// If running in tombstone mode, serialize and write tombstones, if any.
-		const serializedTombstones = this.configs.tombstoneMode
-			? tombstones.length > 0
-				? JSON.stringify(tombstones.sort())
-				: undefined
-			: undefined;
+			deletedNodes.size > 0 ? JSON.stringify([...deletedNodes].sort()) : undefined;
+		// Serialize and write tombstones, if any.
+		const serializedTombstones =
+			tombstones.length > 0 ? JSON.stringify(tombstones.sort()) : undefined;
 
 		/**
 		 * Incremental summary of GC data - If none of GC state, deleted nodes or tombstones changed since last summary,
@@ -151,11 +116,12 @@ export class GCSummaryStateTracker {
 			serializedDeletedNodes,
 		};
 
-		if (trackState && !fullTree && this.latestSummaryData !== undefined) {
+		if (trackState && this.latestSummaryData !== undefined) {
 			// If nothing changed since last summary, send a summary handle for the entire GC data.
 			if (
 				this.latestSummaryData.serializedGCState === serializedGCState &&
-				this.latestSummaryData.serializedTombstones === serializedTombstones
+				this.latestSummaryData.serializedTombstones === serializedTombstones &&
+				this.latestSummaryData.serializedDeletedNodes === serializedDeletedNodes
 			) {
 				const stats = mergeStats();
 				stats.handleNodeCount++;
@@ -202,7 +168,6 @@ export class GCSummaryStateTracker {
 		serializedDeletedNodes: string | undefined,
 		trackState: boolean,
 	): ISummaryTreeWithStats {
-		const gcStateBlobKey = `${gcBlobPrefix}_root`;
 		const builder = new SummaryTreeBuilder();
 
 		// If the GC state hasn't changed, write a summary handle, else write a summary blob for it.
@@ -251,70 +216,23 @@ export class GCSummaryStateTracker {
 	}
 
 	/**
-	 * Called to refresh the latest summary state. This happens when either a pending summary is acked or a snapshot
-	 * is downloaded and should be used to update the state.
+	 * Called to refresh the latest summary state. This happens when a pending summary is acked.
 	 */
-	public async refreshLatestSummary(
-		proposalHandle: string | undefined,
-		result: RefreshSummaryResult,
-		readAndParseBlob: ReadAndParseBlob,
-	): Promise<IGarbageCollectionSnapshotData | undefined> {
-		// If the latest summary was updated and the summary was tracked, this client is the one that generated this
-		// summary. So, update wasGCRunInLatestSummary.
-		// Note that this has to be updated if GC did not run too. Otherwise, `gcStateNeedsReset` will always return
-		// true in scenarios where GC is disabled but enabled in the snapshot we loaded from.
-		if (result.latestSummaryUpdated && result.wasSummaryTracked) {
-			this.wasGCRunInLatestSummary = this.configs.shouldRunGC;
-		}
-
-		if (!result.latestSummaryUpdated || !this.configs.shouldRunGC) {
-			return undefined;
-		}
-
-		// If the summary was tracked by this client, it was the one that generated the summary in the first place.
-		// Update latest state from pending.
-		if (result.wasSummaryTracked) {
-			this.latestSummaryGCVersion = this.currentGCVersion;
-			this.latestSummaryData = this.pendingSummaryData;
-			this.pendingSummaryData = undefined;
-			return undefined;
-		}
-
-		// If the summary was not tracked by this client, the state should be updated from the downloaded snapshot.
-		const snapshotTree = result.snapshotTree;
-		const metadataBlobId = snapshotTree.blobs[metadataBlobName];
-		if (metadataBlobId) {
-			const metadata = await readAndParseBlob<IContainerRuntimeMetadata>(metadataBlobId);
-			this.latestSummaryGCVersion = getGCVersion(metadata);
-		}
-
-		const gcSnapshotTree = snapshotTree.trees[gcTreeKey];
-		// If GC ran in the container that generated this snapshot, it will have a GC tree.
-		this.wasGCRunInLatestSummary = gcSnapshotTree !== undefined;
-		let latestGCData: IGarbageCollectionSnapshotData | undefined;
-		if (gcSnapshotTree !== undefined) {
-			latestGCData = await getGCDataFromSnapshot(gcSnapshotTree, readAndParseBlob);
-		}
-		this.pendingSummaryData = undefined;
-		return latestGCData;
-	}
-
-	/**
-	 * Update state from the given snapshot data. This is done during load and during refreshing state from a snapshot.
-	 * @param gcSnapshotData - The GC snapshot data to update state from.
-	 */
-	public updateStateFromSnapshotData(gcSnapshotData: IGarbageCollectionSnapshotData | undefined) {
-		// If there is no snapshot data, it means this snapshot was generated with GC disabled. Unset all GC state.
-		if (gcSnapshotData === undefined) {
-			this.latestSummaryData = undefined;
+	public async refreshLatestSummary(result: IRefreshSummaryResult): Promise<void> {
+		if (!this.configs.gcAllowed || !result.isSummaryTracked) {
 			return;
 		}
 
-		// If tracking state across summaries, update latest summary data from the snapshot's GC data.
-		this.latestSummaryData = {
-			serializedGCState: JSON.stringify(generateSortedGCState(gcSnapshotData.gcState)),
-			serializedTombstones: JSON.stringify(gcSnapshotData.tombstones),
-			serializedDeletedNodes: JSON.stringify(gcSnapshotData.deletedNodes),
-		};
+		this.latestSummaryData = this.pendingSummaryData;
+		this.pendingSummaryData = undefined;
+		this.updatedDSCountSinceLastSummary = 0;
+	}
+
+	/**
+	 * Called to update the state from a GC run's stats. Used to update the count of data stores whose state updated.
+	 */
+	// eslint-disable-next-line import/no-deprecated
+	public updateStateFromGCRunStats(stats: IGCStats): void {
+		this.updatedDSCountSinceLastSummary += stats.updatedDataStoreCount;
 	}
 }

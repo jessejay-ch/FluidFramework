@@ -24,26 +24,26 @@ export function scheduleIdleTask(task: () => void) {
 		task,
 	});
 
-	ensureIdleCallback();
+	ensureIdleCallback(2000);
 }
 
 /**
  * Ensures an idle callback has been scheduled for the remaining tasks
  */
-function ensureIdleCallback() {
+function ensureIdleCallback(timeout: number = 0) {
 	if (!idleTaskScheduled) {
 		// Exception added when eslint rule was added, this should be revisited when modifying this code
-		if (window.requestIdleCallback) {
-			window.requestIdleCallback(idleTaskCallback);
+		if (self.requestIdleCallback) {
+			self.requestIdleCallback(idleTaskCallback);
 		} else {
 			const deadline = Date.now() + 50;
-			window.setTimeout(
+			self.setTimeout(
 				() =>
 					idleTaskCallback({
 						timeRemaining: () => Math.max(deadline - Date.now(), 0),
 						didTimeout: false,
 					}),
-				0,
+				timeout,
 			);
 		}
 		idleTaskScheduled = true;
@@ -64,14 +64,12 @@ function runTasks(
 	// The next value for the task queue
 	const newTaskQueue: TaskQueueItem[] = [];
 
-	for (let index = 0; index < taskQueue.length; index += 1) {
+	for (const [index, taskQueueItem] of taskQueue.entries()) {
 		if (shouldContinueRunning && !shouldContinueRunning()) {
 			// Add the tasks we didn't get to to the end of the new task queue
 			newTaskQueue.push(...taskQueue.slice(index));
 			break;
 		}
-
-		const taskQueueItem = taskQueue[index];
 
 		if (filter && !filter(taskQueueItem)) {
 			newTaskQueue.push(taskQueueItem);
@@ -84,7 +82,10 @@ function runTasks(
 }
 
 // Runs all the tasks in the task queue
-function idleTaskCallback(deadline: { timeRemaining: () => number; readonly didTimeout: boolean }) {
+function idleTaskCallback(deadline: {
+	timeRemaining: () => number;
+	readonly didTimeout: boolean;
+}) {
 	// Minimum time that must be available on deadline to run any more tasks
 	const minTaskTime = 10;
 	runTasks(undefined, () => deadline.timeRemaining() > minTaskTime);

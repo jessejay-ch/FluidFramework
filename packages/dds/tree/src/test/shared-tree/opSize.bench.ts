@@ -2,284 +2,208 @@
  * Copyright (c) Microsoft Corporation and contributors. All rights reserved.
  * Licensed under the MIT License.
  */
-import { strict as assert } from "assert";
-import Table from "easy-table";
-import { isInPerformanceTestingMode } from "@fluid-tools/benchmark";
-import { ISequencedDocumentMessage } from "@fluidframework/protocol-definitions";
-import { emptyField, FieldKinds, namedTreeSchema, singleTextCursor } from "../../feature-libraries";
-import { ISharedTree } from "../../shared-tree";
-import { brand, getOrAddEmptyToMap } from "../../util";
-import { ITestTreeProvider, TestTreeProvider } from "../utils";
+
+import { strict as assert, fail } from "node:assert";
+
 import {
-	FieldKey,
-	fieldSchema,
-	JsonableTree,
-	moveToDetachedField,
-	rootFieldKey,
-	rootFieldKeySymbol,
-	SchemaData,
-	Value,
-	ValueSchema,
-} from "../../core";
+	BenchmarkType,
+	benchmarkCustom,
+	isInPerformanceTestingMode,
+} from "@fluid-tools/benchmark";
+import { createIdCompressor } from "@fluidframework/id-compressor/internal";
+import type { ISequencedDocumentMessage } from "@fluidframework/driver-definitions/internal";
+import {
+	MockContainerRuntimeFactory,
+	MockFluidDataStoreRuntime,
+	MockStorage,
+} from "@fluidframework/test-runtime-utils/internal";
 
-const stringSchema = namedTreeSchema({
-	name: brand("String"),
-	extraLocalFields: emptyField,
-	value: ValueSchema.String,
+import type { Value } from "../../core/index.js";
+import { typeboxValidator } from "../../external-utilities/index.js";
+import { TreeCompressionStrategy } from "../../feature-libraries/index.js";
+import { Tree, type ITreePrivate } from "../../shared-tree/index.js";
+import { type JsonCompatibleReadOnly, getOrAddEmptyToMap } from "../../util/index.js";
+import { treeTestFactory } from "../utils.js";
+import {
+	SchemaFactory,
+	TreeViewConfiguration,
+	type InsertableTreeNodeFromImplicitAllowedTypes,
+	type ITree,
+	type TreeView,
+} from "../../simple-tree/index.js";
+
+// Notes:
+// 1. Within this file "percentile" is commonly used, and seems to refer to a portion (0 to 1) or some maximum size.
+// While it would be useful and interesting to have some distribution of op sizes and measure some percentile from that distribution,
+// that does not appear to be what these tests are doing.
+// 2. Major changes in these sizes (regressions, optimizations or the tests not collecting what they should) do not make these tests fail.
+// 3. These tests are currently implemented as integration tests, meaning they use lots of dependencies and high level APIs.
+// They could be reimplemented targeted the lower level APIs if desired (just call the op encoding functions)
+// 4. "large" node just get a long repeated string value, not a complex tree, so tree encoding is not really covered here.
+// TODO: fix above issues.
+
+const schemaFactory = new SchemaFactory("opSize");
+
+class Child extends schemaFactory.object("Test:Opsize-Bench-Child", {
+	data: schemaFactory.string,
+}) {}
+class Parent extends schemaFactory.array("Test:Opsize-Bench-Root", Child) {}
+
+/**
+ * Create a default attached tree for op submission
+ */
+function createConnectedTree(): ITreePrivate {
+	const containerRuntimeFactory = new MockContainerRuntimeFactory();
+	const dataStoreRuntime = new MockFluidDataStoreRuntime({
+		idCompressor: createIdCompressor(),
+	});
+	containerRuntimeFactory.createContainerRuntime(dataStoreRuntime);
+	const tree = treeTestFactory({
+		runtime: dataStoreRuntime,
+		options: {
+			jsonValidator: typeboxValidator,
+			treeEncodeType: TreeCompressionStrategy.Uncompressed,
+		},
+	});
+	tree.connect({
+		deltaConnection: dataStoreRuntime.createDeltaConnection(),
+		objectStorage: new MockStorage(),
+	});
+	return tree;
+}
+
+const config = new TreeViewConfiguration({
+	schema: Parent,
+	preventAmbiguity: true,
+	enableSchemaValidation: true,
 });
-
-export const childSchema = namedTreeSchema({
-	name: brand("Test:Opsize-Bench-Child"),
-	localFields: {
-		data: fieldSchema(FieldKinds.value, [stringSchema.name]),
-	},
-	extraLocalFields: emptyField,
-});
-
-export const parentSchema = namedTreeSchema({
-	name: brand("Test:Opsize-Bench-Root"),
-	localFields: {
-		children: fieldSchema(FieldKinds.sequence, [childSchema.name]),
-	},
-	extraLocalFields: emptyField,
-});
-
-export const rootSchema = fieldSchema(FieldKinds.value, [parentSchema.name]);
-
-export const fullSchemaData: SchemaData = {
-	treeSchema: new Map([
-		[stringSchema.name, stringSchema],
-		[parentSchema.name, parentSchema],
-	]),
-	globalFieldSchema: new Map([[rootFieldKey, rootSchema]]),
-};
-
-const initialTestJsonTree = {
-	type: parentSchema.name,
-	fields: {
-		children: [],
-	},
-};
-
-const childrenFieldKey: FieldKey = brand("children");
 
 /*
  * Updates the given `tree` to the given `schema` and inserts `state` as its root.
  */
-function initializeTestTree(tree: ISharedTree, state: JsonableTree = initialTestJsonTree) {
-	tree.storedSchema.update(fullSchemaData);
-	// inserts a node with the initial AppState as the root of the tree
-	const writeCursor = singleTextCursor(state);
-	const field = tree.editor.sequenceField(undefined, rootFieldKeySymbol);
-	field.insert(0, writeCursor);
+function initializeTestTree(
+	tree: ITree,
+	state: InsertableTreeNodeFromImplicitAllowedTypes<typeof Parent> = [],
+): TreeView<typeof Parent> {
+	const view = tree.viewWith(config);
+	view.initialize(state);
+	return view;
 }
 
-const getJsonNode = (desiredByteSize: number): JsonableTree => {
-	const node = {
-		type: childSchema.name,
-		fields: {
-			data: [{ value: "", type: stringSchema.name }],
-		},
+function utf8Length(data: JsonCompatibleReadOnly): number {
+	return new TextEncoder().encode(JSON.stringify(data)).length;
+}
+
+/**
+ * Creates an insertable child with a string of the provided length
+ */
+function createTreeWithSize(
+	desiredByteSize: number,
+): InsertableTreeNodeFromImplicitAllowedTypes<typeof Child> {
+	return {
+		data: createStringFromLength(desiredByteSize),
 	};
+}
 
-	const initialNodeByteSize = new TextEncoder().encode(JSON.stringify(node)).length;
-	const sizeIncrementor = "a"; // 1 byte
-	const remainingByteSizeToAdd = desiredByteSize - initialNodeByteSize;
-	node.fields.data[0].value = sizeIncrementor.repeat(remainingByteSizeToAdd);
-	return node;
-};
+function assertChildNodeCount(tree: TreeView<typeof Parent>, nodeCount: number): void {
+	assert.equal(tree.root.length, nodeCount);
+}
 
-const getChildrenlength = (tree: ISharedTree) => {
-	const cursor = tree.forest.allocateCursor();
-	moveToDetachedField(tree.forest, cursor);
-	cursor.enterNode(0);
-	cursor.enterField(childrenFieldKey);
-	const length = cursor.getFieldLength();
-	cursor.free();
-	return length;
-};
-
-const assertChildNodeCount = (tree: ISharedTree, nodeCount: number) => {
-	const cursor = tree.forest.allocateCursor();
-	moveToDetachedField(tree.forest, cursor);
-	cursor.enterNode(0);
-	cursor.enterField(childrenFieldKey);
-	assert.equal(cursor.getFieldLength(), nodeCount);
-	cursor.free();
-};
-
-const assertChildValuesEqualExpected = (
-	tree: ISharedTree,
-	editPayload: Value,
+/**
+ * Checks that the first `childCount` values under "children" have the provided value.
+ */
+function expectChildrenValues(
+	tree: TreeView<typeof Parent>,
+	expected: Value,
 	childCount: number,
-) => {
-	const cursor = tree.forest.allocateCursor();
-	moveToDetachedField(tree.forest, cursor);
-	cursor.enterNode(0);
-	cursor.enterField(childrenFieldKey);
-	cursor.enterNode(0);
-	assert.equal(cursor.value, editPayload);
-
-	let currChildCount = 1;
-	while (cursor.nextNode() && currChildCount < childCount) {
-		assert.equal(cursor.value, editPayload);
-		currChildCount++;
+): void {
+	for (let index = 0; index < childCount; index++) {
+		assert.equal(tree.root[index].data, expected);
 	}
-	cursor.free();
-};
+}
 
-// Creates a json tree with the desired number of children and the size of each child in bytes.
-const getInitialJsonTreeWithChildren = (numChildNodes: number, childNodeByteSize: number) => {
-	const childNode = getJsonNode(childNodeByteSize);
-	const jsonTree: JsonableTree = {
-		type: parentSchema.name,
-		fields: {
-			children: [],
-		},
-	};
-	for (let i = 0; i < numChildNodes; i++) {
-		jsonTree.fields?.children?.push({ ...childNode });
-	}
-	return jsonTree;
-};
+/**
+ * Creates a tree with the desired number of children and the size of each child's string in bytes.
+ */
+function createInitialTree(
+	childNodes: number,
+	childNodeByteSize: number,
+): InsertableTreeNodeFromImplicitAllowedTypes<typeof Parent> {
+	const childNode = createTreeWithSize(childNodeByteSize);
+	const children: InsertableTreeNodeFromImplicitAllowedTypes<typeof Child>[] = new Array(
+		childNodes,
+	).fill(childNode);
+	return children;
+}
 
-const insertNodesWithIndividualTransactions = async (
-	tree: ISharedTree,
-	provider: ITestTreeProvider,
-	jsonNode: JsonableTree,
+function insertNodes(
+	tree: TreeView<typeof Parent>,
+	content: InsertableTreeNodeFromImplicitAllowedTypes<typeof Child>,
 	count: number,
-) => {
+): void {
 	for (let i = 0; i < count; i++) {
-		tree.transaction.start();
-		const path = {
-			parent: undefined,
-			parentField: rootFieldKeySymbol,
-			parentIndex: 0,
-		};
-		const writeCursor = singleTextCursor(jsonNode);
-		const field = tree.editor.sequenceField(path, childrenFieldKey);
-		field.insert(0, writeCursor);
-		tree.transaction.commit();
+		tree.root.insertAt(0, content);
 	}
-	await provider.ensureSynchronized();
-};
+}
 
-const insertNodesWithSingleTransaction = async (
-	tree: ISharedTree,
-	provider: ITestTreeProvider,
-	jsonNode: JsonableTree,
+function insertNodesWithSingleTransaction(
+	tree: TreeView<typeof Parent>,
+	content: InsertableTreeNodeFromImplicitAllowedTypes<typeof Child>,
 	count: number,
-) => {
-	tree.transaction.start();
-	const path = {
-		parent: undefined,
-		parentField: rootFieldKeySymbol,
-		parentIndex: 0,
-	};
-	const field = tree.editor.sequenceField(path, childrenFieldKey);
-	for (let i = 0; i < count; i++) {
-		field.insert(0, singleTextCursor(jsonNode));
+): void {
+	Tree.runTransaction(tree, () => {
+		insertNodes(tree, content, count);
+	});
+}
+
+function removeNodes(
+	tree: TreeView<typeof Parent>,
+	numRemovals: number,
+	removalsPerOp: number,
+): void {
+	for (let i = 0; i < numRemovals; i++) {
+		tree.root.removeRange(tree.root.length - 1, tree.root.length - 1 + removalsPerOp);
 	}
-	tree.transaction.commit();
-	await provider.ensureSynchronized();
-};
+}
 
-const deleteNodesWithIndividualTransactions = async (
-	tree: ISharedTree,
-	provider: ITestTreeProvider,
-	numDeletes: number,
-	deletesPerTransaction: number,
-) => {
-	for (let i = 0; i < numDeletes; i++) {
-		tree.transaction.start();
-		const path = {
-			parent: undefined,
-			parentField: rootFieldKeySymbol,
-			parentIndex: 0,
-		};
-		const field = tree.editor.sequenceField(path, childrenFieldKey);
-		field.delete(getChildrenlength(tree) - 1, deletesPerTransaction);
-		tree.transaction.commit();
-		await provider.ensureSynchronized();
-	}
-};
+function removeNodesWithSingleTransaction(
+	tree: TreeView<typeof Parent>,
+	numRemoved: number,
+): void {
+	tree.root.removeRange(0, numRemoved);
+}
 
-const deleteNodesWithSingleTransaction = async (
-	tree: ISharedTree,
-	provider: ITestTreeProvider,
-	numDeletes: number,
-) => {
-	tree.transaction.start();
-	const path = {
-		parent: undefined,
-		parentField: rootFieldKeySymbol,
-		parentIndex: 0,
-	};
-	const field = tree.editor.sequenceField(path, childrenFieldKey);
-	field.delete(0, numDeletes);
-	tree.transaction.commit();
-	await provider.ensureSynchronized();
-};
+function createStringFromLength(numberOfBytes: number): string {
+	return "a".repeat(numberOfBytes);
+}
 
-const getEditPayloadInBytes = (numBytes: number) => {
-	let payload = "";
-	while (payload.length < numBytes) {
-		payload += "a";
-	}
-	return payload;
-};
-
-const editNodesWithIndividualTransactions = async (
-	tree: ISharedTree,
-	provider: ITestTreeProvider,
+function editNodes(
+	tree: TreeView<typeof Parent>,
 	numChildrenToEdit: number,
-	editPayload: Value,
-) => {
-	const rootPath = {
-		parent: undefined,
-		parentField: rootFieldKeySymbol,
-		parentIndex: 0,
-	};
+	childData: string,
+): void {
 	for (let i = 0; i < numChildrenToEdit; i++) {
-		tree.transaction.start();
-		const childPath = {
-			parent: rootPath,
-			parentField: childrenFieldKey,
-			parentIndex: i,
-		};
-		tree.editor.setValue(childPath, editPayload);
-		tree.transaction.commit();
-		await provider.ensureSynchronized();
+		Tree.runTransaction(tree, () => {
+			tree.root.removeAt(i);
+			tree.root.insertAt(i, { data: childData });
+		});
 	}
-};
+}
 
-const editNodesWithSingleTransaction = async (
-	tree: ISharedTree,
-	provider: ITestTreeProvider,
-	numChildrenToEdit: number,
-	editPayload: Value,
-) => {
-	const rootPath = {
-		parent: undefined,
-		parentField: rootFieldKeySymbol,
-		parentIndex: 0,
-	};
-	tree.transaction.start();
-	for (let i = 0; i < numChildrenToEdit; i++) {
-		const childPath = {
-			parent: rootPath,
-			parentField: childrenFieldKey,
-			parentIndex: i,
-		};
-		tree.editor.setValue(childPath, editPayload);
-	}
-	tree.transaction.commit();
-	await provider.ensureSynchronized();
-};
+enum Operation {
+	Insert = "Insert",
+	Remove = "Remove",
+	Edit = "Edit",
+}
+
+enum TransactionStyle {
+	Individual,
+	Single,
+}
 
 /**
  * The following byte sizes in utf-8 encoded bytes of JsonableTree were found to be the maximum size that could be successfully
- * inserted/deleted/edited using the following node counts and either individual of singular (bulk) transactions.
+ * inserted/removed/edited using the following node counts and either individual of singular (bulk) transactions.
  *
  * Using any larger of a byte size of JsonableTree children causes the "BatchToLarge" error; this would require either:
  * Adding artificial wait, for e.x. by using a for-loop to segment our transactions into batches of less than the given node count.
@@ -287,38 +211,38 @@ const editNodesWithSingleTransaction = async (
  * Making the size in bytes of the children smaller.
  */
 const MAX_SUCCESSFUL_OP_BYTE_SIZES = {
-	INSERT: {
-		INDIVIDUAL: {
+	Insert: {
+		[TransactionStyle.Individual]: {
 			nodeCounts: {
-				"100": 9000,
+				"100": 8900,
 			},
 		},
-		SINGLE: {
+		[TransactionStyle.Single]: {
+			nodeCounts: {
+				"100": 9600,
+			},
+		},
+	},
+	Remove: {
+		[TransactionStyle.Individual]: {
+			nodeCounts: {
+				"100": 9700,
+			},
+		},
+		[TransactionStyle.Single]: {
 			nodeCounts: {
 				"100": 9700,
 			},
 		},
 	},
-	DELETE: {
-		INDIVIDUAL: {
-			nodeCounts: {
-				"100": 9700,
-			},
-		},
-		SINGLE: {
-			nodeCounts: {
-				"100": 9700,
-			},
-		},
-	},
-	EDIT: {
-		INDIVIDUAL: {
+	Edit: {
+		[TransactionStyle.Individual]: {
 			nodeCounts: {
 				// Edit benchmarks use 1/10 of the actual max sizes outside of perf mode because it takes so long to execute.
 				"100": isInPerformanceTestingMode ? 800000 : 80000,
 			},
 		},
-		SINGLE: {
+		[TransactionStyle.Single]: {
 			nodeCounts: {
 				"100": 8600,
 			},
@@ -327,8 +251,8 @@ const MAX_SUCCESSFUL_OP_BYTE_SIZES = {
 } as const;
 
 const getSuccessfulOpByteSize = (
-	operation: "INSERT" | "DELETE" | "EDIT",
-	transactionStyle: "INDIVIDUAL" | "SINGLE",
+	operation: Operation,
+	transactionStyle: TransactionStyle,
 	percentile: number,
 ) => {
 	return Math.floor(
@@ -338,67 +262,79 @@ const getSuccessfulOpByteSize = (
 
 const BENCHMARK_NODE_COUNT = 100;
 
-describe("SharedTree Op Size Benchmarks", () => {
+const sizes = [
+	{ percentile: 0.1, word: "small" },
+	{ percentile: 0.5, word: "medium" },
+	{ percentile: 1.0, word: "large" },
+];
+
+const styles = [
+	{
+		description: "Many Transactions",
+		style: TransactionStyle.Individual,
+		extraDescription: `${BENCHMARK_NODE_COUNT} transactions`,
+	},
+	{
+		description: "Single Transaction",
+		style: TransactionStyle.Single,
+		extraDescription: `1 transaction`,
+	},
+];
+
+// TODO: replace use of TransactionStyle with this.
+function withTransactionsOrNot(
+	fn: (run: <T>(view: TreeView<typeof Parent>, op: () => T) => T) => void,
+): void {
+	describe("Many Ops", () => {
+		fn((view, op) => op());
+	});
+	describe("Single Transaction", () => {
+		fn((view, op) => Tree.runTransaction(view, () => op()));
+	});
+}
+
+describe("Op Size", () => {
 	const opsByBenchmarkName: Map<string, ISequencedDocumentMessage[]> = new Map();
 	let currentBenchmarkName = "";
 	const currentTestOps: ISequencedDocumentMessage[] = [];
 
-	const registerOpListener = (
-		provider: ITestTreeProvider,
+	function registerOpListener(
+		tree: ITreePrivate,
 		resultArray: ISequencedDocumentMessage[],
-	) => {
-		provider.containers[0].deltaManager.on("op", (message) => {
-			if (message?.type === "op") {
-				resultArray.push(message);
-			}
-		});
-	};
-
-	const getOperationsStats = (operations: ISequencedDocumentMessage[]) => {
-		if (operations.length === 0) {
-			return {
-				"Avg. Op Size (Bytes)": 0,
-				"Max Op Size (Bytes)": 0,
-				"Min Op Size (Bytes)": 0,
-				"Total Ops:": 0,
-			};
+	): void {
+		// TODO: better way to hook this up. Needs to detect local ops exactly once.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const oldSubmitLocalMessage = (tree as any).submitLocalMessage.bind(tree);
+		function submitLocalMessage(
+			content: ISequencedDocumentMessage,
+			localOpMetadata: unknown = undefined,
+		): void {
+			resultArray.push(content);
+			oldSubmitLocalMessage(content, localOpMetadata);
 		}
-		let averageOpSizeBytes = 0;
-		operations.forEach((operation) => {
-			averageOpSizeBytes += new TextEncoder().encode(JSON.stringify(operation)).length;
-		});
-		averageOpSizeBytes = averageOpSizeBytes / operations.length;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(tree as any).submitLocalMessage = submitLocalMessage;
+	}
 
-		let maxOpSizeBytes = new TextEncoder().encode(JSON.stringify(operations[0])).length;
-		operations.forEach(
-			(operation) =>
-				(maxOpSizeBytes = Math.max(
-					new TextEncoder().encode(JSON.stringify(operation)).length,
-					maxOpSizeBytes,
-				)),
+	const getOperationsStats = (
+		operations: ISequencedDocumentMessage[],
+	): Record<string, number> => {
+		const lengths = operations.map((operation) =>
+			utf8Length(operation as unknown as JsonCompatibleReadOnly),
 		);
-
-		let minOpSizeBytes = new TextEncoder().encode(JSON.stringify(operations[0])).length;
-		operations.forEach(
-			(operation) =>
-				(minOpSizeBytes = Math.min(
-					new TextEncoder().encode(JSON.stringify(operation)).length,
-					minOpSizeBytes,
-				)),
-		);
+		const totalOpBytes = lengths.reduce((a, b) => a + b, 0);
+		const maxOpSizeBytes = Math.max(...lengths);
 
 		return {
-			"Avg. Op Size (Bytes)": Number.parseFloat(averageOpSizeBytes.toFixed(2)),
+			"Total Op Size (Bytes)": totalOpBytes,
 			"Max Op Size (Bytes)": maxOpSizeBytes,
-			"Min Op Size (Bytes)": minOpSizeBytes,
 			"Total Ops:": operations.length,
 		};
 	};
 
-	const initializeOpDataCollection = (provider: ITestTreeProvider, testName: string) => {
-		currentBenchmarkName = testName;
+	const initializeOpDataCollection = (tree: ITreePrivate) => {
 		currentTestOps.length = 0;
-		registerOpListener(provider, currentTestOps);
+		registerOpListener(tree, currentTestOps);
 	};
 
 	const saveAndResetCurrentOps = () => {
@@ -412,705 +348,247 @@ describe("SharedTree Op Size Benchmarks", () => {
 		currentTestOps.length = 0;
 	};
 
-	afterEach(() => {
+	beforeEach(function (): void {
+		currentBenchmarkName = this.currentTest?.fullTitle() ?? fail();
+		currentTestOps.length = 0;
+	});
+
+	afterEach(function () {
+		if (this.currentTest?.isFailed() === false) {
+			// Currently tests can pass when no data is collected, so throw here in that case to ensure tests don't break and start collecting no data.
+			assert(currentTestOps.length !== 0);
+		}
 		currentTestOps.forEach((op) =>
 			getOrAddEmptyToMap(opsByBenchmarkName, currentBenchmarkName).push(op),
 		);
 		currentTestOps.length = 0;
 	});
 
-	after(() => {
-		const allBenchmarkOpStats: any[] = [];
-		for (const [benchmarkName, ops] of opsByBenchmarkName) {
-			allBenchmarkOpStats.push({
-				"Test name": benchmarkName,
-				...getOperationsStats(ops),
+	describe("Insert Nodes", () => {
+		function benchmarkOps(transactionStyle: TransactionStyle, percentile: number): void {
+			const tree = createConnectedTree();
+			initializeOpDataCollection(tree);
+			const view = initializeTestTree(tree);
+			deleteCurrentOps(); // We don't want to record any ops from initializing the tree.
+			const apply =
+				transactionStyle === TransactionStyle.Individual
+					? insertNodes
+					: insertNodesWithSingleTransaction;
+
+			apply(
+				view,
+				createTreeWithSize(
+					getSuccessfulOpByteSize(Operation.Insert, transactionStyle, percentile),
+				),
+				BENCHMARK_NODE_COUNT,
+			);
+			assertChildNodeCount(view, BENCHMARK_NODE_COUNT);
+		}
+
+		for (const { description, style, extraDescription } of styles) {
+			describe(description, () => {
+				for (const { percentile, word } of sizes) {
+					benchmarkCustom({
+						only: false,
+						type: BenchmarkType.Measurement,
+						title: `${BENCHMARK_NODE_COUNT} ${word} nodes in ${extraDescription}`,
+						run: async (reporter) => {
+							benchmarkOps(style, percentile);
+							const opStats = getOperationsStats(currentTestOps);
+							for (const key of Object.keys(opStats)) {
+								reporter.addMeasurement(key, opStats[key]);
+							}
+						},
+					});
+				}
 			});
 		}
-		const table = new Table();
-		allBenchmarkOpStats.forEach((data) => {
-			Object.keys(data).forEach((key) => table.cell(key, data[key]));
-			table.newRow();
-		});
-		table.sort(["Avg. Op Size (Bytes)|des"]);
-
-		console.log("-- Op Size Benchmark Statistics Sorted by Avg. Op Size -- ");
-		console.log(table.toString());
 	});
 
-	describe("1. Insert Nodes", () => {
-		describe("1a. With Individual transactions", () => {
-			const benchmarkInsertNodesWithIndividualTxs = async (
-				percentile: number,
-				testName: string,
-			) => {
-				const provider = await TestTreeProvider.create(1);
-				initializeOpDataCollection(provider, testName);
-				initializeTestTree(provider.trees[0]);
-				deleteCurrentOps(); // We don't want to record any ops from initializing the tree.
-				const jsonNode = getJsonNode(
-					getSuccessfulOpByteSize("INSERT", "INDIVIDUAL", percentile),
-				);
-				await insertNodesWithIndividualTransactions(
-					provider.trees[0],
-					provider,
-					jsonNode,
-					BENCHMARK_NODE_COUNT,
-				);
-				assertChildNodeCount(provider.trees[0], BENCHMARK_NODE_COUNT);
-			};
+	describe("Remove Nodes", () => {
+		function benchmarkOps(transactionStyle: TransactionStyle, percentile: number): void {
+			const tree = createConnectedTree();
+			initializeOpDataCollection(tree);
+			const childByteSize = getSuccessfulOpByteSize(
+				Operation.Remove,
+				transactionStyle,
+				percentile,
+			);
+			const view = initializeTestTree(tree, createInitialTree(100, childByteSize));
+			deleteCurrentOps(); // We don't want to record any ops from initializing the tree.
+			if (transactionStyle === TransactionStyle.Individual) {
+				removeNodes(view, 100, 1);
+			} else {
+				removeNodesWithSingleTransaction(view, 100);
+			}
+			assertChildNodeCount(view, 0);
+		}
 
-			it(`1a.a. [Insert] [Individual Txs] ${BENCHMARK_NODE_COUNT} small nodes in ${BENCHMARK_NODE_COUNT} transactions`, async () => {
-				await benchmarkInsertNodesWithIndividualTxs(
-					0.01,
-					`1a.a. [Insert] [Individual Txs] ${BENCHMARK_NODE_COUNT} small nodes in ${BENCHMARK_NODE_COUNT} individual transactions`,
-				);
+		for (const { description, style, extraDescription } of styles) {
+			describe(description, () => {
+				for (const { percentile, word } of sizes) {
+					const title = `${BENCHMARK_NODE_COUNT} ${word} nodes in ${
+						style === TransactionStyle.Individual
+							? extraDescription
+							: `1 transactions containing 1 removal of ${BENCHMARK_NODE_COUNT} nodes`
+					}`;
+					benchmarkCustom({
+						only: false,
+						type: BenchmarkType.Measurement,
+						title,
+						run: async (reporter) => {
+							benchmarkOps(style, percentile);
+							const opStats = getOperationsStats(currentTestOps);
+							for (const key of Object.keys(opStats)) {
+								reporter.addMeasurement(key, opStats[key]);
+							}
+						},
+					});
+				}
 			});
-
-			it(`1a.b. [Insert] [Individual Txs] ${BENCHMARK_NODE_COUNT} medium nodes in ${BENCHMARK_NODE_COUNT} individual transactions`, async () => {
-				await benchmarkInsertNodesWithIndividualTxs(
-					0.5,
-					`1a.b. [Insert] [Individual Txs] ${BENCHMARK_NODE_COUNT} medium nodes in ${BENCHMARK_NODE_COUNT} individual transactions`,
-				);
-			});
-
-			it(`1a.c. [Insert] [Individual Txs] ${BENCHMARK_NODE_COUNT} large nodes in ${BENCHMARK_NODE_COUNT} individual transactions`, async () => {
-				await benchmarkInsertNodesWithIndividualTxs(
-					1,
-					`1a.c. [Insert] [Individual Txs] ${BENCHMARK_NODE_COUNT} large nodes in ${BENCHMARK_NODE_COUNT} individual transactions`,
-				);
-			});
-		});
-
-		describe("1b. With Single transaction", () => {
-			const benchmarkInsertNodesWithSingleTx = async (
-				percentile: number,
-				testName: string,
-			) => {
-				const provider = await TestTreeProvider.create(1);
-				initializeOpDataCollection(provider, testName);
-				initializeTestTree(provider.trees[0]);
-				deleteCurrentOps(); // We don't want to record any ops from initializing the tree.
-				const jsonNode = getJsonNode(
-					getSuccessfulOpByteSize("INSERT", "SINGLE", percentile),
-				);
-				await insertNodesWithSingleTransaction(
-					provider.trees[0],
-					provider,
-					jsonNode,
-					BENCHMARK_NODE_COUNT,
-				);
-				assertChildNodeCount(provider.trees[0], BENCHMARK_NODE_COUNT);
-			};
-
-			it(`1b.a. [Insert] [Single Tx] ${BENCHMARK_NODE_COUNT} small nodes in 1 transaction`, async () => {
-				await benchmarkInsertNodesWithSingleTx(
-					0.01,
-					`1b.a. [Insert] [Single Tx] ${BENCHMARK_NODE_COUNT} small nodes in 1 transaction`,
-				);
-			});
-
-			it(`1b.b. [Insert] [Single Tx] ${BENCHMARK_NODE_COUNT} medium nodes in 1 transaction`, async () => {
-				await benchmarkInsertNodesWithSingleTx(
-					0.5,
-					`1b.b. [Insert] [Single Tx] ${BENCHMARK_NODE_COUNT} medium nodes in 1 transaction`,
-				);
-			});
-
-			it(`1b.c. [Insert] [Single Tx] ${BENCHMARK_NODE_COUNT} large nodes in 1 transaction`, async () => {
-				await benchmarkInsertNodesWithSingleTx(
-					1,
-					`1b.c. [Insert] [Single Tx] ${BENCHMARK_NODE_COUNT} large nodes in 1 transaction`,
-				);
-			});
-		});
+		}
 	});
 
-	describe("2. Delete Nodes", () => {
-		describe("2a. With Individual transactions", () => {
-			const benchmarkDeleteNodesWithIndividualTxs = async (
-				percentile: number,
-				testName: string,
-			) => {
-				const provider = await TestTreeProvider.create(1);
-				initializeOpDataCollection(provider, testName);
-				const childByteSize = getSuccessfulOpByteSize("DELETE", "INDIVIDUAL", percentile);
-				initializeTestTree(
-					provider.trees[0],
-					getInitialJsonTreeWithChildren(100, childByteSize),
-				);
-				deleteCurrentOps(); // We don't want to record any ops from initializing the tree.
-				await deleteNodesWithIndividualTransactions(provider.trees[0], provider, 100, 1);
-				assertChildNodeCount(provider.trees[0], 0);
+	describe("Edit Nodes", () => {
+		function benchmarkOps(transactionStyle: TransactionStyle, percentile: number): void {
+			const tree = createConnectedTree();
+			initializeOpDataCollection(tree);
+			// Note that the child node byte size for the initial tree here should be arbitrary.
+			const view = initializeTestTree(tree, createInitialTree(BENCHMARK_NODE_COUNT, 1000));
+			deleteCurrentOps(); // We don't want to record any ops from initializing the tree.
+			const childData = createStringFromLength(
+				getSuccessfulOpByteSize(Operation.Edit, transactionStyle, percentile),
+			);
+			const action = () => {
+				editNodes(view, BENCHMARK_NODE_COUNT, childData);
 			};
+			if (transactionStyle === TransactionStyle.Individual) {
+				action();
+			} else {
+				Tree.runTransaction(view, action);
+			}
+			expectChildrenValues(view, childData, BENCHMARK_NODE_COUNT);
+		}
 
-			it(`2a.a. [Delete] [Individual Txs] ${BENCHMARK_NODE_COUNT} small nodes in ${BENCHMARK_NODE_COUNT} individual transactions`, async () => {
-				await benchmarkDeleteNodesWithIndividualTxs(
-					0.01,
-					`2a.a. [Delete] [Individual Txs] ${BENCHMARK_NODE_COUNT} small nodes in ${BENCHMARK_NODE_COUNT} individual transactions`,
-				);
+		for (const { description, style, extraDescription } of styles) {
+			describe(description, () => {
+				for (const { percentile, word } of sizes) {
+					const title = `${BENCHMARK_NODE_COUNT} ${word} changes in ${extraDescription} containing ${
+						style === TransactionStyle.Individual ? "1 edit" : `${BENCHMARK_NODE_COUNT} edits`
+					}`;
+					benchmarkCustom({
+						only: false,
+						type: BenchmarkType.Measurement,
+						title,
+						run: async (reporter) => {
+							benchmarkOps(style, percentile);
+							const opStats = getOperationsStats(currentTestOps);
+							for (const key of Object.keys(opStats)) {
+								reporter.addMeasurement(key, opStats[key]);
+							}
+						},
+					});
+				}
 			});
-
-			it(`2a.b. [Delete] [Individual Txs] ${BENCHMARK_NODE_COUNT} medium nodes in ${BENCHMARK_NODE_COUNT} individual transactions`, async () => {
-				await benchmarkDeleteNodesWithIndividualTxs(
-					0.5,
-					`2a.b. [Delete] [Individual Txs] ${BENCHMARK_NODE_COUNT} medium nodes in ${BENCHMARK_NODE_COUNT} individual transactions`,
-				);
-			});
-
-			it(`2a.c. [Delete] [Individual Txs] ${BENCHMARK_NODE_COUNT} large nodes in ${BENCHMARK_NODE_COUNT} individual transactions`, async () => {
-				await benchmarkDeleteNodesWithIndividualTxs(
-					1,
-					`2a.c. [Delete] [Individual Txs] ${BENCHMARK_NODE_COUNT} large nodes in ${BENCHMARK_NODE_COUNT} individual transactions`,
-				);
-			});
-		});
-
-		describe("2b. With Single transaction", () => {
-			const benchmarkDeleteNodesWithSingleTx = async (
-				percentile: number,
-				testName: string,
-			) => {
-				const provider = await TestTreeProvider.create(1);
-				initializeOpDataCollection(provider, testName);
-				const childByteSize = getSuccessfulOpByteSize("DELETE", "SINGLE", percentile);
-				initializeTestTree(
-					provider.trees[0],
-					getInitialJsonTreeWithChildren(100, childByteSize),
-				);
-				deleteCurrentOps(); // We don't want to record any ops from initializing the tree.
-				await deleteNodesWithSingleTransaction(provider.trees[0], provider, 100);
-				assertChildNodeCount(provider.trees[0], 0);
-			};
-
-			it(`2b.a. [Delete] [Single Tx] ${BENCHMARK_NODE_COUNT} small nodes in 1 transaction containing 1 delete of ${BENCHMARK_NODE_COUNT} nodes`, async () => {
-				await benchmarkDeleteNodesWithSingleTx(
-					0.01,
-					`2b.a. [Delete] [Single Tx] ${BENCHMARK_NODE_COUNT} small nodes in 1 transaction containing 1 delete of ${BENCHMARK_NODE_COUNT} nodes`,
-				);
-			});
-
-			it(`2b.b. [Delete] [Single Tx] ${BENCHMARK_NODE_COUNT} medium nodes in 1 transactions containing 1 delete of ${BENCHMARK_NODE_COUNT} nodes`, async () => {
-				await benchmarkDeleteNodesWithSingleTx(
-					0.5,
-					`2b.b. [Delete] [Single Tx] ${BENCHMARK_NODE_COUNT} medium nodes in 1 transactions containing 1 delete of ${BENCHMARK_NODE_COUNT} nodes`,
-				);
-			});
-
-			it(`2b.c. [Delete] [Single Tx] ${BENCHMARK_NODE_COUNT} large nodes in 1 transactions containing 1 delete of ${BENCHMARK_NODE_COUNT} nodes`, async () => {
-				await benchmarkDeleteNodesWithSingleTx(
-					1,
-					`2b.c. [Delete] [Single Tx] ${BENCHMARK_NODE_COUNT} large nodes in 1 transactions containing 1 delete of ${BENCHMARK_NODE_COUNT} nodes`,
-				);
-			});
-		});
+		}
 	});
 
-	describe("3. Edit Nodes", () => {
-		describe("3a. With Individual transactions", () => {
-			const benchmarkEditNodesWithIndividualTxs = async (
+	describe("Insert, Remove & Edit Nodes", () => {
+		const oneThirdNodeCount = Math.floor(BENCHMARK_NODE_COUNT * (1 / 3));
+		const seventyPercentCount = Math.floor(BENCHMARK_NODE_COUNT * 0.7);
+		const fifteenPercentCount = Math.floor(BENCHMARK_NODE_COUNT * 0.15);
+
+		type OpKindDistribution = {
+			readonly [OpKind in keyof typeof Operation]: number;
+		};
+
+		const distributions: OpKindDistribution[] = [
+			{
+				[Operation.Insert]: oneThirdNodeCount,
+				[Operation.Edit]: oneThirdNodeCount,
+				[Operation.Remove]: oneThirdNodeCount,
+			},
+			{
+				[Operation.Insert]: seventyPercentCount,
+				[Operation.Edit]: fifteenPercentCount,
+				[Operation.Remove]: fifteenPercentCount,
+			},
+			{
+				[Operation.Insert]: fifteenPercentCount,
+				[Operation.Edit]: seventyPercentCount,
+				[Operation.Remove]: fifteenPercentCount,
+			},
+			{
+				[Operation.Insert]: fifteenPercentCount,
+				[Operation.Edit]: fifteenPercentCount,
+				[Operation.Remove]: seventyPercentCount,
+			},
+		];
+
+		withTransactionsOrNot((run) => {
+			const benchmarkInsertRemoveEditNodesWithIndividualTxs = (
 				percentile: number,
-				testName: string,
+				distribution: OpKindDistribution,
 			) => {
-				const provider = await TestTreeProvider.create(1);
-				initializeOpDataCollection(provider, testName);
-				// Note that the child node byte size for the intial tree here should be arbitrary
-				initializeTestTree(
-					provider.trees[0],
-					getInitialJsonTreeWithChildren(BENCHMARK_NODE_COUNT, 1000),
-				);
-				deleteCurrentOps(); // We don't want to record any ops from initializing the tree.
-				const editPayload = getEditPayloadInBytes(
-					getSuccessfulOpByteSize("EDIT", "INDIVIDUAL", percentile),
-				);
-				await editNodesWithIndividualTransactions(
-					provider.trees[0],
-					provider,
-					BENCHMARK_NODE_COUNT,
-					editPayload,
-				);
-				assertChildValuesEqualExpected(
-					provider.trees[0],
-					editPayload,
-					BENCHMARK_NODE_COUNT,
-				);
-			};
+				const {
+					Remove: removeNodeCount,
+					Insert: insertNodeCount,
+					Edit: editNodeCount,
+				} = distribution;
 
-			it(`3a.a. [Edit] [Individual Txs] ${BENCHMARK_NODE_COUNT} small changes in ${BENCHMARK_NODE_COUNT} transactions containing 1 edit`, async () => {
-				await benchmarkEditNodesWithIndividualTxs(
-					0.01,
-					`3a.a. [Edit] [Individual Txs] ${BENCHMARK_NODE_COUNT} small changes in ${BENCHMARK_NODE_COUNT} transactions containing 1 edit`,
-				);
-			});
+				const tree = createConnectedTree();
+				initializeOpDataCollection(tree);
 
-			it(`3a.b. [Edit] [Individual Txs] ${BENCHMARK_NODE_COUNT} medium changes in ${BENCHMARK_NODE_COUNT} transactions containing 1 edit`, async () => {
-				await benchmarkEditNodesWithIndividualTxs(
-					0.5,
-					`3a.b. [Edit] [Individual Txs] ${BENCHMARK_NODE_COUNT} medium changes in ${BENCHMARK_NODE_COUNT} transactions containing 1 edit`,
+				// remove
+				const childByteSize = getSuccessfulOpByteSize(
+					Operation.Remove,
+					TransactionStyle.Individual,
+					percentile,
 				);
-			});
-
-			it(`3a.c. [Edit] [Individual Txs] ${BENCHMARK_NODE_COUNT} large changes in ${BENCHMARK_NODE_COUNT} transactions containing 1 edit`, async () => {
-				await benchmarkEditNodesWithIndividualTxs(
-					1,
-					`3a.c. [Edit] [Individual Txs] ${BENCHMARK_NODE_COUNT} large changes in ${BENCHMARK_NODE_COUNT} transactions containing 1 edit`,
-				);
-			});
-		});
-
-		describe("3b. With Single transaction", () => {
-			const benchmarkEditNodesWithSingleTx = async (percentile: number, testName: string) => {
-				const provider = await TestTreeProvider.create(1);
-				initializeOpDataCollection(provider, testName);
-				// Note that the child node byte size for the intial tree here should be arbitrary
-				initializeTestTree(
-					provider.trees[0],
-					getInitialJsonTreeWithChildren(BENCHMARK_NODE_COUNT, 1000),
-				);
-				deleteCurrentOps(); // We don't want to record any ops from initializing the tree.
-				const editPayload = getEditPayloadInBytes(
-					getSuccessfulOpByteSize("EDIT", "SINGLE", percentile),
-				);
-				await editNodesWithSingleTransaction(
-					provider.trees[0],
-					provider,
-					BENCHMARK_NODE_COUNT,
-					editPayload,
-				);
-				assertChildValuesEqualExpected(
-					provider.trees[0],
-					editPayload,
-					BENCHMARK_NODE_COUNT,
-				);
-			};
-
-			it(`3b.a. [Edit] [Single Tx] ${BENCHMARK_NODE_COUNT} small edits in 1 transaction containing ${BENCHMARK_NODE_COUNT} edits`, async () => {
-				await benchmarkEditNodesWithSingleTx(
-					0.01,
-					`3b.a. [Edit] [Single Tx] ${BENCHMARK_NODE_COUNT} small changes in 1 transaction containing ${BENCHMARK_NODE_COUNT} edits`,
-				);
-			});
-
-			it(`3b.b. [Edit] [Single Tx] ${BENCHMARK_NODE_COUNT} medium changes in 1 transaction containing ${BENCHMARK_NODE_COUNT} edits`, async () => {
-				await benchmarkEditNodesWithSingleTx(
-					0.5,
-					`3b.b. [Edit] [Single Tx] ${BENCHMARK_NODE_COUNT} medium changes in 1 transaction containing ${BENCHMARK_NODE_COUNT} edits`,
-				);
-			});
-
-			it(`3b.c. [Edit] [Single Tx] ${BENCHMARK_NODE_COUNT} large changes in 1 transaction containing ${BENCHMARK_NODE_COUNT} edits`, async () => {
-				await benchmarkEditNodesWithSingleTx(
-					1,
-					`3b.c. [Edit] [Single Tx] ${BENCHMARK_NODE_COUNT} large changes in 1 transaction containing ${BENCHMARK_NODE_COUNT} edits`,
-				);
-			});
-		});
-	});
-
-	describe("4. Insert, Delete & Edit Nodes", () => {
-		describe("4a. Insert, Delete & Edit Nodes in Individual Transactions", () => {
-			const benchmarkInsertDeleteEditNodesWithInvidiualTxs = async (
-				percentile: number,
-				testName: string,
-				insertNodeCount: number,
-				deleteNodeCount: number,
-				editNodeCount: number,
-			) => {
-				const provider = await TestTreeProvider.create(1);
-				initializeOpDataCollection(provider, testName);
-
-				// delete
-				const childByteSize = getSuccessfulOpByteSize("DELETE", "INDIVIDUAL", percentile);
-				initializeTestTree(
-					provider.trees[0],
-					getInitialJsonTreeWithChildren(deleteNodeCount, childByteSize),
+				const view = initializeTestTree(
+					tree,
+					createInitialTree(removeNodeCount, childByteSize),
 				);
 				deleteCurrentOps(); // We don't want to record the ops from initializing the tree.
-				await deleteNodesWithIndividualTransactions(
-					provider.trees[0],
-					provider,
-					deleteNodeCount,
-					1,
-				);
-				assertChildNodeCount(provider.trees[0], 0);
 
-				// insert
-				const insertChildNode = getJsonNode(
-					getSuccessfulOpByteSize("INSERT", "INDIVIDUAL", percentile),
+				const childData = createStringFromLength(
+					getSuccessfulOpByteSize(Operation.Edit, TransactionStyle.Individual, percentile),
 				);
-				await insertNodesWithIndividualTransactions(
-					provider.trees[0],
-					provider,
-					insertChildNode,
-					insertNodeCount,
-				);
-				assertChildNodeCount(provider.trees[0], insertNodeCount);
 
-				// edit
-				// The editing function iterates over each child node and performs an edit so we have to make sure we have enough children to avoid going out of bounds.
-				if (insertNodeCount < editNodeCount) {
-					const remainder = editNodeCount - insertNodeCount;
-					saveAndResetCurrentOps();
-					await insertNodesWithIndividualTransactions(
-						provider.trees[0],
-						provider,
-						getJsonNode(childByteSize),
-						remainder,
+				run(view, () => {
+					removeNodes(view, removeNodeCount, 1);
+					assertChildNodeCount(view, 0);
+
+					// insert
+					const insertChildNode = createTreeWithSize(
+						getSuccessfulOpByteSize(Operation.Insert, TransactionStyle.Individual, percentile),
 					);
-					deleteCurrentOps(); // We don't want to record the ops from re-initializing the tree.
-				}
-				const editPayload = getEditPayloadInBytes(
-					getSuccessfulOpByteSize("EDIT", "INDIVIDUAL", percentile),
-				);
-				await editNodesWithIndividualTransactions(
-					provider.trees[0],
-					provider,
-					editNodeCount,
-					editPayload,
-				);
-				assertChildValuesEqualExpected(provider.trees[0], editPayload, editNodeCount);
+					insertNodes(view, insertChildNode, insertNodeCount);
+					assertChildNodeCount(view, insertNodeCount);
+
+					// edit
+					// The editing function iterates over each child node and performs an edit so we have to make sure we have enough children to avoid going out of bounds.
+					if (insertNodeCount < editNodeCount) {
+						const remainder = editNodeCount - insertNodeCount;
+						saveAndResetCurrentOps();
+						insertNodes(view, createTreeWithSize(childByteSize), remainder);
+						deleteCurrentOps(); // We don't want to record the ops from re-initializing the tree.
+					}
+					editNodes(view, editNodeCount, childData);
+				});
+				expectChildrenValues(view, childData, editNodeCount);
 			};
 
-			describe("4a.a. [Combination] [Individual Txs] With individual transactions and an equal distribution of operation type", () => {
-				const oneThirdNodeCount = Math.floor(BENCHMARK_NODE_COUNT * (1 / 3));
-
-				it(`4a.a.a. [Combination] [Individual Txs] insert ${oneThirdNodeCount} small nodes, delete ${oneThirdNodeCount} small nodes, edit ${oneThirdNodeCount} nodes with small payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithInvidiualTxs(
-						0.01,
-						`4a.a.a. [Combination] [Individual Txs] insert ${oneThirdNodeCount} small nodes, delete ${oneThirdNodeCount} small nodes, edit ${oneThirdNodeCount} nodes with small payloads`,
-						oneThirdNodeCount,
-						oneThirdNodeCount,
-						oneThirdNodeCount,
-					);
+			for (const distribution of distributions) {
+				const suiteDescription = `Distribution: ${distribution.Insert}% insert, ${distribution.Edit}% edit, ${distribution.Remove}% remove`;
+				describe(suiteDescription, () => {
+					for (const { percentile } of sizes) {
+						it(`Percentile: ${percentile}`, () => {
+							benchmarkInsertRemoveEditNodesWithIndividualTxs(percentile, distribution);
+						});
+					}
 				});
-
-				it(`4a.a.b. [Combination] [Individual Txs] insert ${oneThirdNodeCount} medium nodes, delete ${oneThirdNodeCount} medium nodes, edit ${oneThirdNodeCount} nodes with medium payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithInvidiualTxs(
-						0.5,
-						`4a.a.b. [Combination] [Individual Txs] insert ${oneThirdNodeCount} medium nodes, delete ${oneThirdNodeCount} medium nodes, edit ${oneThirdNodeCount} nodes with medium payloads`,
-						oneThirdNodeCount,
-						oneThirdNodeCount,
-						oneThirdNodeCount,
-					);
-				});
-
-				it(`4a.a.c. [Combination] [Individual Txs] insert ${oneThirdNodeCount} large nodes, delete ${oneThirdNodeCount} large medium, edit ${oneThirdNodeCount} nodes with large payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithInvidiualTxs(
-						1,
-						`4a.a.c. [Combination] [Individual Txs] insert ${oneThirdNodeCount} large nodes, delete ${oneThirdNodeCount} large medium, edit ${oneThirdNodeCount} nodes with large payloads`,
-						oneThirdNodeCount,
-						oneThirdNodeCount,
-						oneThirdNodeCount,
-					);
-				});
-			});
-
-			describe("4a.b. [Combination] [Individual Txs] In individual transactions with 70% distribution of operations towards insert", () => {
-				const seventyPercentCount = BENCHMARK_NODE_COUNT * 0.7;
-				const fifteenPercentCount = BENCHMARK_NODE_COUNT * 0.15;
-
-				it(`4a.b.a. [Combination] [Individual Txs] Insert ${seventyPercentCount} small nodes, delete ${fifteenPercentCount} small nodes, edit ${fifteenPercentCount} nodes with small payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithInvidiualTxs(
-						0.01,
-						`4a.b.a. [Combination] [Individual Txs] Insert ${seventyPercentCount} small nodes, delete ${fifteenPercentCount} small nodes, edit ${fifteenPercentCount} nodes with small payloads`,
-						seventyPercentCount,
-						fifteenPercentCount,
-						fifteenPercentCount,
-					);
-				});
-
-				it(`4a.b.b. [Combination] [Individual Txs] Insert ${seventyPercentCount} medium nodes, delete ${fifteenPercentCount} medium nodes, edit ${fifteenPercentCount} nodes with medium payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithInvidiualTxs(
-						0.5,
-						`4a.b.b. [Combination] [Individual Txs] Insert ${seventyPercentCount} medium nodes, delete ${fifteenPercentCount} medium nodes, edit ${fifteenPercentCount} nodes with medium payloads`,
-						seventyPercentCount,
-						fifteenPercentCount,
-						fifteenPercentCount,
-					);
-				});
-
-				it(`4a.b.c. [Combination] [Individual Txs] Insert ${seventyPercentCount} large nodes, delete ${fifteenPercentCount} large nodes, edit ${fifteenPercentCount} nodes with large payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithInvidiualTxs(
-						1,
-						`4a.b.c. [Combination] [Individual Txs] Insert ${seventyPercentCount} large nodes, delete ${fifteenPercentCount} large nodes, edit ${fifteenPercentCount} nodes with large payloads`,
-						seventyPercentCount,
-						fifteenPercentCount,
-						fifteenPercentCount,
-					);
-				});
-			});
-
-			describe("4a.c. [Combination] [Individual Txs] In individual transactions with 70% distribution of operations towards delete", () => {
-				const seventyPercentCount = BENCHMARK_NODE_COUNT * 0.7;
-				const fifteenPercentCount = BENCHMARK_NODE_COUNT * 0.15;
-
-				it(`4a.c.a. [Combination] [Individual Txs] Insert ${fifteenPercentCount} small nodes, delete ${seventyPercentCount} small nodes, edit ${fifteenPercentCount} nodes with small payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithInvidiualTxs(
-						0.01,
-						`4a.c.a. [Combination] [Individual Txs] Insert ${fifteenPercentCount} small nodes, delete ${seventyPercentCount} small nodes, edit ${fifteenPercentCount} nodes with small payloads`,
-						fifteenPercentCount,
-						seventyPercentCount,
-						fifteenPercentCount,
-					);
-				});
-
-				it(`4a.c.b. [Combination] [Individual Txs] Insert ${fifteenPercentCount} medium nodes, delete ${seventyPercentCount} medium nodes, edit ${fifteenPercentCount} nodes with medium payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithInvidiualTxs(
-						0.5,
-						`4a.c.b. [Combination] [Individual Txs] Insert ${fifteenPercentCount} medium nodes, delete ${seventyPercentCount} medium nodes, edit ${fifteenPercentCount} nodes with medium payloads`,
-						fifteenPercentCount,
-						seventyPercentCount,
-						fifteenPercentCount,
-					);
-				});
-
-				it(`4a.c.b. [Combination] [Individual Txs] Insert ${fifteenPercentCount} large nodes, delete ${seventyPercentCount} large nodes, edit ${fifteenPercentCount} nodes with large payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithInvidiualTxs(
-						1,
-						`4a.c.b. [Combination] [Individual Txs] Insert ${fifteenPercentCount} medium nodes, delete ${seventyPercentCount} medium nodes, edit ${fifteenPercentCount} nodes with medium payloads`,
-						fifteenPercentCount,
-						seventyPercentCount,
-						fifteenPercentCount,
-					);
-				});
-			});
-
-			describe("4a.d. [Combination] [Individual Txs] In individual transactions with 70% distribution of operations towards edit", () => {
-				const seventyPercentCount = BENCHMARK_NODE_COUNT * 0.7;
-				const fifteenPercentCount = BENCHMARK_NODE_COUNT * 0.15;
-
-				it(`4a.d.a. [Combination] [Individual Txs] Insert ${fifteenPercentCount} small nodes, delete ${fifteenPercentCount} small nodes, edit ${seventyPercentCount} nodes with small payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithInvidiualTxs(
-						0.01,
-						`4a.d.a. [Combination] [Individual Txs] Insert ${fifteenPercentCount} small nodes, delete ${fifteenPercentCount} small nodes, edit ${seventyPercentCount} nodes with small payloads`,
-						fifteenPercentCount,
-						fifteenPercentCount,
-						seventyPercentCount,
-					);
-				});
-
-				it(`4a.d.b. [Combination] [Individual Txs] Insert ${fifteenPercentCount} medium nodes, delete ${fifteenPercentCount} medium nodes, edit ${seventyPercentCount} nodes with medium payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithInvidiualTxs(
-						0.5,
-						`4a.d.b. [Combination] [Individual Txs] Insert ${fifteenPercentCount} medium nodes, delete ${fifteenPercentCount} medium nodes, edit ${seventyPercentCount} nodes with medium payloads`,
-						fifteenPercentCount,
-						fifteenPercentCount,
-						seventyPercentCount,
-					);
-				});
-
-				it(`4a.d.c. [Combination] [Individual Txs] Insert ${fifteenPercentCount} large nodes, delete ${seventyPercentCount} large nodes, edit ${seventyPercentCount} nodes with large payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithInvidiualTxs(
-						1,
-						`4a.d.c. [Combination] [Individual Txs] Insert ${fifteenPercentCount} large nodes, delete ${seventyPercentCount} large nodes, edit ${seventyPercentCount} nodes with large payloads`,
-						fifteenPercentCount,
-						fifteenPercentCount,
-						seventyPercentCount,
-					);
-				});
-			});
-		});
-
-		describe("4b. Insert, Delete & Edit Nodes in Single Transactions", () => {
-			const benchmarkInsertDeleteEditNodesWithSingleTxs = async (
-				percentile: number,
-				testName: string,
-				insertNodeCount: number,
-				deleteNodeCount: number,
-				editNodeCount: number,
-			) => {
-				const provider = await TestTreeProvider.create(1);
-				initializeOpDataCollection(provider, testName);
-
-				// delete
-				const childByteSize = getSuccessfulOpByteSize("DELETE", "SINGLE", percentile);
-				initializeTestTree(
-					provider.trees[0],
-					getInitialJsonTreeWithChildren(deleteNodeCount, childByteSize),
-				);
-				deleteCurrentOps(); // We don't want to record the ops from initializing the tree.
-				await deleteNodesWithSingleTransaction(
-					provider.trees[0],
-					provider,
-					deleteNodeCount,
-				);
-				assertChildNodeCount(provider.trees[0], 0);
-
-				// insert
-				const insertChildNode = getJsonNode(
-					getSuccessfulOpByteSize("INSERT", "SINGLE", percentile),
-				);
-				await insertNodesWithSingleTransaction(
-					provider.trees[0],
-					provider,
-					insertChildNode,
-					insertNodeCount,
-				);
-				assertChildNodeCount(provider.trees[0], insertNodeCount);
-
-				// edit
-				// The editing function iterates over each child node and performs an edit so we have to make sure we have enough children to avoid going out of bounds.
-				if (insertNodeCount < editNodeCount) {
-					const remainder = editNodeCount - insertNodeCount;
-					saveAndResetCurrentOps();
-					await insertNodesWithIndividualTransactions(
-						provider.trees[0],
-						provider,
-						getJsonNode(childByteSize),
-						remainder,
-					);
-					deleteCurrentOps(); // We don't want to record the ops from re-initializing the tree.
-				}
-				const editPayload = getEditPayloadInBytes(
-					getSuccessfulOpByteSize("EDIT", "SINGLE", percentile),
-				);
-				await editNodesWithSingleTransaction(
-					provider.trees[0],
-					provider,
-					editNodeCount,
-					editPayload,
-				);
-				assertChildValuesEqualExpected(provider.trees[0], editPayload, editNodeCount);
-			};
-
-			describe("4b.a. [Combination] [Single Tx] With single transactions and an equal distribution of operation type", () => {
-				const oneThirdNodeCount = Math.floor(BENCHMARK_NODE_COUNT * (1 / 3));
-
-				it(`4b.a.a. [Combination] [Single Tx] insert ${oneThirdNodeCount} small nodes, delete ${oneThirdNodeCount} small nodes, edit ${oneThirdNodeCount} nodes with small payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithSingleTxs(
-						0.01,
-						`4b.a.a. [Combination] [Single Tx] insert ${oneThirdNodeCount} small nodes, delete ${oneThirdNodeCount} small nodes, edit ${oneThirdNodeCount} nodes with small payloads`,
-						oneThirdNodeCount,
-						oneThirdNodeCount,
-						oneThirdNodeCount,
-					);
-				});
-
-				it(`4b.a.b. [Combination] [Single Tx] insert ${oneThirdNodeCount} medium nodes, delete ${oneThirdNodeCount} medium nodes, edit ${oneThirdNodeCount} nodes with medium payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithSingleTxs(
-						0.5,
-						`4b.a.b. [Combination] [Single Tx] insert ${oneThirdNodeCount} medium nodes, delete ${oneThirdNodeCount} medium nodes, edit ${oneThirdNodeCount} nodes with medium payloads`,
-						oneThirdNodeCount,
-						oneThirdNodeCount,
-						oneThirdNodeCount,
-					);
-				});
-
-				it(`4b.a.c. [Combination] [Single Tx] insert ${oneThirdNodeCount} large nodes, delete ${oneThirdNodeCount} large medium, edit ${oneThirdNodeCount} nodes with large payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithSingleTxs(
-						1,
-						`4b.a.c. [Combination] [Single Tx] insert ${oneThirdNodeCount} large nodes, delete ${oneThirdNodeCount} large medium, edit ${oneThirdNodeCount} nodes with large payloads`,
-						oneThirdNodeCount,
-						oneThirdNodeCount,
-						oneThirdNodeCount,
-					);
-				});
-			});
-
-			describe("4b.b. [Combination] [Single Tx] With single transactions with 70% distribution of operations towards insert", () => {
-				const seventyPercentCount = BENCHMARK_NODE_COUNT * 0.7;
-				const fifteenPercentCount = BENCHMARK_NODE_COUNT * 0.15;
-
-				it(`4b.b.a. [Combination] [Single Tx] Insert ${seventyPercentCount} small nodes, delete ${fifteenPercentCount} small nodes, edit ${fifteenPercentCount} nodes with small payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithSingleTxs(
-						0.01,
-						`4b.b.a. [Combination] [Single Tx] Insert ${seventyPercentCount} small nodes, delete ${fifteenPercentCount} small nodes, edit ${fifteenPercentCount} nodes with small payloads`,
-						seventyPercentCount,
-						fifteenPercentCount,
-						fifteenPercentCount,
-					);
-				});
-
-				it(`4b.b.b. [Combination] [Single Tx] Insert ${seventyPercentCount} medium nodes, delete ${fifteenPercentCount} medium nodes, edit ${fifteenPercentCount} nodes with medium payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithSingleTxs(
-						0.5,
-						`4b.b.b. [Combination] [Single Tx] Insert ${seventyPercentCount} medium nodes, delete ${fifteenPercentCount} medium nodes, edit ${fifteenPercentCount} nodes with medium payloads`,
-						seventyPercentCount,
-						fifteenPercentCount,
-						fifteenPercentCount,
-					);
-				});
-
-				it(`4b.b.c. [Combination] [Single Tx] Insert ${seventyPercentCount} large nodes, delete ${fifteenPercentCount} large nodes, edit ${fifteenPercentCount} nodes with large payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithSingleTxs(
-						1,
-						`4b.b.c. [Combination] [Single Tx] Insert ${seventyPercentCount} large nodes, delete ${fifteenPercentCount} large nodes, edit ${fifteenPercentCount} nodes with large payloads`,
-						seventyPercentCount,
-						fifteenPercentCount,
-						fifteenPercentCount,
-					);
-				});
-			});
-
-			describe("4b.c. [Combination] [Single Tx] With single transactions with 70% distribution of operations towards delete", () => {
-				const seventyPercentCount = BENCHMARK_NODE_COUNT * 0.7;
-				const fifteenPercentCount = BENCHMARK_NODE_COUNT * 0.15;
-
-				it(`4b.c.a. [Combination] [Single Tx] Insert ${fifteenPercentCount} small nodes, delete ${seventyPercentCount} small nodes, edit ${fifteenPercentCount} nodes with small payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithSingleTxs(
-						0.01,
-						`4b.c.a. [Combination] [Single Tx] Insert ${fifteenPercentCount} small nodes, delete ${seventyPercentCount} small nodes, edit ${fifteenPercentCount} nodes with small payloads`,
-						fifteenPercentCount,
-						seventyPercentCount,
-						fifteenPercentCount,
-					);
-				});
-
-				it(`4b.c.b. [Combination] [Single Tx] Insert ${fifteenPercentCount} medium nodes, delete ${seventyPercentCount} medium nodes, edit ${fifteenPercentCount} nodes with medium payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithSingleTxs(
-						0.5,
-						`4b.c.b. [Combination] [Single Tx] Insert ${fifteenPercentCount} medium nodes, delete ${seventyPercentCount} medium nodes, edit ${fifteenPercentCount} nodes with medium payloads`,
-						fifteenPercentCount,
-						seventyPercentCount,
-						fifteenPercentCount,
-					);
-				});
-
-				it(`4b.c.b. [Combination] [Single Tx] Insert ${fifteenPercentCount} large nodes, delete ${seventyPercentCount} large nodes, edit ${fifteenPercentCount} nodes with large payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithSingleTxs(
-						1,
-						`4a.c.b. [Combination] [Single Tx] Insert ${fifteenPercentCount} medium nodes, delete ${seventyPercentCount} medium nodes, edit ${fifteenPercentCount} nodes with medium payloads`,
-						fifteenPercentCount,
-						seventyPercentCount,
-						fifteenPercentCount,
-					);
-				});
-			});
-
-			describe("4b.d. [Combination] [Single Tx] In individual With single transactions with 70% distribution of operations towards edit", () => {
-				const seventyPercentCount = BENCHMARK_NODE_COUNT * 0.7;
-				const fifteenPercentCount = BENCHMARK_NODE_COUNT * 0.15;
-
-				it(`4b.d.a. [Combination] [Single Tx] Insert ${fifteenPercentCount} small nodes, delete ${fifteenPercentCount} small nodes, edit ${seventyPercentCount} nodes with small payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithSingleTxs(
-						0.01,
-						`4a.d.a. [Combination] [Single Tx] Insert ${fifteenPercentCount} small nodes, delete ${fifteenPercentCount} small nodes, edit ${seventyPercentCount} nodes with small payloads`,
-						fifteenPercentCount,
-						fifteenPercentCount,
-						seventyPercentCount,
-					);
-				});
-
-				it(`4b.d.b. [Combination] [Single Tx] Insert ${fifteenPercentCount} medium nodes, delete ${fifteenPercentCount} medium nodes, edit ${seventyPercentCount} nodes with medium payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithSingleTxs(
-						0.5,
-						`4b.d.b. [Combination] [Single Tx] Insert ${fifteenPercentCount} medium nodes, delete ${fifteenPercentCount} medium nodes, edit ${seventyPercentCount} nodes with medium payloads`,
-						fifteenPercentCount,
-						fifteenPercentCount,
-						seventyPercentCount,
-					);
-				});
-
-				it(`4b.d.c. [Combination] Single Txs] Insert ${fifteenPercentCount} large nodes, delete ${seventyPercentCount} large nodes, edit ${seventyPercentCount} nodes with large payloads`, async () => {
-					await benchmarkInsertDeleteEditNodesWithSingleTxs(
-						1,
-						`4b.d.c. [Combination] [Single Tx] Insert ${fifteenPercentCount} large nodes, delete ${seventyPercentCount} large nodes, edit ${seventyPercentCount} nodes with large payloads`,
-						fifteenPercentCount,
-						fifteenPercentCount,
-						seventyPercentCount,
-					);
-				});
-			});
+			}
 		});
 	});
 });

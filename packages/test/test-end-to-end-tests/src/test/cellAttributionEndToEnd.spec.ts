@@ -4,59 +4,89 @@
  */
 
 import { strict as assert } from "assert";
-import { AttributionInfo } from "@fluidframework/runtime-definitions";
-import {
-	createRuntimeAttributor,
-	enableOnNewFileKey,
-	IRuntimeAttributor,
-} from "@fluid-experimental/attributor";
-import { requestFluidObject } from "@fluidframework/runtime-utils";
-import { SharedCell } from "@fluidframework/cell";
-import {
-	ITestObjectProvider,
-	ITestContainerConfig,
-	DataObjectFactoryType,
-	ChannelFactoryRegistry,
-	ITestFluidObject,
-} from "@fluidframework/test-utils";
-import { describeNoCompat } from "@fluidframework/test-version-utils";
-import { IContainer, IFluidCodeDetails } from "@fluidframework/container-definitions";
-import { ConfigTypes, IConfigProviderBase } from "@fluidframework/telemetry-utils";
 
-const cellId = "sharedCellKey";
-const registry: ChannelFactoryRegistry = [[cellId, SharedCell.getFactory()]];
-const testContainerConfig: ITestContainerConfig = {
-	fluidDataObjectType: DataObjectFactoryType.Test,
-	registry,
-};
+import {
+	getRuntimeAttributor,
+	IRuntimeAttributor,
+	enableOnNewFileKey,
+} from "@fluid-experimental/attributor";
+import {
+	describeCompat,
+	itSkipsFailureOnSpecificDrivers,
+} from "@fluid-private/test-version-utils";
+import type { ISharedCell } from "@fluidframework/cell/internal";
+import { IContainer, IFluidCodeDetails } from "@fluidframework/container-definitions/internal";
+import { ContainerRuntime } from "@fluidframework/container-runtime/internal";
+import { ConfigTypes, IConfigProviderBase } from "@fluidframework/core-interfaces";
+import { AttributionInfo } from "@fluidframework/runtime-definitions/internal";
+import {
+	ChannelFactoryRegistry,
+	DataObjectFactoryType,
+	ITestContainerConfig,
+	ITestFluidObject,
+	ITestObjectProvider,
+	getContainerEntryPointBackCompat,
+} from "@fluidframework/test-utils/internal";
 
 function assertAttributionMatches(
-	sharedCell: SharedCell,
+	sharedCell: ISharedCell,
 	attributor: IRuntimeAttributor,
-	expected: Partial<AttributionInfo> | "detached",
+	expected: Partial<AttributionInfo> | "detached" | "local" | undefined,
 ): void {
 	const key = sharedCell.getAttribution();
 
-	if (expected === "detached") {
-		assert(
-			key === undefined,
-			`The attribuiton should not be recorded in detached state currently`,
-		);
-	} else {
-		assert(key !== undefined, `The cell had no attribution information`);
-		const { timestamp, user } = attributor.get(key) ?? {};
-		if (expected.timestamp !== undefined) {
-			assert.equal(timestamp, expected.timestamp);
-		}
-		if (expected.user !== undefined) {
-			assert.deepEqual(user, expected.user);
+	switch (expected) {
+		case "detached":
+			assert.deepEqual(
+				key,
+				{ type: "detached", id: 0 },
+				"expected attribution key to be detached",
+			);
+			assert.equal(
+				attributor.has(key),
+				false,
+				"Expected RuntimeAttributor to not attribute detached key.",
+			);
+			break;
+		case "local":
+			assert.deepEqual(key, { type: "local" });
+			assert.equal(
+				attributor.has(key),
+				false,
+				"Expected RuntimeAttributor to not attribute local key.",
+			);
+			break;
+		case undefined:
+			assert.deepEqual(key, expected);
+			break;
+		default: {
+			if (key === undefined) {
+				assert.fail("Expected a defined key, but got an undefined one");
+			}
+			const { timestamp, user } = attributor.get(key) ?? {};
+			if (expected.timestamp !== undefined) {
+				assert.equal(timestamp, expected.timestamp);
+			}
+			if (expected.user !== undefined) {
+				assert.deepEqual(user, expected.user);
+			}
+			break;
 		}
 	}
 }
 
-describeNoCompat("Attributor for SharedCell", (getTestObjectProvider) => {
+describeCompat("Attributor for SharedCell", "NoCompat", (getTestObjectProvider, apis) => {
+	const { SharedCell } = apis.dds;
+
+	const cellId = "sharedCellKey";
+	const registry: ChannelFactoryRegistry = [[cellId, SharedCell.getFactory()]];
+	const testContainerConfig: ITestContainerConfig = {
+		fluidDataObjectType: DataObjectFactoryType.Test,
+		registry,
+	};
+
 	let provider: ITestObjectProvider;
-	beforeEach(() => {
+	beforeEach("getTestObjectProvider", () => {
 		provider = getTestObjectProvider();
 	});
 
@@ -65,57 +95,92 @@ describeNoCompat("Attributor for SharedCell", (getTestObjectProvider) => {
 	});
 
 	const sharedCellFromContainer = async (container: IContainer) => {
-		const dataObject = await requestFluidObject<ITestFluidObject>(container, "default");
-		return dataObject.getSharedObject<SharedCell>(cellId);
+		const dataObject = await getContainerEntryPointBackCompat<ITestFluidObject>(container);
+		return dataObject.getSharedObject<ISharedCell>(cellId);
 	};
 
-	const getTestConfig = (runtimeAttributor?: IRuntimeAttributor): ITestContainerConfig => ({
+	const getTestConfig = (enable: boolean = false): ITestContainerConfig => ({
 		...testContainerConfig,
-		enableAttribution: runtimeAttributor !== undefined,
+		enableAttribution: enable,
 		loaderProps: {
-			scope: { IRuntimeAttributor: runtimeAttributor },
 			configProvider: configProvider({
-				[enableOnNewFileKey]: runtimeAttributor !== undefined,
+				[enableOnNewFileKey]: enable,
 			}),
+			// TODO this option shouldn't live here - this options object is global to the container
+			// and not specific to the individual dataStoreRuntime.
 			options: {
 				attribution: {
-					track: runtimeAttributor !== undefined,
+					track: enable,
 				},
-			},
+			} as any,
 		},
 	});
 
-	it("Can attribute content from multiple collaborators", async () => {
-		const attributor = createRuntimeAttributor();
-		const container1 = await provider.makeTestContainer(getTestConfig(attributor));
-		const sharedCell1 = await sharedCellFromContainer(container1);
-		const container2 = await provider.loadTestContainer(testContainerConfig);
-		const sharedCell2 = await sharedCellFromContainer(container2);
+	const getAttributorFromContainer = async (container: IContainer) => {
+		const dataStore = (await container.getEntryPoint()) as ITestFluidObject;
+		const containerRuntime = dataStore.context.containerRuntime as ContainerRuntime;
+		const attributor = await getRuntimeAttributor(containerRuntime);
+		assert(attributor !== undefined, "Attributor should be defined");
+		return attributor;
+	};
 
-		sharedCell1.set(1);
-		await provider.ensureSynchronized();
-		sharedCell2.set(2);
-		await provider.ensureSynchronized();
+	/**
+	 * Tracked by AB#4997, if no error event is detected within one sprint, we will remove
+	 * the skipping or take actions accordingly if it is.
+	 */
+	itSkipsFailureOnSpecificDrivers(
+		"Can attribute content from multiple collaborators",
+		["tinylicious", "t9s"],
+		async function () {
+			// Skip tests for r11s drivers due to timeout issues because of certain network calls
+			// taking longer time and this test has nothing to do with r11s driver.
+			if (provider.driver.type === "r11s" || provider.driver.type === "routerlicious") {
+				this.skip();
+			}
+			const container1 = await provider.makeTestContainer(getTestConfig(true));
+			const sharedCell1 = await sharedCellFromContainer(container1);
+			const container2 = await provider.loadTestContainer(getTestConfig(true));
+			const sharedCell2 = await sharedCellFromContainer(container2);
 
-		assert(
-			container1.clientId !== undefined && container2.clientId !== undefined,
-			"Both containers should have client ids.",
-		);
-		assertAttributionMatches(sharedCell1, attributor, {
-			user: container1.audience.getMember(container2.clientId)?.user,
-		});
+			const attributor1 = await getAttributorFromContainer(container1);
+			const attributor2 = await getAttributorFromContainer(container2);
+			sharedCell1.set(1);
+			assertAttributionMatches(sharedCell1, attributor1, "local");
+			await provider.ensureSynchronized();
 
-		sharedCell1.set(3);
-		await provider.ensureSynchronized();
+			sharedCell2.set(2);
+			await provider.ensureSynchronized();
 
-		assertAttributionMatches(sharedCell1, attributor, {
-			user: container2.audience.getMember(container1.clientId)?.user,
-		});
-	});
+			assert(
+				container1.clientId !== undefined && container2.clientId !== undefined,
+				"Both containers should have client ids.",
+			);
+			assertAttributionMatches(sharedCell1, attributor1, {
+				user: container1.audience.getMember(container2.clientId)?.user,
+			});
 
-	it("attributes content created in a detached state", async () => {
-		const attributor = createRuntimeAttributor();
-		const loader = provider.makeTestLoader(getTestConfig(attributor));
+			assertAttributionMatches(sharedCell2, attributor2, {
+				user: container1.audience.getMember(container2.clientId)?.user,
+			});
+			sharedCell1.set(3);
+			await provider.ensureSynchronized();
+
+			assertAttributionMatches(sharedCell1, attributor1, {
+				user: container2.audience.getMember(container1.clientId)?.user,
+			});
+			assertAttributionMatches(sharedCell2, attributor2, {
+				user: container2.audience.getMember(container1.clientId)?.user,
+			});
+		},
+	);
+
+	it("attributes content created in a detached state", async function () {
+		// Skip tests for r11s drivers due to timeout issues because of certain network calls
+		// taking longer time and this test has nothing to do with r11s driver.
+		if (provider.driver.type === "r11s" || provider.driver.type === "routerlicious") {
+			this.skip();
+		}
+		const loader = provider.makeTestLoader(getTestConfig(true));
 		const defaultCodeDetails: IFluidCodeDetails = {
 			package: "defaultTestPackage",
 			config: {},
@@ -124,10 +189,11 @@ describeNoCompat("Attributor for SharedCell", (getTestObjectProvider) => {
 		const sharedCell1 = await sharedCellFromContainer(container1);
 
 		sharedCell1.set(1);
+		const attributor1 = await getAttributorFromContainer(container1);
+		assertAttributionMatches(sharedCell1, attributor1, "detached");
+
 		await container1.attach(provider.driver.createCreateNewRequest("doc id"));
 		await provider.ensureSynchronized();
-
-		assertAttributionMatches(sharedCell1, attributor, "detached");
 
 		const url = await container1.getAbsoluteUrl("");
 		assert(url !== undefined);
@@ -144,7 +210,7 @@ describeNoCompat("Attributor for SharedCell", (getTestObjectProvider) => {
 			"Both containers should have client ids.",
 		);
 
-		assertAttributionMatches(sharedCell1, attributor, {
+		assertAttributionMatches(sharedCell1, attributor1, {
 			user: container1.audience.getMember(container2.clientId)?.user,
 		});
 	});

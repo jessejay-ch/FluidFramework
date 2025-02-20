@@ -5,8 +5,11 @@
 
 import fs from "fs";
 import http from "http";
+import { AddressInfo } from "net";
 import path from "path";
+
 import rewire from "rewire";
+
 import * as HashNode from "../../hashFileNode";
 
 // Use rewire to access private functions
@@ -53,7 +56,7 @@ async function evaluateBrowserHash(
 			const fileUint8 = Uint8Array.from(fileCharCodes);
 
 			// eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-			const hashFn = Function(`"use strict"; return ( ${fn} );`);
+			const hashFn = new Function(`"use strict"; return ( ${fn} );`);
 			const pageHashArray = await (hashFn()(fileUint8, alg) as Promise<Uint8Array>);
 
 			// Similarly, return the hash array as a string instead of a Uint8Array
@@ -105,9 +108,22 @@ describe("Common-Utils", () => {
 			res.setHeader("Content-Type", "text/plain");
 			res.end("basic test server");
 		});
-		server.listen(8080, "localhost");
+
+		await new Promise<void>((resolve) => {
+			server.listen(0, "localhost");
+			server.on("listening", () => {
+				resolve();
+			});
+			server.on("error", (err) => {
+				throw err;
+			});
+		});
+
+		// Since we're listening on an http port, address() will return an AddressInfo and not just a string
+		const port: number = (server.address() as AddressInfo).port;
+
 		// Navigate to the local test server so crypto is available
-		await page.goto("http://localhost:8080", { waitUntil: "load", timeout: 0 });
+		await page.goto(`http://localhost:${port}`, { waitUntil: "load", timeout: 0 });
 
 		xmlFile = await getFileContents(path.join(__dirname, `${dataDir}/assets/book.xml`));
 		svgFile = await getFileContents(path.join(__dirname, `${dataDir}/assets/bindy.svg`));
@@ -115,8 +131,12 @@ describe("Common-Utils", () => {
 		gifFile = await getFileContents(path.join(__dirname, `${dataDir}/assets/grid.gif`));
 	});
 
-	afterAll(() => {
-		server?.close();
+	afterAll(async () => {
+		await new Promise((resolve) => {
+			server.close(resolve);
+			// Puppeteer may have lingering connections which prevents the server from closing otherwise.
+			server.closeAllConnections();
+		});
 	});
 
 	// Expected hashes are from git hash-object file...

@@ -2,30 +2,81 @@
 
 **Topics covered below:**
 
--   [@fluidframework/container-loader](#fluidframeworkcontainer-loader)
-    -   [Fluid Loader](#fluid-loader)
-    -   [Expectations from host implementers](#expectations-from-host-implementers)
-    -   [Expectations from container runtime and data store implementers](#expectations-from-container-runtime-and-data-store-implementers)
-    -   [Container Lifetime](#container-lifetime)
-        -   [Loading](#loading)
-        -   [Connectivity](#connectivity)
-        -   [Closure](#closure)
-            -   [`Container.close()`](#containerclose)
-            -   [`Container.dispose()`](#containerdispose)
-    -   [Audience](#audience)
-    -   [ClientID and client identification](#clientid-and-client-identification)
-    -   [Error handling](#error-handling)
-    -   [Connectivity events](#connectivity-events)
-    -   [Readonly states](#readonly-states)
-        -   [`readonly`](#readonly)
-        -   [`permissions`](#permissions)
-        -   [`forced`](#forced)
-        -   [`storageOnly`](#storageonly)
-    -   [Dirty events](#dirty-events)
+- [@fluidframework/container-loader](#fluidframeworkcontainer-loader)
+  - [Using Fluid Framework libraries](#using-fluid-framework-libraries)
+  - [Installation](#installation)
+  - [Importing from this package](#importing-from-this-package)
+  - [API Documentation](#api-documentation)
+  - [Fluid Loader](#fluid-loader)
+  - [Expectations from host implementers](#expectations-from-host-implementers)
+  - [Expectations from container runtime and data store implementers](#expectations-from-container-runtime-and-data-store-implementers)
+  - [Container Lifetime](#container-lifetime)
+    - [Loading](#loading)
+    - [Connectivity](#connectivity)
+    - [Closure](#closure)
+      - [`Container.close()`](#containerclose)
+      - [`Container.dispose()`](#containerdispose)
+  - [Audience](#audience)
+  - [ClientID and client identification](#clientid-and-client-identification)
+  - [Error handling](#error-handling)
+  - [Connectivity events](#connectivity-events)
+  - [Connection State Transitions Flow Chart](#connection-state-transitions-flow-chart)
+  - [Readonly states](#readonly-states)
+    - [`readonly`](#readonly)
+    - [`permissions`](#permissions)
+    - [`forced`](#forced)
+    - [`storageOnly`](#storageonly)
+  - [Dirty events](#dirty-events)
+  - [Minimum Client Requirements](#minimum-client-requirements)
+    - [Supported Runtimes](#supported-runtimes)
+    - [Supported Tools](#supported-tools)
+    - [Module Resolution](#module-resolution)
+    - [Module Formats](#module-formats)
+  - [Contribution Guidelines](#contribution-guidelines)
+  - [Help](#help)
+  - [Trademark](#trademark)
 
 **Related topics covered elsewhere:**
 
 -   [Quorum and Proposals](../../../server/routerlicious/packages/protocol-base/README.md)
+
+<!-- AUTO-GENERATED-CONTENT:START (LIBRARY_README_HEADER) -->
+
+<!-- prettier-ignore-start -->
+<!-- NOTE: This section is automatically generated using @fluid-tools/markdown-magic. Do not update these generated contents directly. -->
+
+## Using Fluid Framework libraries
+
+When taking a dependency on a Fluid Framework library's public APIs, we recommend using a `^` (caret) version range, such as `^1.3.4`.
+While Fluid Framework libraries may use different ranges with interdependencies between other Fluid Framework libraries,
+library consumers should always prefer `^`.
+
+If using any of Fluid Framework's unstable APIs (for example, its `beta` APIs), we recommend using a more constrained version range, such as `~`.
+
+## Installation
+
+To get started, install the package by running the following command:
+
+```bash
+npm i @fluidframework/container-loader
+```
+
+## Importing from this package
+
+This package leverages [package.json exports](https://nodejs.org/api/packages.html#exports) to separate its APIs by support level.
+For more information on the related support guarantees, see [API Support Levels](https://fluidframework.com/docs/build/releases-and-apitags/#api-support-levels).
+
+To access the `public` ([SemVer](https://semver.org/)) APIs, import via `@fluidframework/container-loader` like normal.
+
+To access the `legacy` APIs, import via `@fluidframework/container-loader/legacy`.
+
+## API Documentation
+
+API documentation for **@fluidframework/container-loader** is available at <https://fluidframework.com/docs/apis/container-loader>.
+
+<!-- prettier-ignore-end -->
+
+<!-- AUTO-GENERATED-CONTENT:END -->
 
 ## Fluid Loader
 
@@ -46,6 +97,7 @@ Please see specific sections for more details on these states and events - this 
 2. ["closed"](#Closure) event: If raised with error, host is responsible for conveying error in some form to the user. Container is left in disconnected & readonly state when it is closed (because of error or not).
 3. ["readonly"](#Readonly-states) event: Host should have some indication to user that container is not editable. User permissions can change over lifetime of Container, but they can't change per connection session (in other words, change in permissions causes disconnect and reconnect). Hosts are advised to recheck this property on every reconnect.
 4. [Dirty events](#Dirty-events): Host should have some reasonable UX / workflows to ensure user does not lose edits unexpectedly. I.e. there is enough signals (potentially including blocking user from closing container) ensuring that all user edits make it to storage, unless user explicitly choses to lose such edits.
+5. [Closing or disposing containers](#containerclose): For most cases, you should use the `IContainer.dispose(...)` API to free up resources. If you intend on using the container after closure, or need to pass some critical error to the container, use the `IContainer.close(...)` API.
 
 ## Expectations from container runtime and data store implementers
 
@@ -61,7 +113,7 @@ Please see specific sections for more details on these states and events - this 
 
 Container is returned as result of Loader.resolve() call. Loader can cache containers, so if same URI is requested from same loader instance, earlier created container might be returned. This is important, as some of the headers (like `pause`) might be ignored because of Container reuse.
 
-`ILoaderHeader` in [loader.ts](../../../common/lib/container-definitions/src/loader.ts) describes properties controlling container loading.
+`ILoaderHeader` in [loader.ts](../../common/container-definitions/src/loader.ts) describes properties controlling container loading.
 
 ### Connectivity
 
@@ -69,7 +121,7 @@ Usually container is returned when state of container (and data stores) is rehyd
 
 ### Closure
 
-Container can be closed directly by host by calling `Container.close()` and/or `Container.dispose()`. If the container is expected to be used upon closure, use the `close()` API. Otherwise, use the `dispose()` API. The differences between these methods are detailed in the sections below.
+Container can be closed directly by host by calling `Container.close()` and/or `Container.dispose()`. If the container is expected to be used upon closure, or you need to pass your own critical error to the container, use the `close()` API. Otherwise, use the `dispose()` API. The differences between these methods are detailed in the sections below.
 
 #### `Container.close()`
 
@@ -77,7 +129,9 @@ Once closed, container terminates connection to ordering service, and any local 
 
 The "closed" state effectively means the container is disconnected forever and cannot be reconnected.
 
-Container can also be closed by runtime itself as result of some critical error. Critical errors can be internal (like violation in op ordering invariants), or external (file was deleted). Please see [Error Handling](#Error-handling) for more details
+If after some time a closed container is no longer needed, calling `Container.dispose()` will dispose the runtime resources.
+
+Container can also be closed and/or disposed by runtime itself as result of some critical error. Critical errors can be internal (like violation in op ordering invariants), or external (file was deleted). Please see [Error Handling](#Error-handling) for more details.
 
 When container is closed, the following is true (in no particular order):
 
@@ -86,7 +140,7 @@ When container is closed, the following is true (in no particular order):
 3. "readonly" event fires on DeltaManager & Container (and Container.readonly property is set to true) indicating to all data stores that container is read-only, and data stores should not allow local edits, as they are not going to make it.
 4. "disconnected" event fires, if connection was active at the moment of container closure.
 
-`"closed"` event is available on Container for hosts. `"disposed"` event is delivered to container runtime when container is closed. But container runtime can be also disposed when new code proposal is made and new version of the code (and container runtime) is loaded in accordance with it.
+`"closed"` event is available on Container for hosts.
 
 #### `Container.dispose()`
 
@@ -137,7 +191,7 @@ There are two ways errors are exposed:
 
 Critical errors can show up in #1 & #2 workflows. For example, data store URI may point to a deleted file, which will result in errors on container open. But file can also be deleted while container is opened, resulting in same error type being raised through "error" handler.
 
-Errors are of [ICriticalContainerError](../../../common/lib/container-definitions/src/error.ts) type, and warnings are of [ContainerWarning](../../../common/lib/container-definitions/src/error.ts) type. Both have `errorType` property, describing type of an error (and appropriate interface of error object):
+Errors are of [ICriticalContainerError](../../common/container-definitions/src/error.ts) type, and warnings are of [ContainerWarning](../../common/container-definitions/src/error.ts) type. Both have `errorType` property, describing type of an error (and appropriate interface of error object):
 
 ```ts
      readonly errorType: string;
@@ -145,9 +199,9 @@ Errors are of [ICriticalContainerError](../../../common/lib/container-definition
 
 There are 4 sources of errors:
 
-1. [ContainerErrorType](../../../common/lib/container-definitions/src/error.ts) - errors & warnings raised at loader level
-2. [DriverErrorType](../../common/driver-definitions/src/driverError.ts) - errors that are likely to be raised from the driver level
-3. [OdspErrorType](../../drivers/odsp-driver/src/odspError.ts) and [RouterliciousErrorType](../../drivers/routerlicious-driver/src/documentDeltaConnection.ts) - errors raised by ODSP and R11S drivers.
+1. [ContainerErrorTypes](../../common/container-definitions/src/error.ts) - errors & warnings raised at loader level
+2. [DriverErrorTypes](../../common/driver-definitions/src/driverError.ts) - errors that are likely to be raised from the driver level
+3. [OdspErrorTypes](../../drivers/odsp-driver/src/odspError.ts) and [RouterliciousErrorTypes](../../drivers/routerlicious-driver/src/documentDeltaConnection.ts) - errors raised by ODSP and R11S drivers.
 4. Runtime errors, like `"summarizingError"`, `"dataCorruptionError"`. This class of errors is not pre-determined and depends on type of container loaded.
 
 `ICriticalContainerError.errorType` is a string, which represents a union of 4 error types described above. Hosting application may package different drivers and open different types of containers, and only hosting application may have enough information to enumerate all possible error codes in such scenarios.
@@ -175,6 +229,27 @@ Hosting application can use these events in order to indicate to user when user 
 Please note that hosts can implement various strategies on how to handle disconnections. Some may decide to show some UX letting user know about potential loss of data if container is closed while disconnected. Others can force container to disallow user edits while offline (see [Readonly states](#Readonly-states)).
 
 It's worth pointing out that being connected does not mean all user edits are preserved on container closure. There is latency in the system, and loader layer does not provide any guarantees here. Not every implementation needs a solution here (games likely do not care), and thus solving this problem is pushed to framework level (i.e. having a data store that can expose `'dirtyDocument'` signal from ContainerRuntime and request route that can return such data store).
+
+## Connection State Transitions Flow Chart
+
+```mermaid
+flowchart TD;
+    A(Disconnected)-->B{Reconnect on error if \n AutoReconnect Enabled?};
+    B--Yes-->C(Establishing Connection);
+    B--No-->D[Connection during Container \n connect call];
+    D-->C
+    C-->E{Connection Success \n including any Retry?};
+    E--No-->F[Error or container.close or container.disconnect];
+    A-->F;
+    F-->A;
+    E--Yes-->G(Catching Up);
+    G-->F;
+    G-->H{Which Connection Mode?};
+    H--Read-->I(Connected);
+    H--Write-->J[Wait for Join Op];
+    J-->I;
+    I-->F;
+```
 
 ## Readonly states
 
@@ -219,3 +294,91 @@ This information can be used by a host to build appropriate UX that allows user 
 Note that when an active connection is in place, it's just a matter of time before changes will be flushed to storage unless there is some source of continuous local changes being generated that prevents container from ever being fully saved. But if there is no active connection, because the user is offline, for example, then a document may stay in a dirty state for very long time.
 
 `Container.isDirty` can be used to get current state of container.
+
+<!-- AUTO-GENERATED-CONTENT:START (README_FOOTER) -->
+
+<!-- prettier-ignore-start -->
+<!-- NOTE: This section is automatically generated using @fluid-tools/markdown-magic. Do not update these generated contents directly. -->
+
+## Minimum Client Requirements
+
+These are the platform requirements for the current version of Fluid Framework Client Packages.
+These requirements err on the side of being too strict since within a major version they can be relaxed over time, but not made stricter.
+For Long Term Support (LTS) versions this can require supporting these platforms for several years.
+
+It is likely that other configurations will work, but they are not supported: if they stop working, we do not consider that a bug.
+If you would benefit from support for something not listed here, file an issue and the product team will evaluate your request.
+When making such a request please include if the configuration already works (and thus the request is just that it becomes officially supported), or if changes are required to get it working.
+
+### Supported Runtimes
+
+-   NodeJs ^20.10.0 except that we will drop support for it [when NodeJs 20 loses its upstream support on 2026-04-30](https://github.com/nodejs/release#release-schedule), and will support a newer LTS version of NodeJS (22) at least 1 year before 20 is end-of-life. This same policy applies to NodeJS 22 when it is end of life (2027-04-30).
+    -   Running Fluid in a Node.js environment with the `--no-experimental-fetch` flag is not supported.
+-   Modern browsers supporting the es2022 standard library: in response to asks we can add explicit support for using babel to polyfill to target specific standards or runtimes (meaning we can avoid/remove use of things that don't polyfill robustly, but otherwise target modern standards).
+
+### Supported Tools
+
+-   TypeScript 5.4:
+    -   All [`strict`](https://www.typescriptlang.org/tsconfig) options are supported.
+    -   [`strictNullChecks`](https://www.typescriptlang.org/tsconfig) is required.
+    -   [Configuration options deprecated in 5.0](https://github.com/microsoft/TypeScript/issues/51909) are not supported.
+    -   `exactOptionalPropertyTypes` is currently not fully supported.
+        If used, narrowing members of Fluid Framework types types using `in`, `Reflect.has`, `Object.hasOwn` or `Object.prototype.hasOwnProperty` should be avoided as they may incorrectly exclude `undefined` from the possible values in some cases.
+-   [webpack](https://webpack.js.org/) 5
+    -   We are not intending to be prescriptive about what bundler to use.
+        Other bundlers which can handle ES Modules should work, but webpack is the only one we actively test.
+
+### Module Resolution
+
+[`Node16`, `NodeNext`, or `Bundler`](https://www.typescriptlang.org/tsconfig#moduleResolution) resolution should be used with TypeScript compilerOptions to follow the [Node.js v12+ ESM Resolution and Loading algorithm](https://nodejs.github.io/nodejs.dev/en/api/v20/esm/#resolution-and-loading-algorithm).
+Node10 resolution is not supported as it does not support Fluid Framework's API structuring pattern that is used to distinguish stable APIs from those that are in development.
+
+### Module Formats
+
+-   ES Modules:
+    ES Modules are the preferred way to consume our client packages (including in NodeJs) and consuming our client packages from ES Modules is fully supported.
+-   CommonJs:
+    Consuming our client packages as CommonJs is supported only in NodeJS and only for the cases listed below.
+    This is done to accommodate some workflows without good ES Module support.
+    If you have a workflow you would like included in this list, file an issue.
+    Once this list of workflows motivating CommonJS support is empty, we may drop support for CommonJS one year after notice of the change is posted here.
+
+    -   Testing with Jest (which lacks [stable ESM support](https://jestjs.io/docs/ecmascript-modules) due to [unstable APIs in NodeJs](https://github.com/nodejs/node/issues/37648))
+
+## Contribution Guidelines
+
+There are many ways to [contribute](https://github.com/microsoft/FluidFramework/blob/main/CONTRIBUTING.md) to Fluid.
+
+-   Participate in Q&A in our [GitHub Discussions](https://github.com/microsoft/FluidFramework/discussions).
+-   [Submit bugs](https://github.com/microsoft/FluidFramework/issues) and help us verify fixes as they are checked in.
+-   Review the [source code changes](https://github.com/microsoft/FluidFramework/pulls).
+-   [Contribute bug fixes](https://github.com/microsoft/FluidFramework/blob/main/CONTRIBUTING.md).
+
+Detailed instructions for working in the repo can be found in the [Wiki](https://github.com/microsoft/FluidFramework/wiki).
+
+This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
+For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+
+This project may contain Microsoft trademarks or logos for Microsoft projects, products, or services.
+Use of these trademarks or logos must follow Microsoft’s [Trademark & Brand Guidelines](https://www.microsoft.com/trademarks).
+Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
+
+## Help
+
+Not finding what you're looking for in this README? Check out [fluidframework.com](https://fluidframework.com/docs/).
+
+Still not finding what you're looking for? Please [file an issue](https://github.com/microsoft/FluidFramework/wiki/Submitting-Bugs-and-Feature-Requests).
+
+Thank you!
+
+## Trademark
+
+This project may contain Microsoft trademarks or logos for Microsoft projects, products, or services.
+
+Use of these trademarks or logos must follow Microsoft's [Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
+
+Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
+
+<!-- prettier-ignore-end -->
+
+<!-- AUTO-GENERATED-CONTENT:END -->

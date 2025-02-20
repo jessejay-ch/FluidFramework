@@ -3,14 +3,16 @@
  * Licensed under the MIT License.
  */
 
-import { assert, TypedEventEmitter } from "@fluidframework/common-utils";
+import { TypedEventEmitter } from "@fluid-internal/client-utils";
 import { AttachState } from "@fluidframework/container-definitions";
-import { IQuorumClients } from "@fluidframework/protocol-definitions";
+import { assert } from "@fluidframework/core-utils/internal";
+import { IQuorumClients } from "@fluidframework/driver-definitions";
+
 import {
 	IOldestClientObservable,
-	IOldestClientObserverEvents,
 	IOldestClientObserver,
-} from "./interfaces";
+	IOldestClientObserverEvents,
+} from "./interfaces.js";
 
 /**
  * The `OldestClientObserver` is a utility inspect if the local client is the oldest amongst connected clients (in
@@ -66,6 +68,8 @@ import {
  *     console.log("I'm not the oldest anymore");
  * });
  * ```
+ * @legacy
+ * @alpha
  */
 export class OldestClientObserver
 	extends TypedEventEmitter<IOldestClientObserverEvents>
@@ -113,7 +117,7 @@ export class OldestClientObserver
 		// TODO: Clean up error code linter violations repo-wide.
 		assert(
 			this.observable.clientId !== undefined,
-			// eslint-disable-next-line unicorn/numeric-separators-style
+
 			0x1da /* "Client id should be set if connected" */,
 		);
 

@@ -2,20 +2,25 @@
  * Copyright (c) Microsoft Corporation and contributors. All rights reserved.
  * Licensed under the MIT License.
  */
-import { UsageError } from "@fluidframework/container-utils";
+
+import { isPromiseLike } from "@fluidframework/core-utils/internal";
 import {
 	FluidDataStoreRegistryEntry,
 	IFluidDataStoreRegistry,
 	NamedFluidDataStoreRegistryEntries,
-} from "@fluidframework/runtime-definitions";
+} from "@fluidframework/runtime-definitions/internal";
+import { UsageError } from "@fluidframework/telemetry-utils/internal";
 
+/**
+ * @internal
+ */
 export class FluidDataStoreRegistry implements IFluidDataStoreRegistry {
 	private readonly map: Map<
 		string,
 		FluidDataStoreRegistryEntry | Promise<FluidDataStoreRegistryEntry>
 	>;
 
-	public get IFluidDataStoreRegistry() {
+	public get IFluidDataStoreRegistry(): IFluidDataStoreRegistry {
 		return this;
 	}
 
@@ -32,6 +37,15 @@ export class FluidDataStoreRegistry implements IFluidDataStoreRegistry {
 	public async get(name: string): Promise<FluidDataStoreRegistryEntry | undefined> {
 		if (this.map.has(name)) {
 			return this.map.get(name);
+		}
+
+		return undefined;
+	}
+
+	public getSync(name: string): FluidDataStoreRegistryEntry | undefined {
+		const entry = this.map.get(name);
+		if (!isPromiseLike(entry)) {
+			return entry;
 		}
 
 		return undefined;

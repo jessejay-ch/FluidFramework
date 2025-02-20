@@ -7,22 +7,23 @@
 // and are authored with awareness of the issues with these types.
 
 /* eslint-disable @typescript-eslint/ban-types */
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /* eslint-disable @typescript-eslint/no-extraneous-class */
 
-import {
-	MakeNominal,
-	Covariant,
+import type {
 	Contravariant,
-	Bivariant,
+	Covariant,
 	Invariant,
-	requireTrue,
-	requireFalse,
-	isAssignableTo,
+	MakeNominal,
+	areOnlyKeys,
 	areSafelyAssignable,
-	isAny,
 	eitherIsAny,
+	isAny,
+	isAssignableTo,
 	isStrictSubset,
-} from "./typeCheck";
+	requireFalse,
+	requireTrue,
+} from "./typeCheck.js";
 
 /**
  * Checks that typeCheck's constraints work as intended.
@@ -33,56 +34,48 @@ declare class Empty1 {}
 declare class Empty2 {}
 
 declare class Nominal1 {
-	protected _typeCheck?: MakeNominal;
+	protected _typeCheck: MakeNominal;
 }
 
 declare class Nominal2 {
-	protected _typeCheck?: MakeNominal;
+	protected _typeCheck: MakeNominal;
 }
 
 declare class Derived1 extends Nominal1 {
-	protected _typeCheck?: MakeNominal;
+	protected _typeCheck: MakeNominal;
 }
 
 declare class Derived2 extends Nominal1 {
-	protected _typeCheck?: MakeNominal;
+	protected _typeCheck: MakeNominal;
 }
 
 declare class Generic<_T> {}
 
-declare class GenericCovariant<T> {
+declare class GenericCovariant<out T> {
 	protected _typeCheck?: Covariant<T>;
 }
 
-declare class GenericContravariant<T> {
+declare class GenericContravariant<in T> {
 	protected _typeCheck?: Contravariant<T>;
 }
 
-declare class GenericBivariant<T> {
-	protected _typeCheck?: Bivariant<T>;
-}
-
-declare class GenericInvariant<T> {
+declare class GenericInvariant<in out T> {
 	protected _typeCheck?: Invariant<T>;
 }
 
-declare class GenericMulti<T, K> {
+declare class GenericMulti<in out T, out K> {
 	protected _typeCheck?: Invariant<T> & Covariant<K>;
 }
 
-interface GenericCovariantInterface<T> {
+interface GenericCovariantInterface<out T> {
 	_typeCheck?: Covariant<T>;
 }
 
-interface GenericContravariantInterface<T> {
+interface GenericContravariantInterface<in T> {
 	_typeCheck?: Contravariant<T>;
 }
 
-interface GenericBivariantInterface<T> {
-	_typeCheck?: Bivariant<T>;
-}
-
-interface GenericInvariantInterface<T> {
+interface GenericInvariantInterface<in out T> {
 	_typeCheck?: Invariant<T>;
 }
 
@@ -99,10 +92,7 @@ declare class GenericInvariantImplementation<T> implements GenericInvariantInter
 export type EnforceTypeCheckTests =
 	// Add dummy use of type checking types above
 	| requireTrue<
-			isAssignableTo<
-				GenericInvariantImplementation<number>,
-				GenericInvariantInterface<number>
-			>
+			isAssignableTo<GenericInvariantImplementation<number>, GenericInvariantInterface<number>>
 	  >
 
 	// Positive tests
@@ -136,14 +126,13 @@ export type EnforceTypeCheckTests =
 	| requireFalse<isAssignableTo<GenericCovariant<Nominal1>, GenericCovariant<Derived1>>>
 
 	// test Contravariant
-	| requireFalse<isAssignableTo<GenericContravariant<Nominal1>, GenericContravariant<Nominal2>>>
-	| requireFalse<isAssignableTo<GenericContravariant<Derived1>, GenericContravariant<Nominal1>>>
+	| requireFalse<
+			isAssignableTo<GenericContravariant<Nominal1>, GenericContravariant<Nominal2>>
+	  >
+	| requireFalse<
+			isAssignableTo<GenericContravariant<Derived1>, GenericContravariant<Nominal1>>
+	  >
 	| requireTrue<isAssignableTo<GenericContravariant<Nominal1>, GenericContravariant<Derived1>>>
-
-	// test Bivariant
-	| requireFalse<isAssignableTo<GenericBivariant<Nominal1>, GenericBivariant<Nominal2>>>
-	| requireTrue<isAssignableTo<GenericBivariant<Derived1>, GenericBivariant<Nominal1>>>
-	| requireTrue<isAssignableTo<GenericBivariant<Nominal1>, GenericBivariant<Derived1>>>
 
 	// test Invariant
 	| requireFalse<isAssignableTo<GenericInvariant<Nominal1>, GenericInvariant<Nominal2>>>
@@ -151,8 +140,12 @@ export type EnforceTypeCheckTests =
 	| requireFalse<isAssignableTo<GenericInvariant<Nominal1>, GenericInvariant<Derived1>>>
 
 	// test Multiple parameters
-	| requireFalse<isAssignableTo<GenericMulti<Nominal1, number>, GenericMulti<Derived1, number>>>
-	| requireFalse<isAssignableTo<GenericMulti<number, Nominal1>, GenericMulti<number, Derived1>>>
+	| requireFalse<
+			isAssignableTo<GenericMulti<Nominal1, number>, GenericMulti<Derived1, number>>
+	  >
+	| requireFalse<
+			isAssignableTo<GenericMulti<number, Nominal1>, GenericMulti<number, Derived1>>
+	  >
 	| requireTrue<isAssignableTo<GenericMulti<number, Derived1>, GenericMulti<number, Nominal1>>>
 
 	// test Covariant Interface
@@ -184,17 +177,6 @@ export type EnforceTypeCheckTests =
 				GenericContravariantInterface<Nominal1>,
 				GenericContravariantInterface<Derived1>
 			>
-	  >
-
-	// test Bivariant Interface
-	| requireFalse<
-			isAssignableTo<GenericBivariantInterface<Nominal1>, GenericBivariantInterface<Nominal2>>
-	  >
-	| requireTrue<
-			isAssignableTo<GenericBivariantInterface<Derived1>, GenericBivariantInterface<Nominal1>>
-	  >
-	| requireTrue<
-			isAssignableTo<GenericBivariantInterface<Nominal1>, GenericBivariantInterface<Derived1>>
 	  >
 
 	// test Invariant Interface
@@ -230,6 +212,9 @@ export type EnforceTypeCheckTests =
 	| requireFalse<isAny<never>>
 	| requireFalse<isAny<{}>>
 	| requireFalse<isAny<boolean>>
+	| requireFalse<isAny<number | undefined>>
+	| requireFalse<isAny<1 & "x">>
+	| requireFalse<isAny<(1 & 2) | {}>>
 
 	// test isStrictSubset
 	| requireTrue<isStrictSubset<1, 1 | 2>>
@@ -237,14 +222,32 @@ export type EnforceTypeCheckTests =
 	| requireTrue<isStrictSubset<[1, true], [1 | 2, true | false]>>
 	| requireTrue<isStrictSubset<[1, true], [1, true | false]>>
 	| requireTrue<isStrictSubset<[1, true], [1, true] | [1 | false]>>
+	| requireTrue<isStrictSubset<1, number>>
 	| requireFalse<isStrictSubset<1, 1>>
 	| requireFalse<isStrictSubset<1, 2>>
 	| requireFalse<isStrictSubset<[1, true], [1, true]>>
-	| requireFalse<isStrictSubset<1 | 2, 1>>;
+	| requireFalse<isStrictSubset<1 | 2, 1>>
 
-// negative tests (should not build: enable these to check that tests are actually working)
-// type _falseIsTrue = requireTrue<false>;
-// type _trueIsFalse = requireFalse<true>;
-// type _emptyNotAssignable = requireFalse<isAssignableTo<Empty1, Empty2>>;
-// type _numberAssignableToString = requireTrue<isAssignableTo<number, string>>;
-// type _anyNotAny = requireFalse<isAny<any>>;
+	// areOnlyKeys
+	| requireTrue<areOnlyKeys<{ a: number; b: number }, "a" | "b">>
+	| requireTrue<areOnlyKeys<{ a?: number; b: number }, "a" | "b">>
+	| requireFalse<areOnlyKeys<{ a?: number; b: number }, "b">>
+	| requireFalse<areOnlyKeys<{ a: number; b: number }, "a">>;
+// This case is explicitly documented as unsupported.
+// | requireFalse<areOnlyKeys<Record<string, unknown>, "a">>;
+
+// negative tests (should not build)
+// @ts-expect-error negative test
+type _falseIsTrue = requireTrue<false>;
+// @ts-expect-error negative test
+type _trueIsFalse = requireFalse<true>;
+// @ts-expect-error negative test
+type _booleanIsTrue = requireTrue<boolean>;
+// @ts-expect-error negative test
+type _booleanIsFalse = requireFalse<boolean>;
+// @ts-expect-error negative test
+type _emptyNotAssignable = requireFalse<isAssignableTo<Empty1, Empty2>>;
+// @ts-expect-error negative test
+type _numberAssignableToString = requireTrue<isAssignableTo<number, string>>;
+// @ts-expect-error negative test
+type _anyNotAny = requireFalse<isAny<any>>;

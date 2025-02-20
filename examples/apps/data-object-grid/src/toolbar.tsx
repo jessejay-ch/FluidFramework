@@ -3,13 +3,14 @@
  * Licensed under the MIT License.
  */
 
+import { Button } from "@fluentui/react-components";
+import { ChevronDownFilled, ChevronUpFilled, TargetEditFilled } from "@fluentui/react-icons";
 import React from "react";
-import Collapsible from "react-collapsible";
-import { DefaultButton as Button, initializeIcons } from "office-ui-fabric-react";
-import { IDataObjectGridItemEntry } from "./dataObjectRegistry";
-import "./toolbar.css";
 
-initializeIcons();
+import { Collapsible } from "./collapsible.cjs";
+import { IDataObjectGridItemEntry } from "./dataObjectRegistry.js";
+import { iconMap } from "./icons.js";
+import "./toolbar.css";
 
 interface IToolbarOption {
 	/**
@@ -25,15 +26,15 @@ interface IDataObjectGridToolbarAddItemPickerProps {
 	toolbarOptions: IToolbarOption[];
 }
 
-const DataObjectGridToolbarAddItemPicker: React.FC<IDataObjectGridToolbarAddItemPickerProps> = (
-	props: React.PropsWithChildren<IDataObjectGridToolbarAddItemPickerProps>,
-) => {
+const DataObjectGridToolbarAddItemPicker: React.FC<
+	IDataObjectGridToolbarAddItemPickerProps
+> = (props: React.PropsWithChildren<IDataObjectGridToolbarAddItemPickerProps>) => {
 	const { toolbarOptions } = props;
 	const [open, setOpen] = React.useState<boolean>(false);
 
 	const itemsButton = (
 		<Button
-			iconProps={{ iconName: open ? "ChevronUpEnd6" : "ChevronDownEnd6" }}
+			icon={open ? <ChevronUpFilled /> : <ChevronDownFilled />}
 			className="data-grid-toolbar-top-level-button"
 			onClick={() => setOpen(!open)}
 		>
@@ -44,7 +45,7 @@ const DataObjectGridToolbarAddItemPicker: React.FC<IDataObjectGridToolbarAddItem
 		<Button
 			className="data-grid-toolbar-option-button"
 			key={`toolbarButton-${toolbarOption.key}`}
-			iconProps={{ iconName: toolbarOption.fabricIconName }}
+			icon={iconMap[toolbarOption.fabricIconName]}
 			onClick={() => {
 				toolbarOption.create();
 				setOpen(false);
@@ -93,7 +94,7 @@ export const DataObjectGridToolbar: React.FC<IDataObjectGridToolbarProps> = (
 				<Button
 					id="edit"
 					className="data-grid-toolbar-top-level-button"
-					iconProps={{ iconName: "BullseyeTargetEdit" }}
+					icon={<TargetEditFilled />}
 					onClick={() => {
 						const newEditableState = !editable;
 						setEditable(newEditableState);

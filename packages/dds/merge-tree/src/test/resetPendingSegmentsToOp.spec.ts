@@ -2,14 +2,25 @@
  * Copyright (c) Microsoft Corporation and contributors. All rights reserved.
  * Licensed under the MIT License.
  */
+
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
 
-import { strict as assert } from "assert";
-import { Marker, reservedMarkerIdKey } from "../mergeTreeNodes";
-import { IMergeTreeOp, ReferenceType } from "../ops";
-import { clone } from "../properties";
-import { TextSegment } from "../textSegment";
-import { TestClient } from "./testClient";
+import { strict as assert } from "node:assert";
+
+import { ISequencedDocumentMessage } from "@fluidframework/driver-definitions/internal";
+
+import {
+	Marker,
+	SegmentGroup,
+	reservedMarkerIdKey,
+	type ISegmentPrivate,
+} from "../mergeTreeNodes.js";
+import { IMergeTreeOp, ReferenceType } from "../ops.js";
+import { clone } from "../properties.js";
+import { TextSegment } from "../textSegment.js";
+
+import { TestClient } from "./testClient.js";
+import { TestClientLogger, createClientsAtInitialState } from "./testClientLogger.js";
 
 describe("resetPendingSegmentsToOp", () => {
 	let client: TestClient;
@@ -23,14 +34,14 @@ describe("resetPendingSegmentsToOp", () => {
 	describe("with a number of nested inserts", () => {
 		const insertCount = 5;
 		const expectedSegmentCount = insertCount * 2 - 1;
-		let opList: IMergeTreeOp[];
+		let opList: { op: IMergeTreeOp; refSeq: number }[];
 		let opCount: number = 0;
 
-		function applyOpList(cli: TestClient) {
+		function applyOpList(cli: TestClient): void {
 			while (opList.length > 0) {
 				const op = opList.shift();
 				if (op) {
-					const seqOp = cli.makeOpMessage(op, ++opCount);
+					const seqOp = cli.makeOpMessage(op.op, ++opCount, op.refSeq);
 					cli.applyMsg(seqOp);
 				}
 			}
@@ -42,7 +53,7 @@ describe("resetPendingSegmentsToOp", () => {
 
 			for (let i = 0; i < insertCount; i++) {
 				const op = client.insertTextLocal(i, "hello")!;
-				opList.push(op);
+				opList.push({ op, refSeq: client.getCurrentSeq() });
 				assert.equal(client.mergeTree.pendingSegments?.length, i + 1);
 			}
 		});
@@ -70,29 +81,35 @@ describe("resetPendingSegmentsToOp", () => {
 				"localPartialsComputed",
 				{
 					get() {
+						// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
 						return this._localPartialsComputed as boolean;
 					},
 					set(newValue) {
 						if (newValue) {
 							localPartialsComputeCount++;
 						}
+						// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
 						this._localPartialsComputed = newValue;
 					},
 				},
 			);
 			const oldops = opList;
-			opList = oldops.map((op) =>
-				client.regeneratePendingOp(op, client.mergeTree.pendingSegments!.first!.data),
-			);
+			const pending = [...client.mergeTree.pendingSegments.map((n) => n.data)];
+			opList = oldops.map((op) => ({
+				op: client.regeneratePendingOp(op.op, pending.shift()!),
+				refSeq: client.getCurrentSeq(),
+			}));
 			applyOpList(client);
 			assert.equal(localPartialsComputeCount, 1);
 		});
 
 		it("nacked insertSegment", async () => {
 			const oldops = opList;
-			opList = oldops.map((op) =>
-				client.regeneratePendingOp(op, client.mergeTree.pendingSegments!.first!.data),
-			);
+			const pending = [...client.mergeTree.pendingSegments.map((n) => n.data)];
+			opList = oldops.map((op) => ({
+				op: client.regeneratePendingOp(op.op, pending.shift()!),
+				refSeq: client.getCurrentSeq(),
+			}));
 			// we expect a nack op per segment since our original ops split segments
 			// we should expect mores nack ops then original ops.
 			// only the first op didn't split a segment, all the others did
@@ -105,7 +122,10 @@ describe("resetPendingSegmentsToOp", () => {
 			applyOpList(client);
 			assert(client.mergeTree.pendingSegments?.empty);
 
-			opList.push(client.removeRangeLocal(0, client.getLength())!);
+			opList.push({
+				op: client.removeRangeLocal(0, client.getLength())!,
+				refSeq: client.getCurrentSeq(),
+			});
 			applyOpList(client);
 			assert(client.mergeTree.pendingSegments?.empty);
 		});
@@ -114,13 +134,18 @@ describe("resetPendingSegmentsToOp", () => {
 			applyOpList(client);
 			assert(client.mergeTree.pendingSegments?.empty);
 
-			opList.push(client.removeRangeLocal(0, client.getLength())!);
-			opList.push(
-				client.regeneratePendingOp(
-					opList.shift()!,
+			opList.push({
+				op: client.removeRangeLocal(0, client.getLength())!,
+				refSeq: client.getCurrentSeq(),
+			});
+			// eslint-disable-next-line unicorn/no-array-push-push
+			opList.push({
+				op: client.regeneratePendingOp(
+					opList.shift()!.op,
 					client.mergeTree.pendingSegments.first!.data,
 				),
-			);
+				refSeq: client.getCurrentSeq(),
+			});
 			// we expect a nack op per segment since our original ops split segments
 			// we should expect mores nack ops then original ops.
 			// only the first op didn't split a segment, all the others did
@@ -130,11 +155,16 @@ describe("resetPendingSegmentsToOp", () => {
 		});
 
 		it("nacked insertSegment and removeRange", async () => {
-			opList.push(client.removeRangeLocal(0, client.getLength())!);
+			opList.push({
+				op: client.removeRangeLocal(0, client.getLength())!,
+				refSeq: client.getCurrentSeq(),
+			});
 			const oldops = opList;
-			opList = oldops.map((op) =>
-				client.regeneratePendingOp(op, client.mergeTree.pendingSegments!.first!.data),
-			);
+			const pending = [...client.mergeTree.pendingSegments.map((n) => n.data)];
+			opList = oldops.map((op) => ({
+				op: client.regeneratePendingOp(op.op, pending.shift()!),
+				refSeq: client.getCurrentSeq(),
+			}));
 
 			assert.equal(client.mergeTree.pendingSegments?.length, expectedSegmentCount * 2);
 
@@ -147,9 +177,10 @@ describe("resetPendingSegmentsToOp", () => {
 			applyOpList(client);
 			assert(client.mergeTree.pendingSegments?.empty);
 
-			opList.push(
-				client.annotateRangeLocal(0, client.getLength(), { foo: "bar" }, undefined)!,
-			);
+			opList.push({
+				op: client.annotateRangeLocal(0, client.getLength(), { foo: "bar" })!,
+				refSeq: client.getCurrentSeq(),
+			});
 			applyOpList(client);
 			assert(client.mergeTree.pendingSegments?.empty);
 		});
@@ -158,15 +189,18 @@ describe("resetPendingSegmentsToOp", () => {
 			applyOpList(client);
 			assert(client.mergeTree.pendingSegments?.empty);
 
-			opList.push(
-				client.annotateRangeLocal(0, client.getLength(), { foo: "bar" }, undefined)!,
-			);
-			opList.push(
-				client.regeneratePendingOp(
-					opList.shift()!,
+			opList.push({
+				op: client.annotateRangeLocal(0, client.getLength(), { foo: "bar" })!,
+				refSeq: client.getCurrentSeq(),
+			});
+			// eslint-disable-next-line unicorn/no-array-push-push
+			opList.push({
+				op: client.regeneratePendingOp(
+					opList.shift()!.op,
 					client.mergeTree.pendingSegments.first!.data,
 				),
-			);
+				refSeq: client.getCurrentSeq(),
+			});
 			// we expect a nack op per segment since our original ops split segments
 			// we should expect mores nack ops then original ops.
 			// only the first op didn't split a segment, all the others did
@@ -176,13 +210,16 @@ describe("resetPendingSegmentsToOp", () => {
 		});
 
 		it("nacked insertSegment and annotateRange", async () => {
-			opList.push(
-				client.annotateRangeLocal(0, client.getLength(), { foo: "bar" }, undefined)!,
-			);
+			opList.push({
+				op: client.annotateRangeLocal(0, client.getLength(), { foo: "bar" })!,
+				refSeq: client.getCurrentSeq(),
+			});
 			const oldops = opList;
-			opList = oldops.map((op) =>
-				client.regeneratePendingOp(op, client.mergeTree.pendingSegments!.first!.data),
-			);
+			const pending = [...client.mergeTree.pendingSegments.map((n) => n.data)];
+			opList = oldops.map((op) => ({
+				op: client.regeneratePendingOp(op.op, pending.shift()!),
+				refSeq: client.getCurrentSeq(),
+			}));
 			// we expect a nack op per segment since our original ops split segments
 			// we should expect mores nack ops then original ops.
 			// only the first op didn't split a segment, all the others did
@@ -201,7 +238,7 @@ describe("resetPendingSegmentsToOp", () => {
 				prop1: "foo",
 			});
 			assert(insertOp);
-			const { segment } = client.getContainingSegment(0);
+			const { segment } = client.getContainingSegment<ISegmentPrivate>(0);
 			assert(segment !== undefined && Marker.is(segment));
 			client.annotateMarker(segment, { prop2: "bar" });
 
@@ -209,11 +246,11 @@ describe("resetPendingSegmentsToOp", () => {
 			otherClient.startOrUpdateCollaboration("other user");
 			const regeneratedInsert = client.regeneratePendingOp(
 				insertOp,
-				client.mergeTree.pendingSegments!.first!.data,
+				client.mergeTree.pendingSegments.first!.data,
 			);
 			otherClient.applyMsg(client.makeOpMessage(regeneratedInsert, 1), false);
 
-			const { segment: otherSegment } = otherClient.getContainingSegment(0);
+			const { segment: otherSegment } = otherClient.getContainingSegment<ISegmentPrivate>(0);
 			assert(otherSegment !== undefined && Marker.is(otherSegment));
 			// `clone` here is because properties use a Object.create(null); to compare strict equal the prototype chain
 			// should therefore not include Object.
@@ -226,19 +263,69 @@ describe("resetPendingSegmentsToOp", () => {
 		it("for text segments", () => {
 			const insertOp = client.insertTextLocal(0, "abc", { prop1: "foo" });
 			assert(insertOp);
-			client.annotateRangeLocal(0, 3, { prop2: "bar" }, undefined);
+			client.annotateRangeLocal(0, 3, { prop2: "bar" });
 
 			const otherClient = new TestClient();
 			otherClient.startOrUpdateCollaboration("other user");
 			const regeneratedInsert = client.regeneratePendingOp(
 				insertOp,
-				client.mergeTree.pendingSegments!.first!.data,
+				client.mergeTree.pendingSegments.first!.data,
 			);
 			otherClient.applyMsg(client.makeOpMessage(regeneratedInsert, 1), false);
 
-			const { segment: otherSegment } = otherClient.getContainingSegment(0);
+			const { segment: otherSegment } = otherClient.getContainingSegment<ISegmentPrivate>(0);
 			assert(otherSegment !== undefined && TextSegment.is(otherSegment));
 			assert.deepStrictEqual(otherSegment.properties, clone({ prop1: "foo" }));
 		});
+
+		it("for text segments with no initial properties", () => {
+			const insertOp = client.insertTextLocal(0, "abc");
+			assert(insertOp);
+			client.annotateRangeLocal(0, 3, { prop2: "bar" });
+
+			const otherClient = new TestClient();
+			otherClient.startOrUpdateCollaboration("other user");
+			const regeneratedInsert = client.regeneratePendingOp(
+				insertOp,
+				client.mergeTree.pendingSegments.first!.data,
+			);
+			otherClient.applyMsg(client.makeOpMessage(regeneratedInsert, 1), false);
+
+			const { segment: otherSegment } = otherClient.getContainingSegment<ISegmentPrivate>(0);
+			assert(otherSegment !== undefined && TextSegment.is(otherSegment));
+			assert.deepStrictEqual(otherSegment.properties, undefined);
+		});
+	});
+});
+
+describe("resetPendingSegmentsToOp.rebase", () => {
+	it("rebase with oustanding ops", () => {
+		const clients = createClientsAtInitialState({ initialState: "0123456789" }, "A", "B");
+
+		const logger = new TestClientLogger(clients.all);
+		const ops: [ISequencedDocumentMessage, SegmentGroup][] = Array.from({ length: 10 }).map(
+			(_, i) => [
+				clients.A.makeOpMessage(
+					clients.A.annotateRangeLocal(0, clients.A.getLength(), { prop: i }),
+					i + 1,
+				),
+				clients.A.peekPendingSegmentGroups()!,
+			],
+		);
+
+		ops.push(
+			...ops
+				.splice(Math.floor(ops.length / 2))
+				.map<[ISequencedDocumentMessage, SegmentGroup]>(([op, sg]) => [
+					clients.A.makeOpMessage(
+						clients.A.regeneratePendingOp(op.contents as IMergeTreeOp, sg),
+						op.sequenceNumber,
+					),
+					clients.A.peekPendingSegmentGroups()!,
+				]),
+		);
+
+		for (const [op] of ops) for (const c of clients.all) c.applyMsg(op);
+		logger.validate();
 	});
 });

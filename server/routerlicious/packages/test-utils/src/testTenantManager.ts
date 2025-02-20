@@ -14,13 +14,21 @@ import {
 } from "@fluidframework/server-services-core";
 import { TestHistorian } from "./testHistorian";
 import { TestDb } from "./testCollection";
+import type { IUser, ScopeType } from "@fluidframework/protocol-definitions";
 
+/**
+ * @internal
+ */
 export class TestTenant implements ITenant {
 	private readonly owner = "test";
 	private readonly repository = "test";
 	private readonly manager: GitManager;
 
-	constructor(private readonly url: string, private readonly historianUrl: string, db: IDb) {
+	constructor(
+		private readonly url: string,
+		private readonly historianUrl: string,
+		db: IDb,
+	) {
 		const testHistorian = new TestHistorian(db);
 		this.manager = new GitManager(testHistorian);
 	}
@@ -33,7 +41,10 @@ export class TestTenant implements ITenant {
 		return {
 			historianUrl: this.historianUrl,
 			internalHistorianUrl: this.historianUrl,
-			credentials: null,
+			credentials: {
+				user: "test",
+				password: "test",
+			},
 			owner: this.owner,
 			repository: this.repository,
 			url: this.url,
@@ -48,6 +59,9 @@ export class TestTenant implements ITenant {
 	}
 }
 
+/**
+ * @internal
+ */
 export class TestTenantManager implements ITenantManager {
 	private readonly tenant: TestTenant;
 
@@ -62,6 +76,8 @@ export class TestTenantManager implements ITenantManager {
 			orderer: this.tenant.orderer,
 			key: "test-tenant-key",
 			customData: {},
+			enableSharedKeyAccess: true,
+			enablePrivateKeyAccess: false,
 		};
 	}
 
@@ -77,5 +93,18 @@ export class TestTenantManager implements ITenantManager {
 
 	public async getKey(tenantId: string): Promise<string> {
 		return "test";
+	}
+
+	public async signToken(
+		tenantId: string,
+		documentId: string,
+		scopes: ScopeType[],
+		user?: IUser,
+		lifetime?: number,
+		ver?: string,
+		jti?: string,
+		includeDisabledTenant?: boolean,
+	): Promise<string> {
+		throw new Error("Method not implemented.");
 	}
 }

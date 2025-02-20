@@ -3,22 +3,24 @@
  * Licensed under the MIT License.
  */
 
-import * as isomorphicGit from "isomorphic-git";
 import type * as resources from "@fluidframework/gitresources";
 import { NetworkError } from "@fluidframework/server-services-client";
 import { Lumberjack } from "@fluidframework/server-services-telemetry";
+import * as isomorphicGit from "isomorphic-git";
 import { IExternalStorageManager } from "../externalStorageManager";
-import * as helpers from "./helpers";
-import * as conversions from "./isomorphicgitConversions";
 import {
 	IExternalWriterConfig,
-	IRepositoryManager,
 	IFileSystemManager,
-	IFileSystemManagerFactory,
+	IFileSystemManagerFactories,
+	IFileSystemManagerParams,
+	IFileSystemMakeDirectoryOptions,
+	IRepositoryManager,
 	IStorageDirectoryConfig,
 } from "./definitions";
 import { BaseGitRestTelemetryProperties } from "./gitrestTelemetryDefinitions";
-import { RepositoryManagerBase } from "./repositoryManagerBase";
+import * as helpers from "./helpers";
+import * as conversions from "./isomorphicgitConversions";
+import { IRepositoryManagerBaseOptions, RepositoryManagerBase } from "./repositoryManagerBase";
 import { RepositoryManagerFactoryBase } from "./repositoryManagerFactoryBase";
 
 export class IsomorphicGitRepositoryManager extends RepositoryManagerBase {
@@ -28,9 +30,9 @@ export class IsomorphicGitRepositoryManager extends RepositoryManagerBase {
 		private readonly repoName: string,
 		directory: string,
 		lumberjackBaseProperties: Record<string, any>,
-		enableRepositoryManagerMetrics: boolean = false,
+		options: Partial<IRepositoryManagerBaseOptions>,
 	) {
-		super(directory, lumberjackBaseProperties, enableRepositoryManagerMetrics);
+		super(directory, lumberjackBaseProperties, options);
 	}
 
 	protected async getCommitCore(sha: string): Promise<resources.ICommit> {
@@ -71,16 +73,20 @@ export class IsomorphicGitRepositoryManager extends RepositoryManagerBase {
 				};
 				return result;
 			});
-		} catch (err) {
+		} catch (err: any) {
 			Lumberjack.error(
 				"getCommits error",
 				{
 					...this.lumberjackBaseProperties,
 					[BaseGitRestTelemetryProperties.sha]: sha,
+					[BaseGitRestTelemetryProperties.directoryPath]: this.directory,
 					count,
 				},
 				err,
 			);
+			if (err?.code === "NotFoundError" || err?.code === "ENOENT") {
+				throw new NetworkError(404, "Unable to get commits for ephemeral container.");
+			}
 			throw new NetworkError(500, "Unable to get commits.");
 		}
 	}
@@ -108,7 +114,7 @@ export class IsomorphicGitRepositoryManager extends RepositoryManagerBase {
 
 	private async getTreeInternalRecursive(sha: string): Promise<resources.ITree> {
 		const mapFunction: isomorphicGit.WalkerMap = async (filepath, [walkerEntry]) => {
-			if (filepath !== "." && filepath !== "..") {
+			if (walkerEntry !== null && filepath !== "." && filepath !== "..") {
 				const type = await walkerEntry.type();
 				const mode = (await walkerEntry.mode()).toString(8);
 				const oid = await walkerEntry.oid();
@@ -346,6 +352,7 @@ export class IsomorphicGitRepositoryManager extends RepositoryManagerBase {
 				ref: refId,
 			});
 		} catch (e: any) {
+			Lumberjack.error("Failed to delete ref", this.lumberjackBaseProperties, e);
 			throw new NetworkError(500, `Failed to delete ref. Error: ${e}`);
 		}
 	}
@@ -373,25 +380,33 @@ export class IsomorphicGitRepositoryManager extends RepositoryManagerBase {
 export class IsomorphicGitManagerFactory extends RepositoryManagerFactoryBase<void> {
 	constructor(
 		storageDirectoryConfig: IStorageDirectoryConfig,
-		fileSystemManagerFactory: IFileSystemManagerFactory,
+		fileSystemManagerFactories: IFileSystemManagerFactories,
 		externalStorageManager: IExternalStorageManager,
 		repoPerDocEnabled: boolean,
 		enableRepositoryManagerMetrics: boolean = false,
 		private readonly enableSlimGitInit: boolean = false,
+		apiMetricsSamplingPeriod?: number,
+		maxBlobSizeBytes?: number,
 	) {
 		super(
 			storageDirectoryConfig,
-			fileSystemManagerFactory,
+			fileSystemManagerFactories,
 			externalStorageManager,
 			repoPerDocEnabled,
 			enableRepositoryManagerMetrics,
 			false /* enforceSynchronous */,
+			apiMetricsSamplingPeriod,
+			maxBlobSizeBytes,
 		);
 	}
 
-	protected async initGitRepo(fs: IFileSystemManager, gitdir: string): Promise<void> {
+	protected async initGitRepo(
+		fs: IFileSystemManager,
+		gitdir: string,
+		fsParams: IFileSystemManagerParams | undefined,
+	): Promise<void> {
 		return this.enableSlimGitInit
-			? this.slimInit(fs, gitdir)
+			? this.slimInit(fs, gitdir, fsParams)
 			: isomorphicGit.init({
 					fs,
 					gitdir,
@@ -412,6 +427,9 @@ export class IsomorphicGitManagerFactory extends RepositoryManagerFactoryBase<vo
 		externalStorageManager: IExternalStorageManager,
 		lumberjackBaseProperties: Record<string, any>,
 		enableRepositoryManagerMetrics: boolean,
+		apiMetricsSamplingPeriod?: number,
+		isEphemeralContainer?: boolean,
+		maxBlobSizeBytes?: number,
 	): IRepositoryManager {
 		return new IsomorphicGitRepositoryManager(
 			fileSystemManager,
@@ -419,7 +437,7 @@ export class IsomorphicGitManagerFactory extends RepositoryManagerFactoryBase<vo
 			repoName,
 			gitdir,
 			lumberjackBaseProperties,
-			enableRepositoryManagerMetrics,
+			{ enableRepositoryManagerMetrics, apiMetricsSamplingPeriod, maxBlobSizeBytes },
 		);
 	}
 
@@ -431,7 +449,21 @@ export class IsomorphicGitManagerFactory extends RepositoryManagerFactoryBase<vo
 	 *
 	 * This brings file reads from 1 to 0, and writes from 10 to 3.
 	 */
-	private async slimInit(fs: IFileSystemManager, gitdir: string): Promise<void> {
+	private async slimInit(
+		fs: IFileSystemManager,
+		gitdir: string,
+		fsParams: IFileSystemManagerParams | undefined,
+	): Promise<void> {
+		const splfCustomData = fsParams?.simplifiedCustomData;
+		if (splfCustomData) {
+			// Only pass valid simplifiedCustomData to rootdir in fs mkdir call during slimInit
+			const mkdirOptions: IFileSystemMakeDirectoryOptions = {
+				recursive: false,
+				simplifiedCustomData: splfCustomData,
+			};
+			await fs.promises.mkdir(gitdir, mkdirOptions);
+		}
+
 		const folders = ["objects", "refs/heads"].map((dir) => `${gitdir}/${dir}`);
 		for (const folder of folders) {
 			await fs.promises.mkdir(folder, { recursive: true });

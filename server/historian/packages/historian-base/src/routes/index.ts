@@ -3,11 +3,15 @@
  * Licensed under the MIT License.
  */
 
-import { AsyncLocalStorage } from "async_hooks";
-import { IThrottler } from "@fluidframework/server-services-core";
+import {
+	IStorageNameRetriever,
+	IThrottler,
+	IRevokedTokenChecker,
+	IDocumentManager,
+} from "@fluidframework/server-services-core";
 import { Router } from "express";
 import * as nconf from "nconf";
-import { ICache, ITenantService } from "../services";
+import { ICache, IDenyList, ITenantService, ISimplifiedCustomDataRetriever } from "../services";
 /* eslint-disable import/no-internal-modules */
 import * as blobs from "./git/blobs";
 import * as commits from "./git/commits";
@@ -18,6 +22,7 @@ import * as repositoryCommits from "./repository/commits";
 import * as contents from "./repository/contents";
 import * as headers from "./repository/headers";
 import * as summaries from "./summaries";
+import { CommonRouteParams } from "./utils";
 /* eslint-enable import/no-internal-modules */
 
 export interface IRoutes {
@@ -39,29 +44,42 @@ export interface IRoutes {
 export function create(
 	config: nconf.Provider,
 	tenantService: ITenantService,
-	throttler: IThrottler,
+	storageNameRetriever: IStorageNameRetriever | undefined,
+	restTenantThrottlers: Map<string, IThrottler>,
+	restClusterThrottlers: Map<string, IThrottler>,
+	documentManager: IDocumentManager,
 	cache?: ICache,
-	asyncLocalStorage?: AsyncLocalStorage<string>,
+	revokedTokenChecker?: IRevokedTokenChecker,
+	denyList?: IDenyList,
+	ephemeralDocumentTTLSec?: number,
+	simplifiedCustomDataRetriever?: ISimplifiedCustomDataRetriever,
 ): IRoutes {
+	const commonRouteParams: CommonRouteParams = [
+		config,
+		tenantService,
+		storageNameRetriever,
+		restTenantThrottlers,
+		restClusterThrottlers,
+		documentManager,
+		cache,
+		revokedTokenChecker,
+		denyList,
+		ephemeralDocumentTTLSec,
+		simplifiedCustomDataRetriever,
+	];
 	return {
 		git: {
-			blobs: blobs.create(config, tenantService, throttler, cache, asyncLocalStorage),
-			commits: commits.create(config, tenantService, throttler, cache, asyncLocalStorage),
-			refs: refs.create(config, tenantService, throttler, cache, asyncLocalStorage),
-			tags: tags.create(config, tenantService, throttler, cache, asyncLocalStorage),
-			trees: trees.create(config, tenantService, throttler, cache, asyncLocalStorage),
+			blobs: blobs.create(...commonRouteParams),
+			commits: commits.create(...commonRouteParams),
+			refs: refs.create(...commonRouteParams),
+			tags: tags.create(...commonRouteParams),
+			trees: trees.create(...commonRouteParams),
 		},
 		repository: {
-			commits: repositoryCommits.create(
-				config,
-				tenantService,
-				throttler,
-				cache,
-				asyncLocalStorage,
-			),
-			contents: contents.create(config, tenantService, throttler, cache, asyncLocalStorage),
-			headers: headers.create(config, tenantService, throttler, cache, asyncLocalStorage),
+			commits: repositoryCommits.create(...commonRouteParams),
+			contents: contents.create(...commonRouteParams),
+			headers: headers.create(...commonRouteParams),
 		},
-		summaries: summaries.create(config, tenantService, throttler, cache, asyncLocalStorage),
+		summaries: summaries.create(...commonRouteParams),
 	};
 }

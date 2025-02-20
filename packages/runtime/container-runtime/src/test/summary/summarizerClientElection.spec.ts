@@ -3,25 +3,32 @@
  * Licensed under the MIT License.
  */
 
-import { strict as assert } from "assert";
-import { Deferred, TypedEventEmitter } from "@fluidframework/common-utils";
-import { ISequencedClient, MessageType } from "@fluidframework/protocol-definitions";
-import { MockLogger } from "@fluidframework/telemetry-utils";
-import {
-	ISerializedElection,
-	OrderedClientCollection,
-	OrderedClientElection,
-	ISummaryCollectionOpEvents,
-	SummarizerClientElection,
-	summarizerClientType,
-	IConnectedEvents,
-	IConnectedState,
-	SummaryManager,
-	ISummarizer,
+import { strict as assert } from "node:assert";
+
+import { TypedEventEmitter } from "@fluid-internal/client-utils";
+import type {
 	ISummarizerEvents,
 	SummarizerStopReason,
-} from "../../summary";
-import { TestQuorumClients } from "./testQuorumClients";
+} from "@fluidframework/container-runtime-definitions/internal";
+import { Deferred } from "@fluidframework/core-utils/internal";
+import { ISequencedClient } from "@fluidframework/driver-definitions";
+import { MessageType } from "@fluidframework/driver-definitions/internal";
+import { MockLogger } from "@fluidframework/telemetry-utils/internal";
+
+import {
+	IConnectedEvents,
+	IConnectedState,
+	ISerializedElection,
+	ISummarizer,
+	ISummaryCollectionOpEvents,
+	OrderedClientCollection,
+	OrderedClientElection,
+	SummarizerClientElection,
+	SummaryManager,
+	summarizerClientType,
+} from "../../summary/index.js";
+
+import { TestQuorumClients } from "./testQuorumClients.js";
 
 describe("Summarizer Client Election", () => {
 	const maxOps = 1000;
@@ -65,7 +72,7 @@ describe("Summarizer Client Election", () => {
 
 	class TestSummarizer extends TypedEventEmitter<ISummarizerEvents> implements ISummarizer {
 		private notImplemented(): never {
-			throw Error("not implemented");
+			throw new Error("not implemented");
 		}
 		public onBehalfOf: string | undefined;
 		public state: "notStarted" | "running" | "stopped" = "notStarted";
@@ -165,10 +172,10 @@ describe("Summarizer Client Election", () => {
 			addClient(id, seq, int);
 		}
 		election = new SummarizerClientElection(
-			mockLogger,
+			mockLogger.toTelemetryLogger(),
 			summaryCollectionEmitter,
 			new OrderedClientElection(
-				mockLogger,
+				mockLogger.toTelemetryLogger(),
 				new OrderedClientCollection(mockLogger, testDeltaManager, testQuorum),
 				initialState ?? currentSequenceNumber,
 				SummarizerClientElection.isClientEligible,
@@ -228,7 +235,7 @@ describe("Summarizer Client Election", () => {
 	}
 
 	afterEach(() => {
-		mockLogger.events = [];
+		mockLogger.clear();
 		testQuorum.reset();
 		summaryCollectionEmitter.removeAllListeners();
 		summarizer.removeAllListeners();
@@ -349,12 +356,7 @@ describe("Summarizer Client Election", () => {
 			// Add more clients, no effect
 			addClient("s2", 19, false);
 			addClient("b", 41, true);
-			assertState(
-				"a-summarizer",
-				"a",
-				17,
-				"additional younger clients should have no effect",
-			);
+			assertState("a-summarizer", "a", 17, "additional younger clients should have no effect");
 
 			// Remove elected client, should reelect
 			removeClient("a", 400);

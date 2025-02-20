@@ -29,6 +29,7 @@ import { ILatestSummaryState, ISummaryReader } from "./interfaces";
 
 /**
  * Git specific implementation of ISummaryReader
+ * @internal
  */
 export class SummaryReader implements ISummaryReader {
 	private readonly lumberProperties: Record<string, any>;
@@ -37,9 +38,13 @@ export class SummaryReader implements ISummaryReader {
 		private readonly documentId: string,
 		private readonly summaryStorage: IGitManager,
 		private readonly enableWholeSummaryUpload: boolean,
+		private readonly isEphemeralContainer: boolean | undefined,
 		private readonly maxRetriesOnError: number = 6,
 	) {
-		this.lumberProperties = getLumberBaseProperties(this.documentId, this.tenantId);
+		this.lumberProperties = {
+			...getLumberBaseProperties(this.documentId, this.tenantId),
+			[CommonProperties.isEphemeralContainer]: this.isEphemeralContainer,
+		};
 	}
 
 	/**
@@ -54,6 +59,7 @@ export class SummaryReader implements ISummaryReader {
 			try {
 				let wholeFlatSummary: IWholeFlatSummary | undefined;
 				try {
+					// Attempt to fetch the latest summary by "latest" ID
 					wholeFlatSummary = await requestWithRetry(
 						async () => this.summaryStorage.getSummary(LatestSummaryId),
 						"readWholeSummary_getSummary",
@@ -71,6 +77,7 @@ export class SummaryReader implements ISummaryReader {
 				}
 
 				if (!wholeFlatSummary) {
+					// If fetching by "latest" ID fails, attempt to fetch the latest summary by explicit ref
 					const existingRef = await requestWithRetry(
 						async () => this.summaryStorage.getRef(encodeURIComponent(this.documentId)),
 						"readWholeSummary_getRef",
@@ -78,6 +85,9 @@ export class SummaryReader implements ISummaryReader {
 						shouldRetryNetworkError,
 						this.maxRetriesOnError,
 					);
+					if (!existingRef) {
+						throw new Error("Could not find a ref for the document.");
+					}
 					wholeFlatSummary = await requestWithRetry(
 						async () => this.summaryStorage.getSummary(existingRef.object.sha),
 						"readWholeSummary_getSummary",
@@ -120,7 +130,6 @@ export class SummaryReader implements ISummaryReader {
 				const deli = deliContent
 					? (JSON.parse(bufferToString(deliContent, "utf8")) as IDeliState)
 					: this.getDefaultDeli();
-				const term = deli.term;
 				const messages = opsContent
 					? (JSON.parse(
 							bufferToString(opsContent, "utf8"),
@@ -141,7 +150,6 @@ export class SummaryReader implements ISummaryReader {
 				summaryReaderMetric.success(`Successfully read whole summary`);
 
 				return {
-					term,
 					protocolHead: attributes.sequenceNumber,
 					scribe,
 					messages,
@@ -163,6 +171,9 @@ export class SummaryReader implements ISummaryReader {
 					shouldRetryNetworkError,
 					this.maxRetriesOnError,
 				);
+				if (!existingRef) {
+					throw new Error("Could not find a ref for the document.");
+				}
 				const [attributesContent, scribeContent, deliContent, opsContent] =
 					await Promise.all([
 						requestWithRetry(
@@ -222,7 +233,6 @@ export class SummaryReader implements ISummaryReader {
 				const deli = deliContent
 					? (JSON.parse(toUtf8(deliContent.content, deliContent.encoding)) as IDeliState)
 					: this.getDefaultDeli();
-				const term = deli.term;
 				const messages = opsContent
 					? (JSON.parse(
 							toUtf8(opsContent.content, opsContent.encoding),
@@ -243,7 +253,6 @@ export class SummaryReader implements ISummaryReader {
 				summaryReaderMetric.success(`Successfully read summary`);
 
 				return {
-					term,
 					protocolHead: attributes.sequenceNumber,
 					scribe,
 					messages,
@@ -261,7 +270,6 @@ export class SummaryReader implements ISummaryReader {
 
 	private getDefaultSummaryState(): ILatestSummaryState {
 		return {
-			term: 1,
 			protocolHead: 0,
 			scribe: "",
 			messages: [],
@@ -274,7 +282,6 @@ export class SummaryReader implements ISummaryReader {
 		return {
 			sequenceNumber: 0,
 			minimumSequenceNumber: 0,
-			term: undefined,
 		};
 	}
 
@@ -292,11 +299,8 @@ export class SummaryReader implements ISummaryReader {
 			sequenceNumber: 0,
 			signalClientConnectionNumber: 0,
 			expHash1: "",
-			epoch: 0,
-			term: 1,
 			lastSentMSN: undefined,
 			nackMessages: undefined,
-			successfullyStartedLambdas: [],
 			checkpointTimestamp: undefined,
 		};
 	}

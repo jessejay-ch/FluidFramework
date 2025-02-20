@@ -6,7 +6,6 @@
 import { inspect } from "util";
 import {
 	IContextErrorData,
-	IPartitionConfig,
 	IPartitionLambda,
 	IPartitionLambdaConfig,
 	IPartitionLambdaFactory,
@@ -19,15 +18,16 @@ import { DocumentContext } from "./documentContext";
 
 export class DocumentPartition {
 	private readonly q: QueueObject<IQueuedMessage>;
-	private readonly lambdaP: Promise<IPartitionLambda>;
+	private readonly lambdaP: Promise<IPartitionLambda> | Promise<void>;
 	private lambda: IPartitionLambda | undefined;
 	private corrupt = false;
 	private closed = false;
+	private paused = false;
 	private activityTimeoutTime: number | undefined;
+	private readonly restartOnErrorNames: string[] = [];
 
 	constructor(
-		factory: IPartitionLambdaFactory,
-		config: IPartitionConfig,
+		factory: IPartitionLambdaFactory<IPartitionLambdaConfig>,
 		private readonly tenantId: string,
 		private readonly documentId: string,
 		public readonly context: DocumentContext,
@@ -36,22 +36,24 @@ export class DocumentPartition {
 		this.updateActivityTime();
 
 		const documentConfig: IPartitionLambdaConfig = {
-			leaderEpoch: config.leaderEpoch,
 			tenantId,
 			documentId,
 		};
+
+		this.restartOnErrorNames = ["MongoServerSelectionError"];
 
 		this.q = queue((message: IQueuedMessage, callback) => {
 			// Winston.verbose(`${message.topic}:${message.partition}@${message.offset}`);
 			try {
 				if (!this.corrupt) {
 					// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-					const optionalPromise = this.lambda!.handler(message);
-					if (optionalPromise) {
-						optionalPromise.then(callback as any).catch((error) => {
+					const optionalPromise = this.lambda!.handler(message)
+						?.then(callback as any)
+						.catch((error) => {
 							this.markAsCorrupt(error, message);
 							callback();
 						});
+					if (optionalPromise) {
 						return;
 					}
 				} else {
@@ -70,6 +72,7 @@ export class DocumentPartition {
 		this.q.pause();
 
 		this.context.on("error", (error: any, errorData: IContextErrorData) => {
+			Lumberjack.verbose("Listening for errors in documentPartition, context error event");
 			if (errorData.markAsCorrupt) {
 				this.markAsCorrupt(error, errorData.markAsCorrupt);
 			} else if (errorData.restart) {
@@ -80,22 +83,33 @@ export class DocumentPartition {
 		});
 
 		// Create the lambda to handle the document messages
-		this.lambdaP = factory.create(documentConfig, context, this.updateActivityTime.bind(this));
-		this.lambdaP.then(
-			(lambda) => {
+		this.lambdaP = factory
+			.create(documentConfig, context, this.updateActivityTime.bind(this))
+			.then((lambda) => {
 				this.lambda = lambda;
 				this.q.resume();
-			},
-			(error) => {
-				// There is no need to pass the message to be checkpointed to markAsCorrupt().
-				// The message, in this case, would be the head in the DocumentContext. But the DocumentLambda
-				// that creates this DocumentPartition will also put the same message in the queue.
-				// So the DocumentPartition will see that message in the queue above, and checkpoint it
-				// since the document was marked as corrupted.
-				this.markAsCorrupt(error);
-				this.q.resume();
-			},
-		);
+			})
+			.catch((error) => {
+				if (
+					(error.name && this.restartOnErrorNames.includes(error.name as string)) ||
+					error.shouldRestart
+				) {
+					this.context.error(error, {
+						restart: true,
+						tenantId: this.tenantId,
+						documentId: this.documentId,
+						errorLabel: "docPartition:lambdaFactory.create",
+					});
+				} else {
+					// There is no need to pass the message to be checkpointed to markAsCorrupt().
+					// The message, in this case, would be the head in the DocumentContext. But the DocumentLambda
+					// that creates this DocumentPartition will also put the same message in the queue.
+					// So the DocumentPartition will see that message in the queue above, and checkpoint it
+					// since the document was marked as corrupted.
+					this.markAsCorrupt(error);
+					this.q.resume();
+				}
+			});
 	}
 
 	public process(message: IQueuedMessage) {
@@ -103,7 +117,16 @@ export class DocumentPartition {
 			return;
 		}
 
-		void this.q.push(message);
+		this.q.push(message).catch((error) => {
+			const lumberjackProperties = {
+				...getLumberBaseProperties(this.documentId, this.tenantId),
+			};
+			Lumberjack.error(
+				"Error pushing raw message to queue in document partition",
+				lumberjackProperties,
+				error,
+			);
+		});
 		this.updateActivityTime();
 	}
 
@@ -120,14 +143,13 @@ export class DocumentPartition {
 		if (this.lambda) {
 			this.lambda.close(closeType);
 		} else {
-			this.lambdaP.then(
-				(lambda) => {
+			this.lambdaP
+				.then((lambda) => {
 					lambda.close(closeType);
-				},
-				(error) => {
+				})
+				.catch((error) => {
 					// Lambda was never created - ignoring
-				},
-			);
+				});
 		}
 	}
 
@@ -144,6 +166,16 @@ export class DocumentPartition {
 	 * Future messages will be checkpointed but no real processing will happen
 	 */
 	private markAsCorrupt(error: any, message?: IQueuedMessage) {
+		if (this.closed) {
+			Lumberjack.info(
+				"Skipping marking document as corrupt since the document partition is already closed",
+				{
+					...getLumberBaseProperties(this.documentId, this.tenantId),
+					error: error.toString(),
+				},
+			);
+			return;
+		}
 		this.corrupt = true;
 		this.context.log?.error(`Marking document as corrupted due to error: ${inspect(error)}`, {
 			messageMetaData: {
@@ -161,13 +193,64 @@ export class DocumentPartition {
 			restart: false,
 			tenantId: this.tenantId,
 			documentId: this.documentId,
+			errorLabel: "documentPartition:markAsCorrupt",
 		});
 		if (message) {
 			this.context.checkpoint(message);
 		}
 	}
 
-	private updateActivityTime() {
-		this.activityTimeoutTime = Date.now() + this.activityTimeout;
+	private updateActivityTime(activityTime?: number) {
+		const cacluatedActivityTimeout =
+			Date.now() + (this.lambda?.activityTimeout ?? this.activityTimeout);
+		this.activityTimeoutTime =
+			activityTime !== undefined ? activityTime : cacluatedActivityTimeout;
+	}
+
+	public pause(offset: number) {
+		if (this.paused) {
+			Lumberjack.warning("Doc partition already paused, returning early.", {
+				...getLumberBaseProperties(this.documentId, this.tenantId),
+				offset,
+			});
+			return;
+		}
+		this.paused = true;
+
+		this.q.pause();
+		this.q.remove(() => true); // flush all the messages in the queue since kafka consumer will resume from last successful offset
+
+		if (this.lambda?.pause) {
+			this.lambda.pause(offset);
+		}
+
+		// Its possible that some other doc partition triggered the pause
+		// So we need to make sure to set the paused state for this doc partition's context in case its not already set
+		// This will allow its head to move backwards/reprocess ops as needed during resume
+		this.context.setStateToPause();
+
+		Lumberjack.info("Doc partition paused", {
+			...getLumberBaseProperties(this.documentId, this.tenantId),
+			offset,
+		});
+	}
+
+	public resume() {
+		if (!this.paused) {
+			Lumberjack.warning("Doc partition already resumed, returning early.", {
+				...getLumberBaseProperties(this.documentId, this.tenantId),
+			});
+			return;
+		}
+		this.paused = false;
+
+		this.q.resume();
+
+		if (this.lambda?.resume) {
+			this.lambda.resume();
+		}
+		Lumberjack.info("Doc partition resumed", {
+			...getLumberBaseProperties(this.documentId, this.tenantId),
+		});
 	}
 }

@@ -21,6 +21,7 @@ import {
 	IServiceConfiguration,
 	RawOperationType,
 } from "@fluidframework/server-services-core";
+import { Lumberjack, getLumberBaseProperties } from "@fluidframework/server-services-telemetry";
 import { ISubscriber } from "./pubsub";
 
 export class LocalOrdererConnection implements IOrdererConnection {
@@ -111,6 +112,10 @@ export class LocalOrdererConnection implements IOrdererConnection {
 		this.producer.once(event, listener);
 	}
 
+	public off(event: "error", listener: (...args: any[]) => void) {
+		this.producer.off(event, listener);
+	}
+
 	private submitRawOperation(messages: IRawOperationMessage[]) {
 		if (this.serviceConfiguration.enableTraces) {
 			// Add trace
@@ -118,13 +123,13 @@ export class LocalOrdererConnection implements IOrdererConnection {
 				const operation = message.operation;
 				operation?.traces?.push({
 					action: "start",
-					service: "alfred",
+					service: "nexus",
 					timestamp: performance.now(),
 				});
 			});
 		}
 
-		const boxcar: IBoxcarMessage = {
+		const boxcar: Required<IBoxcarMessage> = {
 			contents: messages,
 			documentId: this.documentId,
 			tenantId: this.tenantId,
@@ -132,7 +137,11 @@ export class LocalOrdererConnection implements IOrdererConnection {
 		};
 
 		// Submits the message.
-		// eslint-disable-next-line @typescript-eslint/no-floating-promises
-		this.producer.send([boxcar], this.tenantId, this.documentId);
+		this.producer.send([boxcar], this.tenantId, this.documentId).catch((err) => {
+			const lumberjackProperties = {
+				...getLumberBaseProperties(this.documentId, this.tenantId),
+			};
+			Lumberjack.error("Error sending boxcar to producer", lumberjackProperties, err);
+		});
 	}
 }

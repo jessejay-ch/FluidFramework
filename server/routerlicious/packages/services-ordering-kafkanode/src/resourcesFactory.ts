@@ -14,6 +14,9 @@ import sillyname from "sillyname";
 import { Provider } from "nconf";
 import { KafkaNodeConsumer } from "./kafkaNodeConsumer";
 
+/**
+ * @internal
+ */
 export interface IKafkaResources extends IResources {
 	lambdaFactory: IPartitionLambdaFactory;
 
@@ -22,6 +25,9 @@ export interface IKafkaResources extends IResources {
 	config: Provider;
 }
 
+/**
+ * @internal
+ */
 export class KafkaResources implements IKafkaResources {
 	constructor(
 		public lambdaFactory: IPartitionLambdaFactory,
@@ -35,6 +41,9 @@ export class KafkaResources implements IKafkaResources {
 	}
 }
 
+/**
+ * @internal
+ */
 export class KafkaResourcesFactory implements IResourcesFactory<KafkaResources> {
 	constructor(
 		private readonly name: string,
@@ -47,7 +56,9 @@ export class KafkaResourcesFactory implements IResourcesFactory<KafkaResources> 
 				? // eslint-disable-next-line @typescript-eslint/no-require-imports
 				  require(this.lambdaModule)
 				: this.lambdaModule;
-		const lambdaFactory = await plugin.create(config);
+
+		const customizations = await (plugin.customize ? plugin.customize(config) : undefined);
+		const lambdaFactory = await plugin.create(config, customizations);
 
 		// Inbound Kafka configuration
 		const kafkaEndpoint = config.get("kafka:lib:endpoint");

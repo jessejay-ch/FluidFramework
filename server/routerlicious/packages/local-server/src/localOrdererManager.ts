@@ -6,17 +6,22 @@
 import { IPubSub, LocalOrderer } from "@fluidframework/server-memory-orderer";
 import { GitManager, IHistorian } from "@fluidframework/server-services-client";
 import {
+	CheckpointService,
+	ICheckpointRepository,
 	IDatabaseManager,
+	IDocumentRepository,
 	IDocumentStorage,
 	ILogger,
 	IOrderer,
 	IOrdererManager,
 	IServiceConfiguration,
-	ITaskMessageSender,
-	ITenantManager,
-	TokenGenerator,
+	MongoCheckpointRepository,
+	MongoDocumentRepository,
 } from "@fluidframework/server-services-core";
 
+/**
+ * @internal
+ */
 export class LocalOrdererManager implements IOrdererManager {
 	/**
 	 * Map of "tenantId/documentId" to the orderer for that document.
@@ -26,14 +31,12 @@ export class LocalOrdererManager implements IOrdererManager {
 	constructor(
 		private readonly storage: IDocumentStorage,
 		private readonly databaseManager: IDatabaseManager,
-		private readonly tenantManager: ITenantManager,
-		private readonly taskMessageSender: ITaskMessageSender,
-		private readonly permission: any, // Can probably remove
-		private readonly tokenGenerator: TokenGenerator,
 		private readonly createHistorian: (tenant: string) => Promise<IHistorian>,
 		private readonly logger: ILogger,
 		private readonly serviceConfiguration?: Partial<IServiceConfiguration>,
 		private readonly pubsub?: IPubSub,
+		private readonly documentRepository?: IDocumentRepository,
+		private readonly checkpointRepository?: ICheckpointRepository,
 	) {}
 
 	/**
@@ -62,7 +65,7 @@ export class LocalOrdererManager implements IOrdererManager {
 	}
 
 	public async getOrderer(tenantId: string, documentId: string): Promise<IOrderer> {
-		const key = `${tenantId}/${documentId}`;
+		const key = this.getOrdererMapKey(tenantId, documentId);
 
 		let orderer = this.ordererMap.get(key);
 		if (orderer === undefined) {
@@ -76,23 +79,50 @@ export class LocalOrdererManager implements IOrdererManager {
 	private async createLocalOrderer(tenantId: string, documentId: string): Promise<IOrderer> {
 		const historian = await this.createHistorian(tenantId);
 		const gitManager = new GitManager(historian);
+		const documentRepository =
+			this.documentRepository ??
+			new MongoDocumentRepository(await this.databaseManager.getDocumentCollection());
+		const deliCheckpointRepository =
+			this.checkpointRepository ??
+			new MongoCheckpointRepository(
+				await this.databaseManager.getCheckpointCollection(),
+				"deli",
+			);
+
+		const scribeCheckpointRepository =
+			this.checkpointRepository ??
+			new MongoCheckpointRepository(
+				await this.databaseManager.getCheckpointCollection(),
+				"scribe",
+			);
+
+		const deliCheckpointService = new CheckpointService(
+			deliCheckpointRepository,
+			documentRepository,
+			false,
+		);
+		const scribeCheckpointService = new CheckpointService(
+			scribeCheckpointRepository,
+			documentRepository,
+			false,
+		);
 
 		const orderer = await LocalOrderer.load(
 			this.storage,
 			this.databaseManager,
 			tenantId,
 			documentId,
-			this.taskMessageSender,
-			this.tenantManager,
-			this.permission,
-			this.tokenGenerator,
 			this.logger,
+			documentRepository,
+			deliCheckpointRepository,
+			scribeCheckpointRepository,
+			deliCheckpointService,
+			scribeCheckpointService,
 			gitManager,
 			undefined /* ILocalOrdererSetup */,
 			this.pubsub,
 			undefined /* broadcasterContext */,
 			undefined /* scriptoriumContext */,
-			undefined /* foremanContext */,
 			undefined /* scribeContext */,
 			undefined /* deliContext */,
 			undefined /* moiraContext */,
@@ -102,7 +132,6 @@ export class LocalOrdererManager implements IOrdererManager {
 		const lambdas = [
 			orderer.broadcasterLambda,
 			orderer.deliLambda,
-			orderer.foremanLambda,
 			orderer.scribeLambda,
 			orderer.scriptoriumLambda,
 		];
@@ -118,5 +147,18 @@ export class LocalOrdererManager implements IOrdererManager {
 		);
 
 		return orderer;
+	}
+
+	public async removeOrderer(tenantId: string, documentId: string): Promise<void> {
+		const key = this.getOrdererMapKey(tenantId, documentId);
+		const orderer = this.ordererMap.get(key);
+		if (orderer !== undefined) {
+			this.ordererMap.delete(key);
+			await (await orderer).close();
+		}
+	}
+
+	private getOrdererMapKey(tenantId: string, documentId: string) {
+		return `${tenantId}/${documentId}`;
 	}
 }

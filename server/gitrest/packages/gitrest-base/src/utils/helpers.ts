@@ -3,7 +3,7 @@
  * Licensed under the MIT License.
  */
 
-import { PathLike, Stats } from "fs";
+import { PathLike, Stats, type BigIntStats } from "fs";
 import * as path from "path";
 import { Request } from "express";
 import {
@@ -21,6 +21,7 @@ import {
 	Constants,
 	IExternalWriterConfig,
 	IFileSystemManager,
+	IFileSystemManagerFactories,
 	IRepoManagerParams,
 	IRepositoryManagerFactory,
 	IStorageRoutingId,
@@ -29,6 +30,7 @@ import {
 	BaseGitRestTelemetryProperties,
 	GitRestLumberEventName,
 } from "./gitrestTelemetryDefinitions";
+import { isFilesystemError, throwFileSystemErrorAsNetworkError } from "./fileSystemHelper";
 
 /**
  * Validates that the input encoding is valid
@@ -42,6 +44,18 @@ export function validateBlobEncoding(encoding: BufferEncoding): boolean {
  */
 export function validateBlobContent(content: string): boolean {
 	return content !== undefined && content !== null;
+}
+
+/**
+ * Returns the fsManagerFactory based on the isEphemeral flag
+ */
+export function getFilesystemManagerFactory(
+	fileSystemManagerFactories: IFileSystemManagerFactories,
+	isEphemeralContainer: boolean,
+) {
+	return isEphemeralContainer && fileSystemManagerFactories.ephemeralFileSystemManagerFactory
+		? fileSystemManagerFactories.ephemeralFileSystemManagerFactory
+		: fileSystemManagerFactories.defaultFileSystemManagerFactory;
 }
 
 /**
@@ -59,23 +73,30 @@ export function getExternalWriterParams(
 
 export function getRepoManagerParamsFromRequest(request: Request): IRepoManagerParams {
 	const storageName: string | undefined = request.get(Constants.StorageNameHeader);
-	const storageRoutingId: IStorageRoutingId = parseStorageRoutingId(
-		request.get(Constants.StorageRoutingIdHeader),
-	);
+	const storageRoutingId = parseStorageRoutingId(request.get(Constants.StorageRoutingIdHeader));
+	const simplifiedCustomData = request.get(Constants.SimplifiedCustomDataHeader);
+
+	const isEphemeralFromRequest = request.get(Constants.IsEphemeralContainer);
+
+	const isEphemeralContainer: boolean =
+		isEphemeralFromRequest === undefined ? false : isEphemeralFromRequest === "true";
+
 	return {
 		repoOwner: request.params.owner,
 		repoName: request.params.repo,
 		storageRoutingId,
 		fileSystemManagerParams: {
 			storageName,
+			simplifiedCustomData,
 		},
+		isEphemeralContainer,
 	};
 }
 
 export async function exists(
 	fileSystemManager: IFileSystemManager,
 	fileOrDirectoryPath: PathLike,
-): Promise<Stats | false> {
+): Promise<Stats | BigIntStats | false> {
 	try {
 		const fileOrDirectoryStats = await fileSystemManager.promises.stat(fileOrDirectoryPath);
 		return fileOrDirectoryStats;
@@ -104,7 +125,7 @@ export async function persistLatestFullSummaryInStorage(
 	try {
 		const directoryExists = await exists(fileSystemManager, storageDirectoryPath);
 		persistLatestFullSummaryInStorageMetric.setProperty(
-			BaseGitRestTelemetryProperties.fullSummaryirectoryExists,
+			BaseGitRestTelemetryProperties.fullSummaryDirectoryExists,
 			directoryExists !== false,
 		);
 		if (directoryExists === false) {
@@ -119,11 +140,14 @@ export async function persistLatestFullSummaryInStorage(
 		persistLatestFullSummaryInStorageMetric.success(
 			"Successfully persisted latest full summary in storage",
 		);
-	} catch (error: any) {
+	} catch (error: unknown) {
 		persistLatestFullSummaryInStorageMetric.error(
 			"Failed to persist latest full summary in storage",
 			error,
 		);
+		if (isFilesystemError(error)) {
+			throwFileSystemErrorAsNetworkError(error);
+		}
 		throw error;
 	}
 }
@@ -213,6 +237,7 @@ export function getLumberjackBasePropertiesFromRepoManagerParams(params: IRepoMa
 		[BaseGitRestTelemetryProperties.repoOwner]: params.repoOwner,
 		[BaseGitRestTelemetryProperties.repoName]: params.repoName,
 		[BaseGitRestTelemetryProperties.storageName]: params?.fileSystemManagerParams?.storageName,
+		[BaseGitRestTelemetryProperties.isEphemeralContainer]: params?.isEphemeralContainer,
 	};
 }
 
@@ -239,6 +264,9 @@ export function logAndThrowApiError(
 
 	if (isNetworkError(error)) {
 		throw error;
+	}
+	if (isFilesystemError(error)) {
+		throwFileSystemErrorAsNetworkError(error);
 	}
 	// TODO: some APIs might expect 400 responses by default, like GetRef in GitManager. Since `handleResponse` uses
 	// 400 by default, using something different here would override the expected behavior and cause issues. Because
@@ -318,22 +346,6 @@ export async function checkSoftDeleted(
 			lumberjackProperties,
 			error,
 		);
-		throw error;
-	}
-}
-
-export async function executeApiWithMetric<U>(
-	api: () => Promise<U>,
-	apiName: string,
-	telemetryProperties: Record<string, any>,
-): Promise<U> {
-	const metric = Lumberjack.newLumberMetric(apiName, telemetryProperties);
-	try {
-		const result = await api();
-		metric.success(`RepositoryManager: ${apiName} success`);
-		return result;
-	} catch (error: any) {
-		metric.error(`RepositoryManager: ${apiName} error`, error);
 		throw error;
 	}
 }
