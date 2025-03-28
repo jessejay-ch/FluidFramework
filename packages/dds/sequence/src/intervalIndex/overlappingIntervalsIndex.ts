@@ -24,9 +24,11 @@ import { ISharedString } from "../sharedString.js";
 import { IntervalIndex, type SequenceIntervalIndex } from "./intervalIndex.js";
 
 /**
+ * The generic version of this interface is deprecated and will be removed in a future release.
+ * Use {@link ISequenceOverlappingIntervalsIndex} instead.
  * @legacy
  * @alpha
- * @deprecated The generic version of this interface is no longer used and will be removed. Use {@link ISequenceOverlappingIntervalsIndex} instead.
+ * @remarks The generic version of this interface is no longer used and will be removed. Use {@link ISequenceOverlappingIntervalsIndex} instead.
  */
 export interface IOverlappingIntervalsIndex<TInterval extends ISerializableInterval>
 	extends IntervalIndex<TInterval> {
@@ -72,9 +74,9 @@ export interface ISequenceOverlappingIntervalsIndex extends SequenceIntervalInde
 export class OverlappingIntervalsIndex implements ISequenceOverlappingIntervalsIndex {
 	protected readonly intervalTree = new IntervalTree<SequenceInterval>();
 	protected readonly client: Client;
-	protected readonly helpers: IIntervalHelpers<SequenceInterval>;
+	protected readonly helpers: IIntervalHelpers;
 
-	constructor(client: Client, helpers: IIntervalHelpers<SequenceInterval>) {
+	constructor(client: Client, helpers: IIntervalHelpers) {
 		this.client = client;
 		this.helpers = helpers;
 	}
